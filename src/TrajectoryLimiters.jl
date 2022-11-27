@@ -134,7 +134,7 @@ end
 
 function (limiter::TrajectoryLimiter)(state, X, Ẋ, Ẍ, R::AbstractArray)
     T = length(R)
-    length(X) == length(Ẋ) == length(Ẍ) == R || throw(ArgumentError("Inconsistent array lengths"))
+    length(X) == length(Ẋ) == length(Ẍ) == T || throw(ArgumentError("Inconsistent array lengths"))
     @inbounds for i = 1:T
         X[i] = state.x
         Ẋ[i] = state.ẋ
