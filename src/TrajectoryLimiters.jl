@@ -1,9 +1,47 @@
+"""
+Quick example follows below, see the [readme](https://github.com/baggepinnen/TrajectoryLimiters.jl) for more details.
+    
+```julia
+using TrajectoryLimiters
+
+ẍM   = 50                       # Maximum acceleration
+ẋM   = 10                       # Maximum velocity
+Ts   = 0.005                    # Sample time
+r(t) = 2.5 + 3 * (t - floor(t)) # Reference to be smoothed
+t    = 0:Ts:3                   # Time vector
+R    = r.(t)                    # An array of sampled position references 
+
+limiter = TrajectoryLimiter(Ts, ẋM, ẍM)
+
+X, Ẋ, Ẍ = limiter(R)
+
+plot(
+    t,
+    [X Ẋ Ẍ],
+    plotu = true,
+    c = :black,
+    title = ["Position \$x(t)\$" "Velocity \$ẋ(t)\$" "Acceleration \$u(t)\$"],
+    ylabel = "",
+    layout = (3,1),
+)
+plot!(r, extrema(t)..., sp = 1, lab = "", l = (:black, :dashdot))
+```
+"""
 module TrajectoryLimiters
 
 export TrajectoryLimiter
 
 sat(x) = clamp(x, -one(x), one(x))
 
+"""
+    State{T}
+
+# Fields:
+- `x`: Filtered reference position
+- `ẋ`: Filtered reference velocity
+- `r`: Reference position
+- `ṙ`: Reference velocity
+"""
 struct State{T}
     x::T
     ẋ::T
@@ -11,10 +49,7 @@ struct State{T}
     ṙ::T
 end
 
-function State(args...)
-    State(promote(args...)...)
-end
-
+State(args...) = State(promote(args...)...)
 State(R) = State(0*R[1], 0, R[1], 0)
 
 struct TrajectoryLimiter{T}
@@ -34,6 +69,9 @@ X, Ẋ, Ẍ = limiter(state, R::Vector)
 # or 
 X, Ẋ, Ẍ = limiter(R::Vector) # Uses a zero initial state
 ```
+
+- `ẋM`: Upper bound on the magnitude of the velocity
+- `ẍM`: Upper bound on the magnitude of the acceleration (in the reference paper, this bound is denoted by U)
 """
 function TrajectoryLimiter(args...)
     TrajectoryLimiter(promote(args...)...)
@@ -73,8 +111,8 @@ function trajlim(state, rt, Ts, ẋM, ẍM)
     # x⁺ = Ts*u + x
     ẋ1 = Ts*u + ẋ
 
-    # x⁺ - x = Ts/2 u⁺ + u
-    # x⁺ = Ts/2 (u⁺ + u) - x
+    # x⁺ - x = Ts/2 (u⁺ + u)
+    # x⁺ = Ts/2 (u⁺ + u) + x
     x1 = Ts/2*(ẋ1 + ẋ) + x
 
     State(x1, ẋ1, r, ṙ), u
@@ -84,15 +122,20 @@ function (limiter::TrajectoryLimiter)(state, r::Number)
     trajlim(state, r, limiter.Ts, limiter.ẋM, limiter.ẍM)
 end
 
-
 (limiter::TrajectoryLimiter)(R::AbstractArray) = limiter(State(R), R)
+(limiter::TrajectoryLimiter)(X, Ẋ, Ẍ, R::AbstractArray) = limiter(State(R), X, Ẋ, Ẍ, R)
 
 function (limiter::TrajectoryLimiter)(state, R::AbstractArray)
-    T = length(R)
     X = similar(R)
     Ẋ = similar(R)
     Ẍ = similar(R)
-    for i = 1:T
+    limiter(state, X, Ẋ, Ẍ, R)
+end
+
+function (limiter::TrajectoryLimiter)(state, X, Ẋ, Ẍ, R::AbstractArray)
+    T = length(R)
+    length(X) == length(Ẋ) == length(Ẍ) == R || throw(ArgumentError("Inconsistent array lengths"))
+    @inbounds for i = 1:T
         X[i] = state.x
         Ẋ[i] = state.ẋ
         state, u = limiter(state, R[i])
