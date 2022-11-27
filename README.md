@@ -14,9 +14,7 @@ This nonlinear trajectory filter takes a pre-defined reference trajectory $r(t)$
 To filter an entire trajectory, create a `TrajectoryLimiter` and call it like a function:
 ```julia
 using TrajectoryLimiters
-using Test
 
-# @testset "TrajectoryLimiters.jl" begin
 ẍM   = 50                       # Maximum acceleration
 ẋM   = 10                       # Maximum velocity
 Ts   = 0.005                    # Sample time
@@ -41,7 +39,9 @@ plot!(r, extrema(t)..., sp = 1, lab = "", l = (:black, :dashdot))
 ```
 ![limited trajectory](https://user-images.githubusercontent.com/3797491/204131020-c0dbcfa5-33f2-44df-b12d-528f3f4e7132.png)
 
-The figure above reproduces figure 10 from the reference, except that we did not increase the acceleration bound (which we call $ẍM$ but they call $U$) at time $t=2$ like they did. To do this, use the lower-level interface explained below.
+The figure above reproduces figure 10 from the reference, except that we did not increase the acceleration bound (which we call $ẍ_M$ but they call $U$) at time $t=2$ like they did. To do this, use the lower-level interface explained below.
+
+The figure indicates that the limited (solid lines) trajectory follows the original reference trajectory (dashed line) whenever possible, but deviates whenever the original trajectory violates the velocity or acceleration constraints. When it has deviated, the limited trajectory converges to the original reference trajectory again with a time-optimal behavior whenever the velocity and acceleration profiles allow.
 
 To limit a trajectory online, i.e., one step at a time, call the limiter like so
 ```julia
@@ -54,3 +54,9 @@ One can also call the lower-level function
 state, ẍ = TrajectoryLimiter.trajlim(state, rt, Ts, ẋM, ẍM)
 ```
 directly in case one would like to change any of the parameters online.
+
+To set the initial state of the trajectory limiter, create a
+```julia
+TrajectoryLimiters.State(x, ẋ, r, ṙ)
+```
+manually. The default choice if no initial state is given when batch filtering an array `R` is `TrajectoryLimiters.State(0, 0, r, 0)` where `r` is the first value in the array `R`.
