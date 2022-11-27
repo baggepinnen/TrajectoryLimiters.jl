@@ -45,6 +45,9 @@ The figure above reproduces figure 10 from the reference, except that we did not
 
 The figure indicates that the limited (solid lines) trajectory follows the original reference trajectory (dashed line) whenever possible, but deviates whenever the original trajectory violates the velocity or acceleration constraints. When it has deviated, the limited trajectory converges to the original reference trajectory again with a time-optimal behavior whenever the velocity and acceleration profiles allow.
 
+Since the trajectory limiter outputs position, velocity and acceleration, it is easy to use inverse-based feedforward models to improve the trajectory tracking compared to purely feedback-based controllers (*always* use some form of feedforward if trajectory-tracking performance is important).
+
+
 To limit a trajectory online, i.e., one step at a time, call the limiter like so
 ```julia
 state, ẍ = limiter(state, r(t))
