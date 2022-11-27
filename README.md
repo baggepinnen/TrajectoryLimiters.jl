@@ -73,7 +73,6 @@ julia> length(R)
 julia> @btime $limiter($R);
   23.745 μs (3 allocations: 14.62 KiB)
 ```
-How 
 
 With preallocated output arrays, you can avoid the allocations completely:
 ```julia
@@ -85,6 +84,6 @@ julia> @btime $limiter($X, $Ẋ, $Ẍ, $R);
 
 Taking a single step takes
 ```julia
-julia> @btime $limiter(TrajectoryLimiters.State(0.0), 0.0);@btime $limiter($R);
+julia> @btime $limiter(TrajectoryLimiters.State(0.0), 0.0);
   17.372 ns (0 allocations: 0 bytes)
   ```
