@@ -7,6 +7,9 @@ Contains an implementation of
 > Nonlinear filters for the generation of smooth trajectories
 > R. Zanasi, C. Guarino Lo Bianco, A. Tonielli
 
+This nonlinear trajectory filter takes a pre-defined reference trajectory $r(t)$ (uniformly sampled in $t$) and filters it (causally) such that the velocity and acceleration are bounded by $ẋ_M$ and $ẍ_M$.
+
+## Usage
 
 To filter an entire trajectory, create a `TrajectoryLimiter` and call it like a function:
 ```julia
@@ -38,13 +41,13 @@ plot!(r, extrema(t)..., sp = 1, lab = "", l = (:black, :dashdot))
 ```
 ![limited trajectory](https://user-images.githubusercontent.com/3797491/204131020-c0dbcfa5-33f2-44df-b12d-528f3f4e7132.png)
 
-The figure above reproduces figure 10 from the reference, except that we did not increase the acceleration bound (which we call ``ẍM`` but they call ``U``) at time ``t=2`` like they did. To do this, use the lower-level interface explained below.
+The figure above reproduces figure 10 from the reference, except that we did not increase the acceleration bound (which we call $ẍM$ but they call $U$) at time $t=2$ like they did. To do this, use the lower-level interface explained below.
 
 To limit a trajectory online, i.e., one step at a time, call the limiter like so
 ```julia
 state, ẍ = limiter(state, r(t))
 ```
-this outputs a new state, containing ``x, ẋ, r, ṙ`` as well as the acceleration ``ẍ``.
+this outputs a new state, containing $x, ẋ, r, ṙ$ as well as the acceleration $ẍ$.
 
 One can also call the lower-level function
 ```julia
