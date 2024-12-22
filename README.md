@@ -7,7 +7,7 @@ Contains an implementation of
 > Nonlinear filters for the generation of smooth trajectories
 > R. Zanasi, C. Guarino Lo Bianco, A. Tonielli
 
-This nonlinear trajectory filter takes a pre-defined reference trajectory $r(t)$ (uniformly sampled in $t$) and filters it (causally) such that the velocity and acceleration are bounded by $ẋ_M$ and $ẍ_M$.
+This nonlinear trajectory filter takes a pre-defined reference trajectory $r(t)$ (uniformly sampled in $t$) and filters it (causally) such that the velocity and acceleration are bounded by $\dot{x}_M$ and $\ddot{x}_M$.
 
 What is this good for? Some applications call for a dynamically feasible reference trajectory, i.e., a trajectory with bounded velocity and acceleration, but all you have access to is an instantaneous reference $r(t)$ that might change abruptly, e.g., from an operator changing a set point. In such situations, this filter performs the required pre-processing of the reference to provide a smoother, dynamically feasible reference trajectory. If you already have a trajectory planner that outputs dynamically feasible trajectories, you do not need this package. 
 
@@ -52,7 +52,7 @@ To limit a trajectory online, i.e., one step at a time, call the limiter like so
 ```julia
 state, ẍ = limiter(state, r(t))
 ```
-this outputs a new state, containing $x, ẋ, r, ṙ$ as well as the acceleration $ẍ$.
+this outputs a new state, containing $x, \dot{x}, r, \dot{r}$ as well as the acceleration $\dot{x}$.
 
 One can also call the lower-level function
 ```julia
