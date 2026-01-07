@@ -2,16 +2,16 @@ using TrajectoryLimiters
 using Test
 
 @testset "TrajectoryLimiters.jl" begin
-ẍM = 50    # Maximum acceleration
-ẋM = 10    # Maximum velocity
+ẍM = 50    # Maximum acceleration
+ẋM = 10    # Maximum velocity
 Ts = 0.005 # Sample time
 r(t) = 2.5 + 3 * (t - floor(t)) # Reference to be smoothed
 t = 0:Ts:3 # Time vector
-R = r.(t) # An array of sampled position references 
+R = r.(t) # An array of sampled position references
 
-limiter = TrajectoryLimiter(Ts, ẋM, ẍM)
+limiter = TrajectoryLimiter(Ts, ẋM, ẍM)
 
-X, Ẋ, Ẍ = limiter(R)
+X, Ẋ, Ẍ = limiter(R)
 
 @test X[1:20:end] ≈ [0.0, 0.25, 0.9996875000000001, 1.987187499999999, 2.974687499999998, 3.862060185185191, 4.3, 4.6000000000000005, 4.8999999999999995, 5.2, 5.499999999999999, 5.549999999999987, 5.099999999999975, 4.301543367346912, 3.9020535714285507, 4.0, 4.300000000000001, 4.6000000000000005, 4.9, 5.2, 5.5, 5.55000000000003, 5.100000000000061, 4.3015433673469925, 3.9020535714285876, 4.000000000000001, 4.3, 4.599999999999999, 4.8999999999999995, 5.200000000000001, 5.500000000000001]
 
@@ -19,21 +19,58 @@ X, Ẋ, Ẍ = limiter(R)
 
 @test Ẍ[1:20:end] ≈ [50.0, 50.0, 0.0, 0.0, 0.0, -50.0, -1.4308554341369017e-10, 3.561595462997502e-11, 1.06403774680075e-10, -1.3882228699912957e-10, -50.0, -50.0, -50.0, 50.0, 50.0, -1.2017054018542694e-10, 1.1097789354153065e-10, 3.774758283725532e-11, 1.0857981180834031e-10, -2.0525803279269894e-10, -50.0, -50.0, -50.0, 50.0, 50.0, 8.464340339742193e-11, -4.0678571622265736e-11, 3.7694292132073315e-10, 1.7053025658242404e-11, -1.8989254613188677e-10, -50.0]
 
-X2, Ẋ2, Ẍ2 = limiter(X, Ẋ, Ẍ, R)
+X2, Ẋ2, Ẍ2 = limiter(X, Ẋ, Ẍ, R)
 @test X2 === X
 
 
-# plot(
-#     t,
-#     [X Ẋ Ẍ],
-#     plotu = true,
-#     c = :black,
-#     title = ["Position \$x(t)\$" "Velocity \$ẋ(t)\$" "Acceleration \$u(t)\$"],
-#     ylabel = "",
-#     layout = (3,1),
-#     lab = "Limited trajectory",
-#     legend = :bottomright,
-# )
+plot(
+    t,
+    [X Ẋ Ẍ],
+    plotu = true,
+    c = :black,
+    title = ["Position \$x(t)\$" "Velocity \$ẋ(t)\$" "Acceleration \$u(t)\$"],
+    ylabel = "",
+    layout = (4,1),
+    lab = "Limited trajectory",
+    legend = :bottomright,
+)
+plot!(r, extrema(t)..., sp = 1, lab = "Original reference", l = (:black, :dashdot))
+
+
+limiter = JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M)
+
+X, Ẋ, Ẍ, X⃛ = limiter(R)
+
+# Test that bounds are respected (with small tolerance for numerical errors)
+tol = 0.01
+@test all(abs.(Ẋ) .<= ẋM + tol)   # Velocity bound
+@test all(abs.(Ẍ) .<= ẍM + tol)   # Acceleration bound
+@test all(abs.(X⃛) .<= x⃛M + tol)  # Jerk bound
+
+# Test preallocated version
+X2, Ẋ2, Ẍ2, X⃛2 = limiter(X, Ẋ, Ẍ, X⃛, R)
+@test X2 === X
+
+# Test single step interface
+state = TrajectoryLimiters.JerkState(0.0, 0.0, 0.0, R[1], 0.0)
+state2, u = limiter(state, R[2])
+@test abs(u) <= x⃛M + tol
+
+# Plotting code for visual verification:
+using Plots
+plot!(
+    t,
+    [X Ẋ Ẍ X⃛],
+    c = :red,
+    title = ["Position" "Velocity" "Acceleration" "Jerk"],
+    ylabel = "",
+    layout = (4,1),
+    lab = "Limited trajectory",
+    legend = :bottomright,
+)
+hline!([ẋM, -ẋM], sp=2, lab="", l=:dash)
+hline!([ẍM, -ẍM], sp=3, lab="", l=:dash)
+hline!([x⃛M, -x⃛M], sp=4, lab="", l=:dash)
+
 # plot!(r, extrema(t)..., sp = 1, lab = "Original reference", l = (:black, :dashdot))
 end
-
