@@ -169,8 +169,9 @@ end
 
 # =============================================================================
 # Jerk-limited trajectory filter (Third-order)
-# Based on: "Third Order Trajectory Generator Satisfying Velocity, Acceleration
-# and Jerk Constraints" - R. Zanasi, R. Morselli (2002)
+# Based on: "Discrete-Time Third Order Trajectory Generator Satisfying Velocity,
+# Acceleration and Jerk Constraints" - O. Gerelli, C. Guarino Lo Bianco (2010)
+# IEEE Int. Conf. on Robotics and Automation (ICRA)
 # =============================================================================
 
 struct JerkTrajectoryLimiter{T}
@@ -202,85 +203,105 @@ function JerkTrajectoryLimiter(args...)
     JerkTrajectoryLimiter(promote(args...)...)
 end
 
-# Helper functions for the jerk-limited control law
-# These implement equations from the paper
+# Helper functions for the discrete-time jerk-limited control law
+# These implement equations from jerk2.pdf (Gerelli & Guarino Lo Bianco, 2010)
 
-# δ* (eq. 8): Curve in error space
-_δstar(ẏ, ÿ) = ẏ + ÿ * abs(ÿ) / 2
-
-# σ* (eq. 7): Sliding surface for unconstrained minimum-time control
-function _σstar(y, ẏ, ÿ)
-    δs = _δstar(ẏ, ÿ)
-    sδ = sign(δs)
-    abs_sδ = abs(sδ)
-    term1 = y + ẏ * ÿ
-    term2 = -ÿ^3 / 6 * (1 - 3 * abs_sδ)
-    inner = ÿ^2 + 2 * ẏ * sδ
-    term3 = inner > 0 ? sδ / 4 * sqrt(2 * inner^3) : zero(y)
-    term1 + term2 + term3
+# Velocity limit curves in z-coordinates (eq. 17-18)
+# z̄₂⁺(z₃) = -⌈z₃⌉(z₃ - (⌈z₃⌉-1)/2) for upper velocity bound
+# z̄₂⁻(z₃) = ⌈-z₃⌉(-z₃ - (⌈-z₃⌉-1)/2) for lower velocity bound
+function _z̄2_plus(z3)
+    c = ceil(z3)
+    -c * (z3 - (c - 1) / 2)
 end
 
-# ν⁺* (eq. 17): Modified surface for max velocity bound
-function _νplus_star(y, ẏ, ÿ, ÿM)
-    term1 = ÿM * (ÿ^2 - 2ẏ) / 4
-    term2 = (ÿ^2 - 2ẏ)^2 / (8 * ÿM)
-    term3 = ÿ * (3ẏ - ÿ^2) / 3
-    y - term1 - term2 - term3
+function _z̄2_minus(z3)
+    c = ceil(-z3)
+    c * (-z3 - (c - 1) / 2)
 end
 
-# ν⁻* (eq. 18): Modified surface for min velocity bound
-function _νminus_star(y, ẏ, ÿ, ÿM)
-    term1 = ÿM * (ÿ^2 + 2ẏ) / 4
-    term2 = (ÿ^2 + 2ẏ)^2 / (8 * ÿM)
-    term3 = ÿ * (3ẏ + ÿ^2) / 3
-    y - term1 - term2 + term3
+# Compute sliding surface σₙ (eq. 22-23)
+function _compute_σ(γ)
+    m = floor((1 + sqrt(1 + 8 * abs(γ))) / 2)
+    -(m - 1) / 2 * sign(γ) - γ / m
 end
 
-# uₐ(a) (eq. 12): Control for reaching acceleration a
-_ua(ÿ, a, U) = -U * sign(ÿ - a)
+# Minimum-time sliding surface σ₃ from reference [16] (Zanasi & Morselli, Automatica 2003)
+# The control law from [16] eq. 16 is: α = z₃ + c_z2*z₂ + c_z1*z₁ + c_η*η, u = -sat(α)
+# So: σ₃ = -(c_z2*z₂ + c_z1*z₁ + c_η*η)
 
-# δ(v) for velocity control (eq. 13)
-_δv(ẏ, ÿ, v) = ÿ * abs(ÿ) + 2 * (ẏ - v)
-
-# uᵥ(v) (eq. 13): Control for reaching velocity v with acceleration bounds
-function _uv(ẏ, ÿ, v, ÿm, ÿM, U)
-    δv = _δv(ẏ, ÿ, v)
-    sδv = sign(δv)
-    ucv = -U * sign(δv + (1 - abs(sδv)) * ÿ)
-    clamp(ucv, _ua(ÿ, ÿm, U), _ua(ÿ, ÿM, U))
+# Compute B⁺ₕ,ₖ vertex coordinates (eq. 11 from [16])
+function _B_plus(h, k)
+    z1 = k*(k-1)*(k-2)//6 + k*(k-1)*h//2 + h*(h-1)*k//2 - h*(h-1)*(h-2)//6
+    z2 = h*(h-1)//2 - h*k - k*(k-1)//2
+    Float64(z1), Float64(z2)
 end
 
-# Σ* (eq. 19): Selects appropriate surface based on region
-function _Σstar(y, ẏ, ÿ, ÿm, ÿM)
-    # Check which region we're in
-    # R_ν+ : ÿ ≤ ÿM and ẏ ≤ ÿ²/2 - ÿM²
-    # R_ν- : ÿ ≥ ÿm and ẏ ≥ ÿm² - ÿ²/2
-    if ÿ <= ÿM && ẏ <= ÿ^2 / 2 - ÿM^2
-        return _νplus_star(y, ẏ, ÿ, ÿM)
-    elseif ÿ >= ÿm && ẏ >= ÿm^2 - ÿ^2 / 2
-        return _νminus_star(y, ẏ, ÿ, abs(ÿm))  # Use |ÿm| since ÿM in paper is positive
+# Check if point (z1, z2) is inside parallelogram with vertices v1, v2, v3, v4
+function _point_in_parallelogram(z1, z2, v1, v2, v3, v4)
+    # Cross product sign check
+    cross_sign(ax, ay, bx, by, px, py) = sign((bx - ax) * (py - ay) - (by - ay) * (px - ax))
+
+    s1 = cross_sign(v1[1], v1[2], v2[1], v2[2], z1, z2)
+    s2 = cross_sign(v2[1], v2[2], v3[1], v3[2], z1, z2)
+    s3 = cross_sign(v3[1], v3[2], v4[1], v4[2], z1, z2)
+    s4 = cross_sign(v4[1], v4[2], v1[1], v1[2], z1, z2)
+
+    (s1 >= 0 && s2 >= 0 && s3 >= 0 && s4 >= 0) || (s1 <= 0 && s2 <= 0 && s3 <= 0 && s4 <= 0)
+end
+
+# Find (h, k, η) for a given (z1, z2) point - Figure 7 in [16]
+function _find_hkη(z1, z2)
+    # Handle symmetry: P⁻ₕ,ₖ = -P⁺ₕ,ₖ
+    if z1 < 0 || (z1 == 0 && z2 > 0)
+        η = -one(z1)
+        z1, z2 = -z1, -z2
     else
-        return _σstar(y, ẏ, ÿ)
+        η = one(z1)
     end
+
+    # Special case near origin
+    if abs(z1) < 0.5 && abs(z2) < 0.5
+        return one(z1), one(z1), η
+    end
+
+    # Estimate search range based on scaling
+    scale = sqrt(abs(z1) + abs(z2) + 1)
+    max_search = max(5, Int(ceil(3 * scale)))
+
+    # Search for parallelogram containing (z1, z2)
+    for total in 2:max_search+100
+        for h in 1:total-1
+            k = total - h
+            k < 1 && continue
+
+            # Vertices of P⁺ₕ,ₖ: B⁺ₕ,ₖ, B⁺ₕ₊₁,ₖ₋₁, B⁺ₕ₊₁,ₖ, B⁺ₕ,ₖ₊₁
+            v1 = _B_plus(h, k)
+            v2 = _B_plus(h+1, k-1)
+            v3 = _B_plus(h+1, k)
+            v4 = _B_plus(h, k+1)
+
+            if _point_in_parallelogram(z1, z2, v1, v2, v3, v4)
+                return typeof(z1)(h), typeof(z1)(k), η
+            end
+        end
+    end
+
+    # Fallback
+    return one(z1), one(z1), η
 end
 
-# Full control law (eq. 19)
-function _jerk_control(y, ẏ, ÿ, ẏm, ẏM, ÿm, ÿM, U)
-    Σs = _Σstar(y, ẏ, ÿ, ÿm, ÿM)
-    δs = _δstar(ẏ, ÿ)
-    sΣ = sign(Σs)
-    sδ = sign(δs)
+# Compute σ₃ using the formula from [16] eq. 16
+function _compute_σ3(z1, z2)
+    h, k, η = _find_hkη(z1, z2)
 
-    # Inner control: u_c = -U sgn{Σ* + (1-|sgn(Σ*)|)·[δ* + (1-|sgn(δ*)|)ÿ]}
-    inner = δs + (1 - abs(sδ)) * ÿ
-    arg = Σs + (1 - abs(sΣ)) * inner
-    uc = -U * sign(arg)
+    # From [16] eq. 16: α = z₃ + (2h+k-1)/(h(h+k))*z₂ + 2/(h(h+k))*z₁ + c_η*η
+    # So σ₃ = -[those terms] since we want α = z₃ - σ₃
+    denom = h * (h + k)
+    c_z2 = (2h + k - 1) / denom
+    c_z1 = 2 / denom
+    c_η = (2h^3 + k^3 + 3h^2*k - 3h*k - 3h^2 + h - k) / (6 * denom)
 
-    # Apply velocity limits via u_v
-    u_lower = _uv(ẏ, ÿ, ẏm, ÿm, ÿM, U)
-    u_upper = _uv(ẏ, ÿ, ẏM, ÿm, ÿM, U)
-
-    clamp(uc, u_lower, u_upper)
+    -(c_z2 * z2 + c_z1 * z1 + c_η * η)
 end
 
 """
@@ -298,31 +319,69 @@ Return an updated state and the jerk for the jerk-limited trajectory filter.
 """
 function trajlim(state::JerkState, rt, Ts, ẋM, ẍM, x⃛M)
     (; x, ẋ, ẍ, r, ṙ) = state
+    T = Ts
     U = x⃛M
+    TU = T * U
 
     # Update reference velocity estimate
-    ṙ_new = (rt - r) / Ts
+    ṙ_new = (rt - r) / T
     r_new = rt
 
-    # Normalized error coordinates (eq. 4 area)
-    # The paper assumes r̈ = 0 for admissible references
-    y = (x - r_new) / U
-    ẏ = (ẋ - ṙ_new) / U
-    ÿ = ẍ / U
+    # Error coordinates (y = x - r)
+    y = x - r_new
+    ẏ = ẋ - ṙ_new
+    ÿ = ẍ  # r̈ = 0 for admissible references
 
-    # Normalized bounds
-    ẏM = (ẋM - ṙ_new) / U  # Corresponds to eq. 11 with ṙ instead of ṙmax
-    ẏm = (-ẋM - ṙ_new) / U
-    ÿM = ẍM / U
-    ÿm = -ẍM / U
+    # Normalized coordinates z = W⁻¹ y (eq. 12)
+    z1 = (1 / TU) * (y / T^2 + ẏ / T + ÿ / 3)
+    z2 = (1 / TU) * (ẏ / T + ÿ / 2)
+    z3 = ÿ / TU
 
-    # Compute control (jerk)
-    u = _jerk_control(y, ẏ, ÿ, ẏm, ẏM, ÿm, ÿM, U)
+    # Bounds in z-coordinates (eq. 13-16)
+    z2_plus = (ẋM - ṙ_new) / (T^2 * U)   # max velocity bound
+    z2_minus = (-ẋM - ṙ_new) / (T^2 * U)  # min velocity bound
+    z3_plus = ẍM / (T * U)                 # max acceleration bound
+    z3_minus = -ẍM / (T * U)               # min acceleration bound
 
-    # Discrete-time integration (trapezoidal rule, matching existing code pattern)
-    ẍ1 = Ts * u + ẍ
-    ẋ1 = Ts / 2 * (ẍ1 + ẍ) + ẋ
-    x1 = Ts / 2 * (ẋ1 + ẋ) + x
+    # Velocity limit curves evaluated at current z3 (eq. 17-18)
+    z̄2_plus = _z̄2_plus(z3_plus)
+    z̄2_minus = _z̄2_minus(z3_minus)
+
+    # d₁ and d₂: distances to velocity curves (eq. 19-20)
+    d1 = z2 - z̄2_plus
+    d2 = z2 - z̄2_minus
+
+    # γ values clamped to acceleration bounds (eq. 21)
+    γ1 = clamp(d1, z2_minus, z2_plus)
+    γ2 = clamp(d2, z2_minus, z2_plus)
+
+    # Compute sliding surfaces (eq. 22-23)
+    σ1 = _compute_σ(γ1)  # Upper velocity constraint surface
+    σ2 = _compute_σ(γ2)  # Lower velocity constraint surface
+    σ3 = _compute_σ3(z1, z2)  # Minimum-time surface (eq. 24)
+
+    # Select sliding surface (eq. 25): σ = max(σ₁, min(σ₃, σ₂))
+    σ = if σ1 <= σ3
+        σ1
+    elseif σ2 <= σ3 <= σ1
+        σ3
+    elseif σ3 < σ2
+        σ2
+    else
+        error("Unreachable case in sliding surface selection")
+    end
+
+    # Control law (eq. 26-27)
+    α = z3 - σ
+    u = -U * sat(α)
+
+    # Discrete-time integration (eq. 2-3 from paper)
+    # x_{i+1} = x_i + T*ẋ_i + T²/2*ẍ_i + T³/6*u_i
+    # ẋ_{i+1} = ẋ_i + T*ẍ_i + T²/2*u_i
+    # ẍ_{i+1} = ẍ_i + T*u_i
+    x1 = x + T * ẋ + T^2 / 2 * ẍ + T^3 / 6 * u
+    ẋ1 = ẋ + T * ẍ + T^2 / 2 * u
+    ẍ1 = ẍ + T * u
 
     JerkState(x1, ẋ1, ẍ1, r_new, ṙ_new), u
 end
