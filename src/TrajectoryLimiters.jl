@@ -38,6 +38,33 @@ export TrajectoryLimiter, JerkTrajectoryLimiter
 sat(x) = clamp(x, -one(x), one(x))
 
 """
+    x_to_z(pos, vel, acc, T, U)
+
+Transform physical state to z-coordinates (W⁻¹ transform from jerk2.pdf eq. 12).
+"""
+function x_to_z(pos, vel, acc, T, U)
+    TU = T * U
+    z1 = (1/TU) * (pos/T^2 + vel/T + acc/3)
+    z2 = (1/TU) * (vel/T + acc/2)
+    z3 = acc / TU
+    return z1, z2, z3
+end
+
+"""
+    z_to_x(z1, z2, z3, T, U)
+
+Transform z-coordinates back to physical state (W transform from jerk2.pdf eq. 9).
+"""
+function z_to_x(z1, z2, z3, T, U)
+    TU = T * U
+    T2 = T^2
+    pos = TU * (T2/6 * z1 - T2/2 * z2 + T2/2 * z3)
+    vel = TU * (T * z2 - T/2 * z3)
+    acc = TU * z3
+    return pos, vel, acc
+end
+
+"""
     State{T}
 
 # Fields:
@@ -61,12 +88,15 @@ State(R) = State(0*R[1], 0, R[1], 0)
 
 State for the jerk-limited trajectory filter.
 
+Internally stores normalized z-coordinates (from jerk2.pdf) for better numerical conditioning.
+Use `z_to_x` to convert back to physical coordinates when needed.
+
 # Fields:
-- `x`: Filtered reference position
-- `ẋ`: Filtered reference velocity
-- `ẍ`: Filtered reference acceleration
-- `r`: Reference position
-- `ṙ`: Reference velocity
+- `x`: z1 coordinate (normalized position-related)
+- `ẋ`: z2 coordinate (normalized velocity-related)
+- `ẍ`: z3 coordinate (normalized acceleration)
+- `r`: Reference position (physical)
+- `ṙ`: Reference velocity (physical)
 """
 struct JerkState{T}
     x::T
@@ -78,6 +108,14 @@ end
 
 JerkState(args...) = JerkState(promote(args...)...)
 JerkState(R) = JerkState(0*R[1], 0, 0, R[1], 0)
+
+"""
+    JerkState(R::AbstractVector, T, U)
+
+Initialize JerkState in z-coordinates from reference array R.
+Initial physical state (0, 0, 0) maps to z-coordinates (0, 0, 0).
+"""
+JerkState(R::AbstractVector, T, U) = JerkState(zero(eltype(R)), 0, 0, R[1], 0)
 
 struct TrajectoryLimiter{T}
     Ts::T
@@ -184,12 +222,12 @@ struct JerkTrajectoryLimiter{T, M}
 end
 
 """
-    limiter = JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=20)
+    limiter = JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=100)
 
 Create a jerk-limited trajectory limiter using Model Predictive Control.
 
-The limiter uses a discrete-time triple integrator model with state `[position, velocity, acceleration]`
-and input `jerk`. It minimizes position tracking error while respecting velocity, acceleration, and jerk bounds.
+The limiter uses normalized z-coordinates (from jerk2.pdf) for better numerical conditioning.
+State is `[z1, z2, z3]` (normalized coordinates) and input is physical jerk.
 
 Can be called like so:
 ```julia
@@ -209,70 +247,62 @@ X, Ẋ, Ẍ, X⃛ = limiter(R::Vector) # Uses a zero initial state
 # Keyword Arguments
 - `Np`: Prediction horizon
 """
-function JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=100)
+function JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=60)
     Ts, ẋM, ẍM, x⃛M = promote(Ts, ẋM, ẍM, x⃛M)
+    T, U = Ts, x⃛M
+    TU = T * U
 
-    # Continuous-time triple integrator: ẋ = Ac*x + Bc*u
-    # State: [position, velocity, acceleration], Input: jerk
-    Ac = [0 1.0 0; 0 0 1; 0 0 0]
-    Bc = [0.0; 0; 1]
+    # Normalized discrete-time system in z-coordinates (from jerk2.pdf eq. 10)
+    # z_{k+1} = Ad * z_k + bd * u_k
+    Ad = [1.0 1.0 1.0; 0.0 1.0 1.0; 0.0 0.0 1.0]
+    bd = [1/U; 1/U; 1/U]
 
-    # Output matrix: track position and velocity
-    Cc = [1.0 0 0; 0 1 0; 0 0 1]
-    # C = [1.0 0 0]
-    # M = exp([Ac Bc zeros(3,1); zeros(1,3) zeros(1,1) I(1); zeros(1,5)] * Ts)
-    # F = M[1:3, 1:3]
-    # G = M[1:3, 4]
-    # G1 = M[1:3, 4]
+    # Output matrix: track all z-states
+    Cd = [1.0 0 0; 0 1 0; 0 0 1]
 
-    # Create MPC (LinearMPC will discretize automatically)
-    # mpc = LinearMPC.MPC(A, B; C, Ts=Float64(Ts), Np, Nc)
-    mpc = LinearMPC.MPC(Ac, Bc, Float64(Ts); C=Cc, Np)
+    # Create MPC with discrete-time z-space model (already discrete, Ts just for record-keeping)
+    mpc = LinearMPC.MPC(Ad, bd; C=Cd, Ts=Float64(Ts), Np)
 
-    # Set objective: minimize position and velocity tracking error
-    set_objective!(mpc; Q=[1e4, 0, 0], R=[1e-6], Rr=[1e-4], Qf=[1e8, 1e-2, 1e-3])
-    # Set jerk (input) bounds
+    # Set objective in z-space (tune weights as needed)
+    set_objective!(mpc; Q=[1, 0, 0], R=[1e-10], Rr=[1e-10], Qf=[10, 1, 1])
+
+    # Set jerk (input) bounds - u is still physical jerk
     set_input_bounds!(mpc; umin=[-x⃛M], umax=[x⃛M])
 
-    # add_constraint!(mpc;
-    #     Ax=[1 0.0 0.0],
-    #     Ar=[-1 0.0 0.0],
-    #     lb=[0], ub=[0], ks=Np:Np,
-    #     soft=true)
-
+    # Velocity constraint in z-space:
+    # From z_to_x: vel = TU * (T * z2 - T/2 * z3)
+    # So: -ẋM ≤ TU * T * (z2 - z3/2) ≤ ẋM
+    # Divide by TU*T: -ẋM/(TU*T) ≤ z2 - z3/2 ≤ ẋM/(TU*T)
+    vel_bound = ẋM / (TU * T)
     add_constraint!(mpc;
-        Ax=[0.0 1.0 0.0],
-        lb=[-ẋM], ub=[ẋM],
+        Ax=[0.0 1.0 -0.5],  # z2 - z3/2 represents normalized velocity
+        lb=[-vel_bound], ub=[vel_bound],
         soft=false)
 
-    # Add acceleration constraint: -ẍM ≤ x₃ ≤ ẍM (soft to avoid infeasibility)
+    # Acceleration constraint in z-space:
+    # From z_to_x: acc = TU * z3
+    # So: -ẍM ≤ TU * z3 ≤ ẍM => z3 ∈ [-ẍM/TU, ẍM/TU]
+    acc_bound = ẍM / TU
     add_constraint!(mpc;
         Ax=[0.0 0.0 1.0],
-        lb=[-ẍM], ub=[ẍM],
+        lb=[-acc_bound], ub=[acc_bound],
         soft=false)
 
-    sysd = ss(mpc.model.F, mpc.model.G, Cc, 0)
+    # Pole placement for prestabilizing feedback (optional)
+    sysd = ss(Ad, bd, Cd, 0)
     K = place(sysd, [0.3, 0.3, 0.3])
-    # LinearMPC.set_prestabilizing_feedback!(mpc, K)
+    LinearMPC.set_prestabilizing_feedback!(mpc, K)
+
     mpc.settings.reference_preview = true
 
-    LinearMPC.move_block!(mpc,[ones(40); 1ones(100)])
-
-    # parameter_range = LinearMPC.ParameterRange(mpc)
-    # parameter_range.xmax .= [10, ẋM, ẍM]
-    # parameter_range.xmin .= -[10, ẋM, ẍM]
-    # parameter_range.rmax .= [10, ẋM, ẍM]
-    # parameter_range.rmin .= -[10, ẋM, ẍM]
-    # mpc = LinearMPC.ExplicitMPC(mpc; build_tree=true, range=parameter_range)
+    # LinearMPC.move_block!(mpc, [ones(40); 1ones(100)])
 
     # Setup the MPC (converts to QP form)
     setup!(mpc)
 
     LinearMPC.DAQP.settings(mpc.opt_model, Dict(
-        # :iter_limit => 2000,
-        # :primal_tol => 1e-8,
         :dual_tol => 1e-10,
-        :pivot_tol => 1e-5, # A higher value improves stability. 1e-6
+        :pivot_tol => 1e-5,
     ))
 
     JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M, mpc)
@@ -288,58 +318,77 @@ end
 
 Compute one step of the jerk-limited trajectory filter using MPC.
 
-Returns updated state and the jerk control input.
+State is stored in z-coordinates internally. Reference is transformed to z-space.
+Returns updated state (in z-coordinates) and the physical jerk control input.
 """
 function trajlim(state::JerkState, rt::Number, limiter::JerkTrajectoryLimiter)
-    T = limiter.Ts
+    T, U = limiter.Ts, limiter.x⃛M
 
-    # Current state vector [position, velocity, acceleration]
-    x = [state.x, state.ẋ, state.ẍ]
-    A = limiter.mpc.model.F
-    B = limiter.mpc.model.G
+    # Current state vector in z-coordinates [z1, z2, z3]
+    z = [state.x, state.ẋ, state.ẍ]
+    Ad = limiter.mpc.model.F
+    Bd = limiter.mpc.model.G
 
+    # Compute reference derivatives in physical coordinates
     ṙ_new = (rt - state.r) / T
     r̈_new = (ṙ_new - state.ṙ) / T
 
-    r = [rt, ṙ_new, r̈_new]
+    # Transform reference to z-coordinates
+    r_z1, r_z2, r_z3 = x_to_z(rt, ṙ_new, r̈_new, T, U)
+
+    # Build reference preview in z-space
+    r_z = [r_z1, r_z2, r_z3]
     R = zeros(3, limiter.mpc.Np)
-    R[:, 1] .= r
+    R[:, 1] .= r_z
     for i = 1:limiter.mpc.Np-1
-        R[:, i+1] .= A*R[:, i] # predict reference assuming zero jerk
+        R[:, i+1] .= Ad * R[:, i]  # predict reference assuming zero jerk
     end
 
-    u_vec = compute_control(limiter.mpc, x; r=R, check=true)
+    # Compute control (u is physical jerk)
+    u_vec = compute_control(limiter.mpc, z; r=R, check=true)
     u = u_vec[1]
-    x1 = A*x + B*u
-    x1, ẋ1, ẍ1 = x1
 
-    JerkState(x1, ẋ1, ẍ1, rt, ṙ_new), u
+    # Propagate in z-space
+    z_next = Ad * z + Bd * u
+
+    JerkState(z_next[1], z_next[2], z_next[3], rt, ṙ_new), u
 end
 
 function trajlim(state::JerkState, R::AbstractMatrix, limiter::JerkTrajectoryLimiter)
-    T = limiter.Ts
+    T, U = limiter.Ts, limiter.x⃛M
 
-    # Current state vector [position, velocity, acceleration]
-    x = [state.x, state.ẋ, state.ẍ]
-    A = limiter.mpc.model.F
-    B = limiter.mpc.model.G
-    rt = R[1]
+    # Current state vector in z-coordinates [z1, z2, z3]
+    z = [state.x, state.ẋ, state.ẍ]
+    Ad = limiter.mpc.model.F
+    Bd = limiter.mpc.model.G
+
+    # Physical reference from first column
+    rt = R[1, 1]
     ṙ_new = (rt - state.r) / T
 
-    u_vec = compute_control(limiter.mpc, x; r=R, check=true)
-    u = u_vec[1]
-    x1 = A*x + B*u
-    x1, ẋ1, ẍ1 = x1
+    # Transform reference matrix to z-coordinates
+    R_z = similar(R)
+    for i = 1:size(R, 2)
+        R_z[1, i], R_z[2, i], R_z[3, i] = x_to_z(R[1, i], R[2, i], R[3, i], T, U)
+    end
 
-    JerkState(x1, ẋ1, ẍ1, rt, ṙ_new), u
+    # Compute control (u is physical jerk)
+    u_vec = compute_control(limiter.mpc, z; r=R_z, check=true)
+    u = u_vec[1]
+
+    # Propagate in z-space
+    z_next = Ad * z + Bd * u
+
+    JerkState(z_next[1], z_next[2], z_next[3], rt, ṙ_new), u
 end
 
 function (limiter::JerkTrajectoryLimiter)(state::JerkState, r)
     trajlim(state, r, limiter)
 end
 
-(limiter::JerkTrajectoryLimiter)(R::AbstractArray; kwargs...) = limiter(JerkState(R), R; kwargs...)
-(limiter::JerkTrajectoryLimiter)(X, Ẋ, Ẍ, X⃛, R::AbstractArray; kwargs...) = limiter(JerkState(R), X, Ẋ, Ẍ, X⃛, R; kwargs...)
+# Initialize JerkState with z-coordinates (requires T and U from limiter)
+(limiter::JerkTrajectoryLimiter)(R::AbstractArray; kwargs...) = limiter(JerkState(R, limiter.Ts, limiter.x⃛M), R; kwargs...)
+(limiter::JerkTrajectoryLimiter)(X, Ẋ, Ẍ, X⃛, R::AbstractArray; kwargs...) = limiter(JerkState(R, limiter.Ts, limiter.x⃛M), X, Ẋ, Ẍ, X⃛, R; kwargs...)
 
 function (limiter::JerkTrajectoryLimiter)(state::JerkState, R::AbstractVector; kwargs...)
     X = similar(R)
@@ -350,17 +399,20 @@ function (limiter::JerkTrajectoryLimiter)(state::JerkState, R::AbstractVector; k
 end
 
 function (limiter::JerkTrajectoryLimiter)(state::JerkState, X, Ẋ, Ẍ, X⃛, R::AbstractVector; causal=true)
-    T = length(R)
-    length(X) == length(Ẋ) == length(Ẍ) == length(X⃛) == T || throw(ArgumentError("Inconsistent array lengths"))
+    Ts, U = limiter.Ts, limiter.x⃛M
+    Tlen = length(R)
+    length(X) == length(Ẋ) == length(Ẍ) == length(X⃛) == Tlen || throw(ArgumentError("Inconsistent array lengths"))
     if !causal
-        Rd = centraldiff(R) ./ limiter.Ts
-        Rdd = centraldiff(Rd) ./ limiter.Ts
+        Rd = centraldiff(R) ./ Ts
+        Rdd = centraldiff(Rd) ./ Ts
         Rmat = [R Rd Rdd]'
     end
-    @inbounds for i = 1:T
-        X[i] = state.x
-        Ẋ[i] = state.ẋ
-        Ẍ[i] = state.ẍ
+    @inbounds for i = 1:Tlen
+        # Transform z-state to physical coordinates for output
+        pos, vel, acc = z_to_x(state.x, state.ẋ, state.ẍ, Ts, U)
+        X[i] = pos
+        Ẋ[i] = vel
+        Ẍ[i] = acc
         state, u = limiter(state, causal ? R[i] : Rmat[:, i:end])
         X⃛[i] = u
     end
