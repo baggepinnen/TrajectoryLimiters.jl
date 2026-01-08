@@ -209,7 +209,7 @@ X, Ẋ, Ẍ, X⃛ = limiter(R::Vector) # Uses a zero initial state
 # Keyword Arguments
 - `Np`: Prediction horizon
 """
-function JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=60)
+function JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=100)
     Ts, ẋM, ẍM, x⃛M = promote(Ts, ẋM, ẍM, x⃛M)
 
     # Continuous-time triple integrator: ẋ = Ac*x + Bc*u
@@ -230,11 +230,16 @@ function JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=60)
     mpc = LinearMPC.MPC(Ac, Bc, Float64(Ts); C=Cc, Np)
 
     # Set objective: minimize position and velocity tracking error
-    set_objective!(mpc; Q=[0, 1e-10, 1e-9], R=[1e-9], Rr=[1e-8], Qf=[1e7, 1e-1, 1e-3])
+    set_objective!(mpc; Q=[1e4, 0, 0], R=[1e-6], Rr=[1e-4], Qf=[1e8, 1e-2, 1e-3])
     # Set jerk (input) bounds
     set_input_bounds!(mpc; umin=[-x⃛M], umax=[x⃛M])
 
-    # Add velocity constraint: -ẋM ≤ x₂ ≤ ẋM (soft to avoid infeasibility)
+    # add_constraint!(mpc;
+    #     Ax=[1 0.0 0.0],
+    #     Ar=[-1 0.0 0.0],
+    #     lb=[0], ub=[0], ks=Np:Np,
+    #     soft=true)
+
     add_constraint!(mpc;
         Ax=[0.0 1.0 0.0],
         lb=[-ẋM], ub=[ẋM],
@@ -246,8 +251,12 @@ function JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=60)
         lb=[-ẍM], ub=[ẍM],
         soft=false)
 
-    # LinearMPC.set_prestabilizing_feedback!(mpc)
+    sysd = ss(mpc.model.F, mpc.model.G, Cc, 0)
+    K = place(sysd, [0.3, 0.3, 0.3])
+    # LinearMPC.set_prestabilizing_feedback!(mpc, K)
     mpc.settings.reference_preview = true
+
+    LinearMPC.move_block!(mpc,[ones(40); 1ones(100)])
 
     # parameter_range = LinearMPC.ParameterRange(mpc)
     # parameter_range.xmax .= [10, ẋM, ẍM]
@@ -261,8 +270,9 @@ function JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=60)
 
     LinearMPC.DAQP.settings(mpc.opt_model, Dict(
         # :iter_limit => 2000,
-        :primal_tol => 1e-8,
-        # :dual_tol => 1e-8,
+        # :primal_tol => 1e-8,
+        :dual_tol => 1e-10,
+        :pivot_tol => 1e-5, # A higher value improves stability. 1e-6
     ))
 
     JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M, mpc)
