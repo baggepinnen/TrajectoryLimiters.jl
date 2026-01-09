@@ -128,6 +128,8 @@ lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
 # Plan a trajectory from rest at position 0 to rest at position 1
 profile = calculate_trajectory(lim; pf=1.0)
 
+Tf = duration(profile)  # Total trajectory duration
+
 # Evaluate the trajectory at any time
 t = 0.05 # May also be a vector of time points
 p, v, a, j = evaluate_at(profile, t)
@@ -210,8 +212,6 @@ plot(
     plot(ts, acc, ylabel="Acceleration", label=""),
     layout=(3,1), xlabel="Time [s]", size=(600,450)
 )
-hline!([0], sp=2, ls=:dash, c=:gray, label="")
-hline!([0], sp=3, ls=:dash, c=:gray, label="")
 ```
 
 ![initial velocity](https://private-user-images.githubusercontent.com/3797491/533803584-67ab9661-6ca0-4d5f-82dc-6d3b9cb9bbea.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NDkyNjMsIm5iZiI6MTc2Nzk0ODk2MywicGF0aCI6Ii8zNzk3NDkxLzUzMzgwMzU4NC02N2FiOTY2MS02Y2EwLTRkNWYtODJkYy02ZDNiOWNiOWJiZWEucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMDg1NjAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9NWI2NzkxODNkMWQ1OTNjYmZlNzk0MDM1ZTY2OTEyZDQzOTdmMmQ5NDcxNTBmZGMxMTQ1YWNlN2JlMzk0ODM4OSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.W3uS4WPk5_24CBGcerWHkRdTM6LKKbyGlTTxwrja9dg)
@@ -228,6 +228,161 @@ lim = JerkLimiter(;
     jmax=1000.0
 )
 ```
+
+### Multi-DOF Synchronized Trajectories
+
+For systems with multiple degrees of freedom (e.g., robotic arms, CNC machines), trajectories can be synchronized so that all DOFs reach their targets simultaneously. Each DOF can have different constraints, and the algorithm finds the time-optimal synchronized duration.
+
+The multi-DOF algorithm is invoked by passing an array of `JerkLimiter` instances to `calculate_trajectory`, one for each DOF:
+
+```julia
+using TrajectoryLimiters
+
+# Create limiters with different constraints for each DOF
+lims = [
+    JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),  # DOF 1
+    JerkLimiter(; vmax=5.0,  amax=40.0, jmax=500.0),   # DOF 2
+    JerkLimiter(; vmax=8.0,  amax=30.0, jmax=800.0),   # DOF 3
+]
+
+# Plan synchronized trajectories to target positions
+profiles = calculate_trajectory(lims;
+    pf = [1.0, 2.0, 0.5],  # Target positions for each DOF
+)
+
+# Evaluate all DOFs at a specific time
+t = 0.1
+ps, vs, as, js = evaluate_at(profiles, t)  # Returns vectors of length 3
+
+# Evaluate with initial states
+profiles = calculate_trajectory(lims;
+    p0 = [0.0, 1.0, 0.0],   # Initial positions
+    v0 = [1.0, 0.0, 0.5],   # Initial velocities
+    pf = [5.0, 4.0, 2.0],   # Target positions
+)
+
+# Sample and plot
+pos, vel, acc, jerk, ts = evaluate_dt(profiles, 0.001)
+
+plot(
+    plot(ts, pos, ylabel="Position", label=""),
+    plot(ts, vel, ylabel="Velocity", label=""),
+    plot(ts, acc, ylabel="Acceleration", label=""),
+    plot(ts, jerk, ylabel="Jerk", label=""),
+    layout=(4,1), xlabel="Time [s]", size=(600,700)
+)
+hline!([10 5 8], sp=2, ls=:dash, label="", c=(1:3)')
+hline!([50 30 40], sp=3, ls=:dash, label="", c=(1:3)')
+hline!([1000 500 800], sp=4, ls=:dash, label="", c=(1:3)')
+```
+
+![multi DOF synch](https://private-user-images.githubusercontent.com/3797491/533882036-2afc3934-d2bd-4043-baeb-910ff08fd03f.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NjEzOTMsIm5iZiI6MTc2Nzk2MTA5MywicGF0aCI6Ii8zNzk3NDkxLzUzMzg4MjAzNi0yYWZjMzkzNC1kMmJkLTQwNDMtYmFlYi05MTBmZjA4ZmQwM2YucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMTIxODEzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9Y2FmZmVmZDA5ZTUzNWMxYTJhYTk4MjUyNTdhNWM4ZmE2ZDQ2NGI1MjQ5ZWEzNDNjNzIxNzkxOWFmYjkyNGFkOCZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.329-h_Jy3DHIrLbz3dC75bRFI4e95B7wfl4FfqNKjCs)
+
+The image shows how different parts of the trajectory is limited by different degrees of freedom, all three DOF start and reach the end at the same time.
+
+### Multi-DOF Waypoint Trajectories
+
+For multi-DOF systems that need to pass through multiple waypoints, use `calculate_waypoint_trajectory` with an array of limiters. Each waypoint specifies arrays for position (and optionally velocity/acceleration) for all DOFs:
+
+```julia
+using TrajectoryLimiters
+using Plots
+
+# Two DOFs with different constraints
+lims = [
+    JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),  # DOF 1 (e.g., X axis)
+    JerkLimiter(; vmax=8.0, amax=40.0, jmax=800.0),    # DOF 2 (e.g., Y axis)
+]
+
+# Define 4 waypoints - each with position arrays for both DOFs
+waypoints = [
+    (p = [0.0, 0.0],),                      # Start at origin
+    (p = [2.0, 1.0],),                      # First waypoint
+    (p = [3.0, 3.0],),                      # Second waypoint
+    (p = [-0.5, 2.0],), 
+    (p = [0.0, 0.0],),                      # Final position
+]
+
+# Calculate synchronized trajectory through all waypoints
+ts, pos, vel, acc, jerk = calculate_waypoint_trajectory(lims, waypoints, 0.001)
+
+# Plot the trajectory in XY space
+scatter([wp.p[1] for wp in waypoints], [wp.p[2] for wp in waypoints],
+         label="Waypoints", ms=8, c=:red)
+plot!(pos[:, 1], pos[:, 2], label="Path", xlabel="X", ylabel="Y", aspect_ratio=:equal, c=1)
+```
+
+Each segment between waypoints is time-synchronized across all DOFs, ensuring coordinated motion through the entire path. Note, the trajectory is in general not globally time optimal since the velocity and acceleration targets at the waypoints are not optimized.
+
+#### Optimizing for global time-optimality
+We could try to optimize the waypoint velocities in order to minimize the total trajectory time (not a supported feature yet, this is only an example):
+```julia
+using Optim
+
+# Fixed waypoint positions (first and last have fixed v=0, a=0)
+positions = [
+    [0.0, 0.0],   # Start
+    [2.0, 1.0],   # Intermediate 1
+    [3.0, 3.0],   # Intermediate 2
+    [-0.5, 2.0],  # Intermediate 3
+    [0.0, 0.0],   # End
+]
+
+ndof = length(positions[1])
+n_intermediate = length(positions) - 2  # Exclude first and last
+
+# Build waypoints from optimization parameters
+# params layout: [v1..., v2..., ..., a1..., a2..., ...] for each intermediate waypoint
+function get_waypoints(params)
+    wps = [(p = positions[1], v=zeros(ndof), a=zeros(ndof))]  # First waypoint (fixed)
+    np = length(positions)
+    for i in 1:n_intermediate
+        push!(wps, (
+            p = positions[i + 1],
+            v = params[(i - 1) * ndof + 1 : i * ndof],
+            a = params[(n_intermediate * ndof) + (i - 1) * ndof + 1 : (n_intermediate * ndof) + i * ndof]
+        ))
+    end
+    push!(wps, (p = positions[end], v=zeros(ndof), a=zeros(ndof)))  # Last waypoint (fixed)
+    return wps
+end
+
+function cost(params)
+    try
+        ts, _ = calculate_waypoint_trajectory(lims, get_waypoints(params), 0.001)
+        return last(ts)  # Total trajectory time
+    catch
+        return Inf  # Infeasible trajectory
+    end
+end
+
+n_params = n_intermediate * ndof * 2  # velocities + accelerations
+initial_params = zeros(n_params)
+
+res = Optim.optimize(
+    cost,
+    initial_params,
+    ParticleSwarm(),
+    Optim.Options(
+        store_trace       = true,
+        show_trace        = true,
+        show_every        = 1,
+        iterations        = 1000,
+        allow_f_increases = false,
+        time_limit        = 100,
+        x_abstol          = 0,
+        f_abstol          = 0,
+        g_tol             = 1e-8,
+        f_calls_limit     = 0,
+        g_calls_limit     = 0,
+    ),
+)
+
+opt = Optim.minimizer(res)
+ts_opt, pos_opt, vel_opt, acc_opt, jerk_opt = calculate_waypoint_trajectory(lims, get_waypoints(opt), 0.001)
+plot!(pos_opt[:, 1], pos_opt[:, 2], label="Optimized Path")
+```
+![optimized trajectory](https://private-user-images.githubusercontent.com/3797491/533931993-02161a30-0a75-4471-8212-e8d9488192d0.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NjkxNTEsIm5iZiI6MTc2Nzk2ODg1MSwicGF0aCI6Ii8zNzk3NDkxLzUzMzkzMTk5My0wMjE2MWEzMC0wYTc1LTQ0NzEtODIxMi1lOGQ5NDg4MTkyZDAucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMTQyNzMxWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9ZGQ5NmZhODUzMzM1NjZhYWQ5YmQ0NDhkNDI2OTU5NTE5NWYyMDA4NDYwYTY1OWQyM2RjYTdmODIxZjBmMGYxYSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.usNMB6A5Fr1yJR8esDMdCtEvozr5-NBZA_t8Ne7GwkU)
 
 ### Profile Structure
 

@@ -5,13 +5,13 @@
 # License of reference: MIT License https://github.com/pantor/ruckig/blob/main/LICENSE
 
 export JerkLimiter, RuckigProfile
-export calculate_trajectory, evaluate_at, evaluate_dt
+export calculate_trajectory, calculate_waypoint_trajectory, evaluate_at, evaluate_dt, duration
 
 #=============================================================================
  Constants (matching reference implementation)
 =============================================================================#
 
-const EPS = eps(Float64)
+const EPS = 1e-12  # Matching reference implementation's v_eps/a_eps/j_eps
 const P_PRECISION = 1e-8
 const V_PRECISION = 1e-8
 const A_PRECISION = 1e-10
@@ -116,6 +116,70 @@ end
 # Allow RuckigProfile to broadcast as a scalar
 Base.Broadcast.broadcastable(p::RuckigProfile) = Ref(p)
 
+duration(p::RuckigProfile) = p.t_sum[end]
+
+#=============================================================================
+ Block: Stores profile and blocked time intervals for synchronization
+=============================================================================#
+
+"""
+    BlockInterval{T}
+
+Represents a blocked time interval [left, right) with an associated profile
+that becomes valid at the right endpoint.
+"""
+struct BlockInterval{T}
+    left::T
+    right::T
+    profile::RuckigProfile{T}
+end
+
+"""
+    Block{T}
+
+Stores the minimum-time profile and any blocked time intervals.
+Used to find valid synchronization times across multiple DOFs.
+
+A DOF is "blocked" at time t if:
+- t < t_min (faster than minimum time), OR
+- t is within interval a: a.left < t < a.right, OR
+- t is within interval b: b.left < t < b.right
+"""
+struct Block{T}
+    p_min::RuckigProfile{T}       # Minimum-time profile
+    t_min::T                       # Minimum duration
+    a::Union{Nothing, BlockInterval{T}}  # First blocked interval (optional)
+    b::Union{Nothing, BlockInterval{T}}  # Second blocked interval (optional)
+end
+
+"""Create a Block with just the minimum profile (no blocked intervals)."""
+function Block(p_min::RuckigProfile{T}) where T
+    Block{T}(p_min, duration(p_min), nothing, nothing)
+end
+
+"""Check if time t is blocked for this DOF."""
+function is_blocked(block::Block, t)
+    t < block.t_min && return true
+    !isnothing(block.a) && block.a.left < t < block.a.right && return true
+    !isnothing(block.b) && block.b.left < t < block.b.right && return true
+    return false
+end
+
+"""Get the appropriate profile for time t."""
+function get_profile(block::Block, t)
+    if !isnothing(block.b) && t >= block.b.right
+        return block.b.profile
+    end
+    if !isnothing(block.a) && t >= block.a.right
+        return block.a.profile
+    end
+    return block.p_min
+end
+
+#=============================================================================
+ Roots: Storage for polynomial roots
+=============================================================================#
+
 """
     Roots{T}
 
@@ -196,6 +260,15 @@ end
 function JerkLimiter(; vmax, amax, jmax, vmin=-vmax, amin=-amax)
     T = promote_type(typeof(vmax), typeof(vmin), typeof(amax), typeof(amin), typeof(jmax))
     JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}(), ProfileBuffer{Float64}())
+end
+
+function Base.show(io::IO, lim::JerkLimiter)
+    # Check if vmin/amin are at their default values
+    if lim.vmin == -lim.vmax && lim.amin == -lim.amax
+        print(io, "JerkLimiter(; vmax=$(lim.vmax), amax=$(lim.amax), jmax=$(lim.jmax))")
+    else
+        print(io, "JerkLimiter(; vmax=$(lim.vmax), vmin=$(lim.vmin), amax=$(lim.amax), amin=$(lim.amin), jmax=$(lim.jmax))")
+    end
 end
 
 #=============================================================================
@@ -468,14 +541,24 @@ function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::Reac
     abs(buf.v[8] - vf) > V_PRECISION && return false
     abs(buf.a[8] - af) > A_PRECISION && return false
 
+    # Determine direction and set limits accordingly (matching reference implementation)
+    # When vMax > 0, direction is UP; when vMax <= 0, direction is DOWN (limits swapped)
+    if vMax > 0
+        vUppLim, vLowLim = vMax + EPS, vMin - EPS
+        aUppLim, aLowLim = aMax + EPS, aMin - EPS
+    else
+        vUppLim, vLowLim = vMin + EPS, vMax - EPS
+        aUppLim, aLowLim = aMin + EPS, aMax - EPS
+    end
+
     # Check acceleration limits at critical points (indices 2, 4, 6 in 1-based = boundaries after phases 1, 3, 5)
     @inbounds for i in (2, 4, 6)
-        (buf.a[i] > aMax + EPS || buf.a[i] < aMin - EPS) && return false
+        (buf.a[i] > aUppLim || buf.a[i] < aLowLim) && return false
     end
 
     # Check velocity limits at critical points (indices 4-7 in 1-based)
     @inbounds for i in 4:7
-        (buf.v[i] > vMax + EPS || buf.v[i] < vMin - EPS) && return false
+        (buf.v[i] > vUppLim || buf.v[i] < vLowLim) && return false
     end
 
     # Check velocity at acceleration zero-crossings
@@ -489,7 +572,7 @@ function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::Reac
             t_zero = -ai / ji
             if 0 < t_zero < buf.t[i]
                 v_at_zero = buf.v[i] - ai^2 / (2ji)
-                (v_at_zero > vMax + EPS || v_at_zero < vMin - EPS) && return false
+                (v_at_zero > vUppLim || v_at_zero < vLowLim) && return false
             end
         end
     end
@@ -944,6 +1027,39 @@ function time_acc0_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
 end
 
 """
+Two-step ACC1_VEL profile (reaches aMin and vMax, skips aMax phase).
+From reference: time_acc1_vel_two_step
+"""
+function time_acc1_vel_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
+                                  jMax, vMax, vMin, aMax, aMin) where T
+    jMax_jMax = jMax^2
+    a0_a0 = a0^2
+    af_af = af^2
+    a0_p3 = a0^3
+    af_p3 = af^3
+    af_p4 = af^4
+    pd = pf - p0
+    vf_vf = vf^2
+
+    buf.t[1] = 0
+    buf.t[2] = 0
+    buf.t[3] = a0/jMax
+    buf.t[4] = -(3*af_p4 - 8*aMin*(af_p3 - a0_p3) - 24*aMin*jMax*(a0*v0 - af*vf) +
+                 6*af_af*(aMin^2 - 2*jMax*vf) -
+                 12*jMax*(2*aMin*jMax*pd + aMin^2*(vf + vMax) + jMax*(vMax^2 - vf_vf) +
+                          aMin*a0*(a0_a0 - 2*jMax*(v0 + vMax))/jMax)) / (24*aMin*jMax_jMax*vMax)
+    buf.t[5] = -aMin/jMax
+    buf.t[6] = -(af_af/2 - aMin^2 + jMax*(vMax - vf))/(aMin*jMax)
+    buf.t[7] = buf.t[5] + af/jMax
+
+    if check!(buf, UDDU, LIMIT_ACC1_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        return true
+    end
+
+    return false
+end
+
+"""
 Two-step VEL profile (simplified velocity-limited profile).
 """
 function time_vel_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
@@ -993,7 +1109,6 @@ function time_vel_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
     return false
 end
 
-
 #=============================================================================
  State Evaluation
 =============================================================================#
@@ -1004,7 +1119,7 @@ end
 Evaluate profile at time t.
 """
 function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
-    T_total = profile.t_sum[7]
+    T_total = duration(profile)
 
     if t <= 0
         return profile.p[1], profile.v[1], profile.a[1], profile.j[1]
@@ -1071,7 +1186,7 @@ Evaluate the trajectory at regular time intervals from 0 to the total duration.
 Returns `(positions, velocities, accelerations, jerks, ts)` where `ts` is the time vector.
 """
 function evaluate_dt(profile::RuckigProfile, Ts)
-    T = profile.t_sum[7]
+    T = duration(profile)
     ts = 0:Ts:T
     pos, vel, acc, jerk = evaluate_at(profile, ts)
     pos, vel, acc, jerk, ts
@@ -1101,103 +1216,1782 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
     buf = buffer
     clear!(buf)
 
-    # For positive displacement, try UP direction profiles
-    if pf >= p0
-        # Try velocity-limited profiles first
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        # Try ACC0_ACC1 (reaches amax and amin)
-        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        # Try ACC0, ACC1, NONE
-        if time_all_none_acc0_acc1!(lim.roots, buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        # Try two-step fallback profiles
-        if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
+    # Determine primary and secondary direction based on displacement
+    # For positive pd: primary uses standard limits
+    # For negative pd: primary uses swapped limits (to move in negative direction)
+    pd = pf - p0
+    if pd >= 0
+        jMax1, vMax1, vMin1, aMax1, aMin1 = jmax, vmax, vmin, amax, amin
+        jMax2, vMax2, vMin2, aMax2, aMin2 = -jmax, vmin, vmax, amin, amax
+    else
+        jMax1, vMax1, vMin1, aMax1, aMin1 = -jmax, vmin, vmax, amin, amax
+        jMax2, vMax2, vMin2, aMax2, aMin2 = jmax, vmax, vmin, amax, amin
     end
 
-    # Try DOWN direction (flip the problem)
+    # Try primary direction first
+    if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_all_none_acc0_acc1!(lim.roots, buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    # Try secondary direction (for complex cases like starting with velocity
+    # in the wrong direction)
     clear!(buf)
-    p0_flip, pf_flip = -p0, -pf
-    v0_flip, vf_flip = -v0, -vf
-    a0_flip, af_flip = -a0, -af
-    vmax_flip, vmin_flip = -vmin, -vmax
-    amax_flip, amin_flip = -amin, -amax
 
-    if pf_flip >= p0_flip
-        if time_all_vel!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                         jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            # Flip back
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
+    if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_all_none_acc0_acc1!(lim.roots, buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
+
+end
+
+#=============================================================================
+ Waypoint Trajectories
+=============================================================================#
+
+"""
+Extract position, velocity, acceleration from a waypoint named tuple.
+Defaults to v=0.0, a=0.0 if not specified.
+"""
+function get_waypoint_state(wp)
+    p = wp.p
+    v = hasproperty(wp, :v) ? wp.v : 0.0
+    a = hasproperty(wp, :a) ? wp.a : 0.0
+    (p, v, a)
+end
+
+"""
+    calculate_waypoint_trajectory(lim, waypoints, Ts)
+
+Calculate time-optimal trajectory passing through specified waypoints.
+
+# Arguments
+- `lim`: JerkLimiter with constraints
+- `waypoints`: Vector of named tuples with fields:
+  - `p`: Position at waypoint (required)
+  - `v`: Velocity at waypoint (default: 0.0)
+  - `a`: Acceleration at waypoint (default: 0.0)
+- `Ts`: Sample interval for output
+
+# Returns
+`(ts, ps, vs, as, js)` - Arrays of time, position, velocity, acceleration, jerk
+
+# Example
+```julia
+lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+waypoints = [(p=0.0,), (p=2.0, v=5.0), (p=5.0,)]
+ts, ps, vs, as, js = calculate_waypoint_trajectory(lim, waypoints)
+```
+"""
+function calculate_waypoint_trajectory(lim::JerkLimiter, waypoints, Ts)
+    n = length(waypoints)
+    n < 2 && error("Need at least 2 waypoints")
+
+    # Collect all segments
+    all_ts = Float64[]
+    all_ps = Float64[]
+    all_vs = Float64[]
+    all_as = Float64[]
+    all_js = Float64[]
+
+    t_offset = 0.0
+
+    for i in 1:(n-1)
+        # Extract states at waypoints
+        p0, v0, a0 = get_waypoint_state(waypoints[i])
+        pf, vf, af = get_waypoint_state(waypoints[i+1])
+
+        # Calculate time-optimal trajectory for this segment
+        profile = calculate_trajectory(lim; p0, v0, a0, pf, vf, af)
+
+        # Sample at Ts intervals
+        ps, vs, as, js, ts = evaluate_dt(profile, Ts)
+
+        # Shift times by offset and append
+        if i == 1
+            append!(all_ts, ts .+ t_offset)
+            append!(all_ps, ps)
+            append!(all_vs, vs)
+            append!(all_as, as)
+            append!(all_js, js)
+        else
+            # Skip first point to avoid duplicates at waypoint boundaries
+            append!(all_ts, (ts .+ t_offset)[2:end])
+            append!(all_ps, ps[2:end])
+            append!(all_vs, vs[2:end])
+            append!(all_as, as[2:end])
+            append!(all_js, js[2:end])
         end
 
-        if time_acc0_acc1!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                           jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
+        t_offset += duration(profile)
+    end
+
+    return all_ts, all_ps, all_vs, all_as, all_js
+end
+
+"""
+Extract waypoint state arrays for multi-DOF trajectories.
+"""
+function get_waypoint_state_multidof(wp, ndof)
+    p = wp.p
+    v = hasproperty(wp, :v) ? wp.v : zeros(eltype(p), ndof)
+    a = hasproperty(wp, :a) ? wp.a : zeros(eltype(p), ndof)
+    (p, v, a)
+end
+
+"""
+    calculate_waypoint_trajectory(lims::AbstractVector{<:JerkLimiter}, waypoints, Ts)
+
+Calculate time-synchronized trajectory passing through specified waypoints for multiple DOFs.
+
+Each waypoint is a named tuple with arrays for each state:
+- `p`: position array (required)
+- `v`: velocity array (optional, defaults to zeros)
+- `a`: acceleration array (optional, defaults to zeros)
+
+# Example
+```julia
+lims = [
+    JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),
+    JerkLimiter(; vmax=5.0, amax=30.0, jmax=500.0),
+]
+waypoints = [
+    (p = [0.0, 0.0],),
+    (p = [1.0, 2.0], v = [2.0, 1.0]),
+    (p = [3.0, 4.0],),
+]
+ts, ps, vs, as, js = calculate_waypoint_trajectory(lims, waypoints, 0.001)
+```
+
+Returns `(ts, ps, vs, as, js)` where `ps`, `vs`, `as`, `js` are matrices
+with each column corresponding to a DOF.
+"""
+function calculate_waypoint_trajectory(lims::AbstractVector{<:JerkLimiter{T}}, waypoints, Ts) where T
+    n = length(waypoints)
+    n < 2 && error("Need at least 2 waypoints")
+    ndof = length(lims)
+
+    # Collect all segments
+    all_ts = T[]
+    all_ps = Vector{T}[]
+    all_vs = Vector{T}[]
+    all_as = Vector{T}[]
+    all_js = Vector{T}[]
+
+    t_offset = zero(T)
+
+    for i in 1:(n-1)
+        # Extract states at waypoints
+        p0, v0, a0 = get_waypoint_state_multidof(waypoints[i], ndof)
+        pf, vf, af = get_waypoint_state_multidof(waypoints[i+1], ndof)
+
+        # Calculate synchronized trajectory for this segment
+        profiles = calculate_trajectory(lims; p0, v0, a0, pf, vf, af)
+
+        # Sample at Ts intervals
+        ps, vs, as, js, ts = evaluate_dt(profiles, Ts)
+
+        # Shift times by offset and append
+        if i == 1
+            append!(all_ts, ts .+ t_offset)
+            for k in axes(ps, 1)
+                push!(all_ps, ps[k, :])
+                push!(all_vs, vs[k, :])
+                push!(all_as, as[k, :])
+                push!(all_js, js[k, :])
+            end
+        else
+            # Skip first point to avoid duplicates at waypoint boundaries
+            append!(all_ts, (ts .+ t_offset)[2:end])
+            for k in 2:size(ps, 1)
+                push!(all_ps, ps[k, :])
+                push!(all_vs, vs[k, :])
+                push!(all_as, as[k, :])
+                push!(all_js, js[k, :])
+            end
         end
 
-        if time_all_none_acc0_acc1!(lim.roots, buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                                    jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
-        end
+        t_offset += duration(profiles[1])
+    end
 
-        # Try two-step fallback profiles for DOWN direction
-        if time_none_two_step!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                               jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
-        end
+    # Convert vectors of vectors to matrices
+    ps_mat = reduce(hcat, all_ps)'
+    vs_mat = reduce(hcat, all_vs)'
+    as_mat = reduce(hcat, all_as)'
+    js_mat = reduce(hcat, all_js)'
 
-        if time_acc0_two_step!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                               jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
-        end
+    return all_ts, Matrix(ps_mat), Matrix(vs_mat), Matrix(as_mat), Matrix(js_mat)
+end
 
-        if time_vel_two_step!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                              jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
+
+#=============================================================================
+ Step 2: Time-Synchronized Profile Calculation
+
+ These functions calculate profiles for a GIVEN duration tf, rather than
+ finding the minimum-time profile. Used for multi-DOF synchronization.
+=============================================================================#
+
+"""
+Pre-computed expressions for Step2 calculations to avoid repeated computation.
+"""
+struct Step2PreComputed{T}
+    pd::T       # pf - p0
+    tf::T       # target duration
+    tf_tf::T    # tf^2
+    tf_p3::T    # tf^3
+    tf_p4::T    # tf^4
+    vd::T       # vf - v0
+    vd_vd::T    # vd^2
+    v0_v0::T    # v0^2
+    vf_vf::T    # vf^2
+    ad::T       # af - a0
+    ad_ad::T    # ad^2
+    a0_a0::T    # a0^2
+    af_af::T    # af^2
+    a0_p3::T    # a0^3
+    a0_p4::T    # a0^4
+    a0_p5::T    # a0^5
+    a0_p6::T    # a0^6
+    af_p3::T    # af^3
+    af_p4::T    # af^4
+    af_p5::T    # af^5
+    af_p6::T    # af^6
+    jMax_jMax::T  # jMax^2
+    g1::T       # -pd + tf*v0
+    g2::T       # -2pd + tf*(v0 + vf)
+end
+
+function Step2PreComputed(tf, p0, v0, a0, pf, vf, af, jMax)
+    pd = pf - p0
+    tf_tf = tf * tf
+    tf_p3 = tf_tf * tf
+    tf_p4 = tf_tf * tf_tf
+
+    vd = vf - v0
+    vd_vd = vd * vd
+    v0_v0 = v0 * v0
+    vf_vf = vf * vf
+
+    ad = af - a0
+    ad_ad = ad * ad
+    a0_a0 = a0 * a0
+    af_af = af * af
+
+    a0_p3 = a0 * a0_a0
+    a0_p4 = a0_a0 * a0_a0
+    a0_p5 = a0_p3 * a0_a0
+    a0_p6 = a0_p4 * a0_a0
+    af_p3 = af * af_af
+    af_p4 = af_af * af_af
+    af_p5 = af_p3 * af_af
+    af_p6 = af_p4 * af_af
+
+    jMax_jMax = jMax * jMax
+    g1 = -pd + tf * v0
+    g2 = -2pd + tf * (v0 + vf)
+
+    Step2PreComputed(pd, tf, tf_tf, tf_p3, tf_p4, vd, vd_vd, v0_v0, vf_vf,
+                     ad, ad_ad, a0_a0, af_af, a0_p3, a0_p4, a0_p5, a0_p6,
+                     af_p3, af_p4, af_p5, af_p6, jMax_jMax, g1, g2)
+end
+
+"""
+Check profile for Step2 with target duration tf.
+Returns true if profile is valid and matches duration.
+"""
+function check_step2!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::ReachedLimits,
+                      tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, jMax_limit=Inf) where T
+    # Check jerk limit if provided
+    abs(jf) > jMax_limit + EPS && return false
+
+    # Use existing check function
+    result = check!(buf, control_signs, limits, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+    if !result
+        return false
+    end
+
+    # Verify total duration matches tf
+    abs(buf.t_sum[7] - tf) > T_PRECISION && return false
+
+    return true
+end
+
+"""
+    time_acc0_acc1_vel_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile reaching both acceleration limits and velocity limit.
+"""
+function time_acc0_acc1_vel_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                                   p0, v0, a0, pf, vf, af,
+                                   vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, tf_p3, tf_p4, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+
+    # Profile UDDU, Solution 1
+    if (2*(aMax - aMin) + ad)/jMax < tf
+        h1_sq = (a0_p4 + af_p4 - 4*a0_p3*(2*aMax + aMin)/3 - 4*af_p3*(aMax + 2*aMin)/3 +
+                 2*(a0_a0 - af_af)*aMax^2 +
+                 (4*a0*aMax - 2*a0_a0)*(af_af - 2*af*aMin + (aMin - aMax)*aMin + 2*jMax*(aMin*tf - vd)) +
+                 2*af_af*(aMin^2 + 2*jMax*(aMax*tf - vd)) +
+                 4*jMax*(2*aMin*(af*vd + jMax*g1) + (aMax^2 - aMin^2)*vd + jMax*vd_vd) +
+                 8*aMax*jMax_jMax*(pd - tf*vf))/(aMax*aMin) +
+                4*af_af + 2*a0_a0 + (4*af + aMax - aMin)*(aMax - aMin) +
+                4*jMax*(aMin - aMax + jMax*tf - 2*af)*tf
+
+        h1_sq >= 0 || return false
+        h1 = sqrt(h1_sq) * sign(jMax)
+
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = (-(af_af - a0_a0 + 2*aMax^2 + aMin*(aMin - 2*ad - 3*aMax) + 2*jMax*(aMin*tf - vd)) + aMin*h1)/(2*(aMax - aMin)*jMax)
+        buf.t[3] = aMax/jMax
+        buf.t[4] = (aMin - aMax + h1)/(2*jMax)
+        buf.t[5] = -aMin/jMax
+        buf.t[6] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + buf.t[4] + 2*buf.t[5] + af/jMax)
+        buf.t[7] = buf.t[5] + af/jMax
+
+        if check_step2!(buf, UDDU, LIMIT_ACC0_ACC1_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
         end
     end
 
-    error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, 0)")
+    # Profile UDUD
+    if (-a0 + 4*aMax - af)/jMax < tf
+        denom = a0_a0 + af_af - 2*(a0 + af)*aMax + 2*(aMax^2 - aMax*jMax*tf + jMax*vd)
+        abs(denom) < EPS && return false
 
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = (3*(a0_p4 + af_p4) - 4*(a0_p3 + af_p3)*aMax - 4*af_p3*aMax +
+                    24*(a0 + af)*aMax^3 - 6*(af_af + a0_a0)*(aMax^2 - 2*jMax*vd) +
+                    6*a0_a0*(af_af - 2*af*aMax - 2*aMax*jMax*tf) -
+                    12*aMax^2*(2*aMax^2 - 2*aMax*jMax*tf + jMax*vd) -
+                    24*af*aMax*jMax*vd + 12*jMax_jMax*(2*aMax*g1 + vd_vd))/(12*aMax*jMax*denom)
+        buf.t[3] = aMax/jMax
+        buf.t[4] = (-a0_a0 - af_af + 2*aMax*(a0 + af - 2*aMax) - 2*jMax*vd)/(2*aMax*jMax) + tf
+        buf.t[5] = buf.t[3]
+        buf.t[6] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + buf.t[4] + 2*buf.t[5] - af/jMax)
+        buf.t[7] = buf.t[5] - af/jMax
+
+        if check_step2!(buf, UDUD, LIMIT_ACC0_ACC1_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+    time_acc1_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with ACC1 and velocity limit.
+"""
+function time_acc1_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                              p0, v0, a0, pf, vf, af,
+                              vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+
+    # Profile UDDU
+    ph1 = a0_a0 + af_af - aMin*(a0 + 2*af - aMin) - 2*jMax*(vd - aMin*tf)
+    ph2 = 2*aMin*(jMax*g1 + af*vd) - aMin^2*vd + jMax*vd_vd
+    ph3 = af_af + aMin*(aMin - 2*af) - 2*jMax*(vd - aMin*tf)
+
+    polynom_0 = (2*(2*a0 - aMin))/jMax
+    polynom_1 = (4*a0_a0 + ph1 - 3*a0*aMin)/jMax_jMax
+    polynom_2 = (2*a0*ph1)/(jMax_jMax*jMax)
+    polynom_3 = (3*(a0_p4 + af_p4) - 4*(a0_p3 + 2*af_p3)*aMin + 6*af_af*(aMin^2 - 2*jMax*vd) +
+                 12*jMax*ph2 + 6*a0_a0*ph3)/(12*jMax_jMax*jMax_jMax)
+
+    t_min = -a0/jMax
+    t_max = min(tf + 2*aMin/jMax - (a0 + af)/jMax, 2*(aMax - a0)/jMax) / 2
+
+    for t in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+        (t < t_min || t > t_max) && continue
+
+        # Newton refinement
+        if abs(a0 + jMax*t) > 16*EPS
+            h0 = jMax*t*t
+            h1 = -((a0_a0 + af_af)/2 + jMax*(-vd + 2*a0*t + h0))/aMin
+            orig = -pd + (3*(a0_p4 + af_p4) - 8*af_p3*aMin - 4*a0_p3*aMin +
+                   6*af_af*(aMin^2 + 2*jMax*(h0 - vd)) +
+                   6*a0_a0*(af_af - 2*af*aMin + aMin^2 + 2*aMin*jMax*(-2*t + tf) + 2*jMax*(5*h0 - vd)) +
+                   24*a0*jMax*t*(a0_a0 + af_af - 2*af*aMin + aMin^2 + 2*jMax*(aMin*(-t + tf) + h0 - vd)) -
+                   24*af*aMin*jMax*(h0 - vd) +
+                   12*jMax*(aMin^2*(h0 - vd) + jMax*(h0 - vd)^2))/(24*aMin*jMax_jMax) +
+                   h0*(tf - t) + tf*v0
+            deriv = (a0 + jMax*t)*((a0_a0 + af_af)/(aMin*jMax) + (aMin - a0 - 2*af)/jMax +
+                    (4*a0*t + 2*h0 - 2*vd)/aMin + 2*tf - 3*t)
+            abs(deriv) > EPS && (t -= orig / deriv)
+        end
+
+        h1 = -((a0_a0 + af_af)/2 + jMax*(-vd + 2*a0*t + jMax*t*t))/aMin
+
+        buf.t[1] = t
+        buf.t[2] = 0
+        buf.t[3] = a0/jMax + t
+        buf.t[4] = tf - (h1 - aMin + a0 + af)/jMax - 2*t
+        buf.t[5] = -aMin/jMax
+        buf.t[6] = (h1 + aMin)/jMax
+        buf.t[7] = buf.t[5] + af/jMax
+
+        if check_step2!(buf, UDDU, LIMIT_ACC1_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # Profile UDUD
+    ph1 = a0_a0 - af_af + (2*af - a0)*aMax - aMax^2 - 2*jMax*(vd - aMax*tf)
+    ph2 = aMax^2 + 2*jMax*vd
+    ph3 = af_af + ph2 - 2*aMax*(af + jMax*tf)
+    ph4 = 2*aMax*jMax*g1 + aMax^2*vd + jMax*vd_vd
+
+    polynom_0 = (4*a0 - 2*aMax)/jMax
+    polynom_1 = (4*a0_a0 - 3*a0*aMax + ph1)/jMax_jMax
+    polynom_2 = (2*a0*ph1)/(jMax_jMax*jMax)
+    polynom_3 = (3*(a0_p4 + af_p4) - 4*(a0_p3 + 2*af_p3)*aMax - 24*af*aMax*jMax*vd +
+                 12*jMax*ph4 - 6*a0_a0*ph3 + 6*af_af*ph2)/(12*jMax_jMax*jMax_jMax)
+
+    t_min = -a0/jMax
+    t_max = min(tf + ad/jMax - 2*aMax/jMax, 2*(aMax - a0)/jMax) / 2
+
+    for t in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+        (t > t_max || t < t_min) && continue
+
+        h1 = ((a0_a0 - af_af)/2 + jMax_jMax*t*t - jMax*(vd - 2*a0*t))/aMax
+
+        buf.t[1] = t
+        buf.t[2] = 0
+        buf.t[3] = t + a0/jMax
+        buf.t[4] = tf + (h1 + ad - aMax)/jMax - 2*t
+        buf.t[5] = aMax/jMax
+        buf.t[6] = -(h1 + aMax)/jMax
+        buf.t[7] = buf.t[5] - af/jMax
+
+        if check_step2!(buf, UDUD, LIMIT_ACC1_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+    time_acc0_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with ACC0 and velocity limit.
+"""
+function time_acc0_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                              p0, v0, a0, pf, vf, af,
+                              vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+
+    # Early exit check
+    tf < max((-a0 + aMax)/jMax, 0.0) + max(aMax/jMax, 0.0) && return false
+    ph1 = 12*jMax*(-aMax^2*vd - jMax*vd_vd + 2*aMax*jMax*(-pd + tf*vf))
+
+    # Profile UDDU
+    polynom_0 = (2*aMax)/jMax
+    polynom_1 = (a0_a0 - af_af + 2*ad*aMax + aMax^2 + 2*jMax*(vd - aMax*tf))/jMax_jMax
+    polynom_2 = 0.0
+    polynom_3 = -(-3*(a0_p4 + af_p4) + 4*(af_p3 + 2*a0_p3)*aMax -
+                  12*a0*aMax*(af_af - 2*jMax*vd) + 6*a0_a0*(af_af - aMax^2 - 2*jMax*vd) +
+                  6*af_af*(aMax^2 - 2*aMax*jMax*tf + 2*jMax*vd) + ph1)/(12*jMax_jMax*jMax_jMax)
+
+    t_min = -af/jMax
+    t_max = min(tf - (2*aMax - a0)/jMax, -aMin/jMax)
+
+    for t in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+        (t < t_min || t > t_max) && continue
+
+        # Newton refinement
+        if t > EPS
+            h1 = jMax*t*t + vd
+            orig = (-3*(a0_p4 + af_p4) + 4*(af_p3 + 2*a0_p3)*aMax - 24*af*aMax*jMax_jMax*t*t -
+                    12*a0*aMax*(af_af - 2*jMax*h1) + 6*a0_a0*(af_af - aMax^2 - 2*jMax*h1) +
+                    6*af_af*(aMax^2 - 2*aMax*jMax*tf + 2*jMax*h1) -
+                    12*jMax*(aMax^2*h1 + jMax*h1^2 + 2*aMax*jMax*(pd + jMax*t*t*(t - tf) - tf*vf)))/(24*aMax*jMax_jMax)
+            deriv = -t*(a0_a0 - af_af + 2*aMax*(ad - jMax*tf) + aMax^2 + 3*aMax*jMax*t + 2*jMax*h1)/aMax
+            abs(deriv) > EPS && (t -= orig / deriv)
+        end
+
+        h1 = ((a0_a0 - af_af)/2 + jMax*(jMax*t*t + vd))/aMax
+
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = (h1 - aMax)/jMax
+        buf.t[3] = aMax/jMax
+        buf.t[4] = tf - (h1 + ad + aMax)/jMax - 2*t
+        buf.t[5] = t
+        buf.t[6] = 0
+        buf.t[7] = af/jMax + t
+
+        if check_step2!(buf, UDDU, LIMIT_ACC0_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # Profile UDUD
+    polynom_0 = (-2*aMax)/jMax
+    polynom_1 = -(a0_a0 + af_af - 2*(a0 + af)*aMax + aMax^2 + 2*jMax*(vd - aMax*tf))/jMax_jMax
+    polynom_2 = 0.0
+    polynom_3 = (3*(a0_p4 + af_p4) - 4*(af_p3 + 2*a0_p3)*aMax +
+                 6*a0_a0*(af_af + aMax^2 + 2*jMax*vd) - 12*a0*aMax*(af_af + 2*jMax*vd) +
+                 6*af_af*(aMax^2 - 2*aMax*jMax*tf + 2*jMax*vd) - ph1)/(12*jMax_jMax*jMax_jMax)
+
+    t_min = af/jMax
+    t_max = min(tf - aMax/jMax, aMax/jMax)
+
+    for t in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+        (t < t_min || t > t_max) && continue
+
+        # Newton refinement
+        h1 = jMax*t*t - vd
+        orig = -(3*(a0_p4 + af_p4) - 4*(2*a0_p3 + af_p3)*aMax + 24*af*aMax*jMax_jMax*t*t -
+                 12*a0*aMax*(af_af - 2*jMax*h1) + 6*a0_a0*(af_af + aMax^2 - 2*jMax*h1) +
+                 6*af_af*(aMax^2 - 2*jMax*(tf*aMax + h1)) +
+                 12*jMax*(-aMax^2*h1 + jMax*h1^2 - 2*aMax*jMax*(-pd + jMax*t*t*(t - tf) + tf*vf)))/(24*aMax*jMax_jMax)
+        deriv = t*(a0_a0 + af_af - 2*jMax*h1 - 2*(a0 + af + jMax*tf)*aMax + aMax^2 + 3*aMax*jMax*t)/aMax
+        abs(deriv) > EPS && (t -= orig / deriv)
+
+        h1 = ((a0_a0 + af_af)/2 + jMax*(vd - jMax*t*t))/aMax
+
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = (h1 - aMax)/jMax
+        buf.t[3] = aMax/jMax
+        buf.t[4] = tf - (h1 - a0 - af + aMax)/jMax - 2*t
+        buf.t[5] = t
+        buf.t[6] = 0
+        buf.t[7] = -(af/jMax) + t
+
+        if check_step2!(buf, UDUD, LIMIT_ACC0_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+    time_acc0_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile reaching both acceleration limits (no velocity limit).
+"""
+function time_acc0_acc1_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                               p0, v0, a0, pf, vf, af,
+                               vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, tf_p3, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+
+    # Simple case: a0 ≈ 0 and af ≈ 0
+    if abs(a0) < EPS && abs(af) < EPS
+        h1 = 2*aMin*g1 + vd_vd + aMax*(2*pd + aMin*tf_tf - 2*tf*vf)
+        h2 = (aMax - aMin)*(-aMin*vd + aMax*(aMin*tf - vd))
+
+        abs(h1) < EPS && return false
+        jf = h2/h1
+
+        abs(jf) < EPS && return false
+
+        buf.t[1] = aMax/jf
+        buf.t[2] = (-2*aMax*h1 + aMin^2*g2)/h2
+        buf.t[3] = buf.t[1]
+        buf.t[4] = 0
+        buf.t[5] = -aMin/jf
+        buf.t[6] = tf - (2*buf.t[1] + buf.t[2] + 2*buf.t[5])
+        buf.t[7] = buf.t[5]
+
+        if check_step2!(buf, UDDU, LIMIT_ACC0_ACC1, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
+            return true
+        end
+    end
+
+    # UDDU general case
+    h_denom = 2*aMin*g1 + vd_vd + aMax*(2*pd + aMin*tf_tf - 2*tf*vf)
+    abs(h_denom) < EPS && return false
+
+    h1_sq = 144*(((aMax - aMin)*(-aMin*vd + aMax*(aMin*tf - vd)) -
+                   af_af*(aMax*tf - vd) + 2*af*aMin*(aMax*tf - vd) +
+                   a0_a0*(aMin*tf + v0 - vf) - 2*a0*aMax*(aMin*tf - vd))^2) +
+            48*ad*(3*a0_p3 - 3*af_p3 + 12*aMax*aMin*(-aMax + aMin) +
+                   4*af_af*(aMax + 2*aMin) +
+                   a0*(-3*af_af + 8*af*(aMin - aMax) + 6*(aMax^2 + 2*aMax*aMin - aMin^2)) +
+                   6*af*(aMax^2 - 2*aMax*aMin - aMin^2) +
+                   a0_a0*(3*af - 4*(2*aMax + aMin)))*h_denom
+
+    h1_sq >= 0 || return false
+    h1 = sqrt(h1_sq)
+
+    jf = -(3*af_af*aMax*tf - 3*a0_a0*aMin*tf - 6*ad*aMax*aMin*tf +
+           3*aMax*aMin*(aMin - aMax)*tf + 3*(a0_a0 - af_af)*vd +
+           6*vd*(af*aMin - a0*aMax) + 3*(aMax^2 - aMin^2)*vd + h1/4)/(6*h_denom)
+
+    abs(jf) < EPS && return false
+
+    buf.t[1] = (aMax - a0)/jf
+    buf.t[2] = (a0_a0 - af_af + 2*ad*aMin - 2*(aMax^2 - 2*aMax*aMin + aMin^2 + aMin*jf*tf - jf*vd))/(2*(aMax - aMin)*jf)
+    buf.t[3] = aMax/jf
+    buf.t[4] = 0
+    buf.t[5] = -aMin/jf
+    buf.t[6] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + 2*buf.t[5] + af/jf)
+    buf.t[7] = buf.t[5] + af/jf
+
+    if check_step2!(buf, UDDU, LIMIT_ACC0_ACC1, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
+        return true
+    end
+
+    return false
+end
+
+"""
+    time_acc0_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with only ACC0 limit reached.
+"""
+function time_acc0_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                          p0, v0, a0, pf, vf, af,
+                          vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, jMax_jMax, g1, g2) = pc
+
+    # UDUD case
+    h1_sq = ad_ad/(2*jMax_jMax) - ad*(aMax - a0)/jMax_jMax + (aMax*tf - vd)/jMax
+    if h1_sq >= 0
+        h1 = sqrt(h1_sq)
+
+        buf.t[1] = (aMax - a0)/jMax
+        buf.t[2] = tf - ad/jMax - 2*h1
+        buf.t[3] = h1
+        buf.t[4] = 0
+        buf.t[5] = (af - aMax)/jMax + h1
+        buf.t[6] = 0
+        buf.t[7] = 0
+
+        if check_step2!(buf, UDUD, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # UDDU case with t[4] != 0
+    h0a = -a0_a0 + af_af - 2*ad*aMax + 2*jMax*(aMax*tf - vd)
+    h0b = a0_p3 + 2*af_p3 - 6*af_af*aMax - 3*a0_a0*(af - jMax*tf) -
+          3*a0*aMax*(aMax - 2*af + 2*jMax*tf) -
+          3*jMax*(jMax*(-2*pd + aMax*tf_tf + 2*tf*v0) + aMax*(aMax*tf - 2*vd)) +
+          3*af*(aMax^2 + 2*aMax*jMax*tf - 2*jMax*vd)
+    h0_sq = 4*h0b^2 - 18*h0a^3
+    if h0_sq >= 0
+        h0 = abs(jMax) * sqrt(h0_sq)
+        h1 = 3*jMax*h0a
+
+        abs(h1) < EPS && return false
+
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = (-a0_p3 + af_p3 + af_af*(-6*aMax + 3*jMax*tf) +
+                    a0_a0*(-3*af + 6*aMax + 3*jMax*tf) + 6*af*(aMax^2 - jMax*vd) +
+                    3*a0*(af_af - 2*(aMax^2 + jMax*vd)) -
+                    6*jMax*(aMax*(aMax*tf - 2*vd) + jMax*g2))/h1
+        buf.t[3] = -(ad + h0/h1)/(2*jMax) + tf/2 - buf.t[2]/2
+        buf.t[4] = h0/(jMax*h1)
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + buf.t[4])
+
+        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # UDDU Solution 1
+    h0b = a0_a0 + af_af + 2*(aMax^2 - (a0 + af)*aMax + jMax*(vd - aMax*tf))
+    h0a = a0_p3 + 2*af_p3 - 6*(af_af + aMax^2)*aMax - 6*(a0 + af)*aMax*jMax*tf +
+          9*aMax^2*(af + jMax*tf) + 3*a0*aMax*(-2*af + 3*aMax) +
+          3*a0_a0*(af - 2*aMax + jMax*tf) - 6*jMax_jMax*g1 +
+          6*(af - aMax)*jMax*vd - 3*aMax*jMax_jMax*tf_tf
+    h0_sq = 4*h0a^2 - 18*h0b^3
+    if h0_sq >= 0
+        h1 = (jMax > 0 ? 1 : -1) * sqrt(h0_sq)
+        h2 = 6*jMax*h0b
+
+        abs(h2) < EPS && return false
+
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = ad/jMax - 2*buf.t[1] - (2*h0a - h1)/h2 + tf
+        buf.t[3] = -(2*h0a + h1)/h2
+        buf.t[4] = (2*h0a - h1)/h2
+        buf.t[5] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + buf.t[4])
+        buf.t[6] = 0
+        buf.t[7] = 0
+
+        if check_step2!(buf, UDDU, LIMIT_ACC0, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+    time_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with only ACC1 limit reached.
+"""
+function time_acc1_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                          p0, v0, a0, pf, vf, af,
+                          vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+
+    # UDDU case
+    h0_sq = jMax_jMax*(a0_p4 + af_p4 - 4*af_p3*jMax*tf + 6*af_af*jMax_jMax*tf_tf -
+            4*a0_p3*(af - jMax*tf) + 6*a0_a0*(af - jMax*tf)^2 + 24*af*jMax_jMax*g1 -
+            4*a0*(af_p3 - 3*af_af*jMax*tf + 6*jMax_jMax*(-pd + tf*vf)) -
+            12*jMax_jMax*(-vd_vd + jMax*tf*g2))/3
+    if h0_sq >= 0
+        h0 = sqrt(h0_sq)/jMax
+        h1_sq = (a0_a0 + af_af - 2*a0*af - 2*ad*jMax*tf + 2*h0)/jMax_jMax + tf_tf
+        if h1_sq >= 0
+            h1 = sqrt(h1_sq)
+
+            denom = 2*jMax*(-ad + jMax*tf)
+            abs(denom) < EPS && return false
+
+            buf.t[1] = -(a0_a0 + af_af + 2*a0*(jMax*tf - af) - 2*jMax*vd + h0)/denom
+            buf.t[2] = 0
+            buf.t[3] = (tf - h1)/2 - ad/(2*jMax)
+            buf.t[4] = 0
+            buf.t[5] = 0
+            buf.t[6] = h1
+            buf.t[7] = tf - (buf.t[1] + buf.t[3] + buf.t[6])
+
+            if check_step2!(buf, UDDU, LIMIT_ACC1, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # UDUD case
+    h0_sq = jMax_jMax*(a0_p4 + af_p4 + 4*(af_p3 - a0_p3)*jMax*tf + 6*af_af*jMax_jMax*tf_tf +
+            6*a0_a0*(af + jMax*tf)^2 + 24*af*jMax_jMax*g1 -
+            4*a0*(a0_a0*af + af_p3 + 3*af_af*jMax*tf + 6*jMax_jMax*(-pd + tf*vf)) +
+            12*jMax_jMax*(vd_vd + jMax*tf*g2))/3
+    if h0_sq >= 0
+        h0 = sqrt(h0_sq)/jMax
+        h1_sq = (a0_a0 + af_af - 2*a0*af + 2*ad*jMax*tf + 2*h0)/jMax_jMax + tf_tf
+        if h1_sq >= 0
+            h1 = sqrt(h1_sq)
+
+            denom = 2*jMax*(ad + jMax*tf)
+            abs(denom) < EPS && return false
+
+            buf.t[1] = 0
+            buf.t[2] = 0
+            buf.t[3] = -(a0_a0 + af_af - 2*a0*af + 2*jMax*(vd - a0*tf) + h0)/denom
+            buf.t[4] = 0
+            buf.t[5] = ad/(2*jMax) + (tf - h1)/2
+            buf.t[6] = h1
+            buf.t[7] = tf - (buf.t[6] + buf.t[5] + buf.t[3])
+
+            if check_step2!(buf, UDUD, LIMIT_ACC1, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # UDDU Solution 2
+    h0b = a0_a0 + af_af - 2*(a0 + af)*aMin + 2*(aMin^2 - jMax*(-aMin*tf + vd))
+    h0a = a0_p3 - af_p3 - 3*a0_a0*aMin + 3*aMin^2*(a0 + jMax*tf) +
+          3*af*aMin*(-aMin - 2*jMax*tf) - 3*af_af*(-aMin - jMax*tf) -
+          3*jMax_jMax*(-2*pd - aMin*tf_tf + 2*tf*vf)
+    h0c = a0_p4 + 3*af_p4 - 4*(a0_p3 + 2*af_p3)*aMin + 6*a0_a0*aMin^2 +
+          6*af_af*(aMin^2 - 2*jMax*vd) + 12*jMax*(2*aMin*jMax*g1 - aMin^2*vd + jMax*vd_vd) +
+          24*af*aMin*jMax*vd -
+          4*a0*(af_p3 - 3*af*aMin*(-aMin - 2*jMax*tf) + 3*af_af*(-aMin - jMax*tf) +
+                3*jMax*(-aMin^2*tf + jMax*(-2*pd - aMin*tf_tf + 2*tf*vf)))
+    h0_sq = 4*h0a^2 - 6*h0b*h0c
+    if h0_sq >= 0
+        h1 = (jMax > 0 ? 1 : -1) * sqrt(h0_sq)
+        h2 = 6*jMax*h0b
+
+        abs(h2) < EPS && return false
+
+        buf.t[1] = 0
+        buf.t[2] = 0
+        buf.t[3] = (2*h0a + h1)/h2
+
+        denom = 2*jMax*(a0 - aMin - jMax*buf.t[3])
+        abs(denom) < EPS && return false
+
+        buf.t[4] = -(a0_a0 + af_af - 2*(a0 + af)*aMin + 2*(aMin^2 + aMin*jMax*tf - jMax*vd))/denom
+        buf.t[5] = (a0 - aMin)/jMax - buf.t[3]
+        buf.t[6] = tf - (buf.t[3] + buf.t[4] + buf.t[5] + (af - aMin)/jMax)
+        buf.t[7] = (af - aMin)/jMax
+
+        if check_step2!(buf, UDDU, LIMIT_ACC1, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # UDUD Solution 1
+    h0a = -a0_p3 + af_p3 + 3*(a0_a0 - af_af)*aMax - 3*ad*aMax^2 - 6*af*aMax*jMax*tf +
+          3*af_af*jMax*tf + 3*jMax*(aMax^2*tf + jMax*(-2*pd - aMax*tf_tf + 2*tf*vf))
+    h0b = a0_a0 - af_af + 2*ad*aMax + 2*jMax*(aMax*tf - vd)
+    h0c = a0_p4 + 3*af_p4 - 4*(a0_p3 + 2*af_p3)*aMax + 6*a0_a0*aMax^2 - 24*af*aMax*jMax*vd +
+          12*jMax*(2*aMax*jMax*g1 + jMax*vd_vd + aMax^2*vd) + 6*af_af*(aMax^2 + 2*jMax*vd) -
+          4*a0*(af_p3 + 3*af*aMax*(aMax - 2*jMax*tf) - 3*af_af*(aMax - jMax*tf) +
+                3*jMax*(aMax^2*tf + jMax*(-2*pd - aMax*tf_tf + 2*tf*vf)))
+    h0_sq = 4*h0a^2 - 6*h0b*h0c
+    if h0_sq >= 0
+        h1 = (jMax > 0 ? 1 : -1) * sqrt(h0_sq)
+        h2 = 6*jMax*h0b
+
+        abs(h2) < EPS && return false
+
+        buf.t[1] = 0
+        buf.t[2] = 0
+        buf.t[3] = -(2*h0a + h1)/h2
+        buf.t[4] = 2*h1/h2
+        buf.t[5] = (aMax - a0)/jMax + buf.t[3]
+        buf.t[6] = tf - (buf.t[3] + buf.t[4] + buf.t[5] + (-af + aMax)/jMax)
+        buf.t[7] = (-af + aMax)/jMax
+
+        if check_step2!(buf, UDUD, LIMIT_ACC1, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+    time_none_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with no limits reached.
+"""
+function time_none_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                          p0, v0, a0, pf, vf, af,
+                          vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, tf_p3, tf_p4, vd, vd_vd, v0_v0, vf_vf, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, a0_p5, af_p5, a0_p6, af_p6, jMax_jMax, g1, g2) = pc
+
+    # Special case: start from rest with zero acceleration (v0=a0=af=0)
+    if abs(v0) < EPS && abs(a0) < EPS && abs(af) < EPS
+        h1_sq = tf_tf*vf_vf + (4*pd - tf*vf)^2
+        if h1_sq >= 0
+            h1 = sqrt(h1_sq)
+            jf = 4*(4*pd - 2*tf*vf + h1)/tf_p3
+
+            if abs(jf) > EPS
+                buf.t[1] = tf/4
+                buf.t[2] = 0
+                buf.t[3] = 2*buf.t[1]
+                buf.t[4] = 0
+                buf.t[5] = 0
+                buf.t[6] = 0
+                buf.t[7] = buf.t[1]
+
+                if check_step2!(buf, UDDU, LIMIT_NONE, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
+                    return true
+                end
+            end
+        end
+    end
+
+    # Case a0=af=0: Profile with constant velocity phase (t[3] != 0)
+    if abs(a0) < EPS && abs(af) < EPS
+        # UDDU with constant phase - quartic polynomial
+        polynom_0 = -2*tf
+        polynom_1 = 2*vd/jMax + tf_tf
+        polynom_2 = 4*(pd - tf*vf)/jMax
+        polynom_3 = (vd_vd + jMax*tf*g2)/jMax_jMax
+
+        t_max = min(tf/2, (aMax - a0)/jMax)
+
+        for t_root in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+            (t_root > t_max || t_root < 0) && continue
+            t = t_root
+
+            # Newton refinement
+            denom = jMax*(2*t - tf)
+            if abs(denom) > EPS
+                h1 = (jMax*t*(t - tf) + vd)/denom
+                h2 = (2*jMax*t*(t - tf) + jMax*tf_tf - 2*vd)/(denom*(2*t - tf))
+                orig = (-2*pd + 2*tf*v0 + h1^2*jMax*(tf - 2*t) + jMax*tf*(2*h1*t - t*t - (h1 - t)*tf))/2
+                deriv = (jMax*tf*(2*t - tf)*(h2 - 1))/2 + h1*jMax*(tf - (2*t - tf)*h2 - h1)
+                abs(deriv) > EPS && (t -= orig / deriv)
+            end
+
+            denom = jMax*(2*t - tf)
+            abs(denom) < EPS && continue
+            h1 = (jMax*t*(t - tf) + vd)/denom
+
+            buf.t[1] = t
+            buf.t[2] = 0
+            buf.t[3] = h1
+            buf.t[4] = tf - 2*t
+            buf.t[5] = t - h1
+            buf.t[6] = 0
+            buf.t[7] = 0
+
+            if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # UDUD T 0246 - general case
+    h0_inner = 2*(a0_p3 - af_p3 - 3*af_af*jMax*tf + 9*af*jMax_jMax*tf_tf - 3*a0_a0*(af + jMax*tf) +
+                  3*a0*(af + jMax*tf)^2 + 3*jMax_jMax*(8*pd + jMax*tf_p3 - 8*tf*vf))^2 -
+               3*(a0_a0 + af_af - 2*af*jMax*tf - 2*a0*(af + jMax*tf) - jMax*(jMax*tf_tf + 4*v0 - 4*vf))*
+               (a0_p4 + af_p4 + 4*af_p3*jMax*tf + 6*af_af*jMax_jMax*tf_tf - 3*jMax_jMax*jMax_jMax*tf_p4 -
+                4*a0_p3*(af + jMax*tf) + 6*a0_a0*(af + jMax*tf)^2 -
+                12*af*jMax_jMax*(8*pd + jMax*tf_p3 - 8*tf*v0) + 48*jMax_jMax*vd_vd + 48*jMax_jMax*jMax*tf*g2 -
+                4*a0*(af_p3 + 3*af_af*jMax*tf - 9*af*jMax_jMax*tf_tf - 3*jMax_jMax*(8*pd + jMax*tf_p3 - 8*tf*vf)))
+    if h0_inner >= 0
+        h0 = sqrt(2*jMax_jMax*h0_inner)/jMax
+        h1 = 12*jMax*(-a0_a0 - af_af + 2*af*jMax*tf + 2*a0*(af + jMax*tf) + jMax*(jMax*tf_tf + 4*v0 - 4*vf))
+        h2 = -4*a0_p3 + 4*af_p3 + 12*a0_a0*af - 12*a0*af_af + 48*jMax_jMax*pd +
+             12*(a0_a0 - af_af)*jMax*tf - 24*jMax_jMax*tf*(v0 + vf) + 24*ad*jMax*vd
+        h3 = 2*a0_p3 - 2*af_p3 - 6*a0_a0*af + 6*a0*af_af
+
+        if abs(h1) > EPS
+            buf.t[1] = (h3 - 48*jMax_jMax*(tf*vf - pd) - 6*(a0_a0 + af_af)*jMax*tf +
+                        12*a0*af*jMax*tf + 6*(a0 + 3*af + jMax*tf)*tf_tf*jMax_jMax - h0)/h1
+            buf.t[2] = 0
+            buf.t[3] = (h2 + h0)/h1
+            buf.t[4] = 0
+            buf.t[5] = (-h2 + h0)/h1
+            buf.t[6] = 0
+            buf.t[7] = (-h3 + 48*jMax_jMax*(tf*v0 - pd) - 6*(a0_a0 + af_af)*jMax*tf +
+                        12*a0*af*jMax*tf + 6*(af + 3*a0 + jMax*tf)*tf_tf*jMax_jMax - h0)/h1
+
+            if check_step2!(buf, UDUD, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # UDDU T 0234 - profiles with a3 != 0
+    ph1 = af + jMax*tf
+
+    polynom_0 = -2*(ad + jMax*tf)/jMax
+    polynom_1 = 2*(a0_a0 + af_af + jMax*(af*tf + vd) - 2*a0*ph1)/jMax_jMax + tf_tf
+    polynom_2 = 2*(a0_p3 - af_p3 - 3*af_af*jMax*tf + 3*a0*ph1*(ph1 - a0) - 6*jMax_jMax*(-pd + tf*vf))/(3*jMax_jMax*jMax)
+    polynom_3 = (a0_p4 + af_p4 + 4*af_p3*jMax*tf - 4*a0_p3*ph1 + 6*a0_a0*ph1^2 + 24*jMax_jMax*af*g1 -
+                 4*a0*(af_p3 + 3*af_af*jMax*tf + 6*jMax_jMax*(-pd + tf*vf)) + 6*jMax_jMax*af_af*tf_tf +
+                 12*jMax_jMax*(vd_vd + jMax*tf*g2))/(12*jMax_jMax*jMax_jMax)
+
+    t_min = ad/jMax
+    t_max = min((aMax - a0)/jMax, (ad/jMax + tf) / 2)
+
+    for t_root in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+        (t_root < t_min || t_root > t_max) && continue
+        t = t_root
+
+        # Newton refinement
+        h0 = jMax*(2*t - tf) - ad
+        if abs(h0) > EPS
+            h1 = (ad_ad - 2*af*jMax*t + 2*a0*jMax*(t - tf) + 2*jMax*(jMax*t*(t - tf) + vd))/(2*jMax*h0)
+            h2 = (-ad_ad + 2*jMax_jMax*(tf_tf + t*(t - tf)) + (a0 + af)*jMax*tf - ad*h0 - 2*jMax*vd)/(h0*h0)
+            orig = (-a0_p3 + af_p3 + 3*ad_ad*jMax*(h1 - t) + 3*ad*jMax_jMax*(h1 - t)^2 - 3*a0*af*ad +
+                    3*jMax_jMax*(a0*tf_tf - 2*pd + 2*tf*v0 + h1^2*jMax*(tf - 2*t) + jMax*tf*(2*h1*t - t*t - (h1 - t)*tf)))/(6*jMax_jMax)
+            deriv = (h0*(-ad + jMax*tf)*(h2 - 1))/(2*jMax) + h1*(-ad + jMax*(tf - h1) - h0*h2)
+            abs(deriv) > EPS && (t -= orig / deriv)
+        end
+
+        h0 = jMax*(2*t - tf) - ad
+        abs(h0) < EPS && continue
+        h1 = (ad_ad + 2*jMax*(-a0*tf - ad*t + jMax*t*(t - tf) + vd))/(2*jMax*h0)
+
+        buf.t[1] = t
+        buf.t[2] = 0
+        buf.t[3] = h1
+        buf.t[4] = ad/jMax + tf - 2*t
+        buf.t[5] = tf - (t + h1 + buf.t[4])
+        buf.t[6] = 0
+        buf.t[7] = 0
+
+        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # UDDU T 3456
+    h1 = 3*jMax*(ad_ad + 2*jMax*(a0*tf - vd))
+    h2 = ad_ad + 2*jMax*(a0*tf - vd)
+    if abs(h1) > EPS && h2^3 >= 0
+        h0_inner = 4*(2*(a0_p3 - af_p3) - 6*a0_a0*(af - jMax*tf) + 6*jMax_jMax*g1 +
+                      3*a0*(2*af_af - 2*jMax*af*tf + jMax_jMax*tf_tf) + 6*ad*jMax*vd)^2 - 18*h2^3
+        if h0_inner >= 0
+            h0 = (jMax > 0 ? 1 : -1) * sqrt(h0_inner)/h1
+
+            buf.t[1] = 0
+            buf.t[2] = 0
+            buf.t[3] = 0
+            buf.t[4] = (af_p3 - a0_p3 + 3*(af_af - a0_a0)*jMax*tf - 3*ad*(a0*af + 2*jMax*vd) - 6*jMax_jMax*g2)/h1
+            buf.t[5] = (tf - buf.t[4] - h0)/2 - ad/(2*jMax)
+            buf.t[6] = h0
+            buf.t[7] = (tf - buf.t[4] + ad/jMax - h0)/2
+
+            if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # T 2346 - UDDU with constant phase
+    ph1 = ad_ad + 2*(af + a0)*jMax*tf - jMax*(jMax*tf_tf + 4*vd)
+    if abs(ph1) > EPS
+        ph2 = jMax*tf_tf*g1 - vd*(-2*pd - tf*v0 + 3*tf*vf)
+        ph3 = 5*af_af - 8*af*jMax*tf + 2*jMax*(2*jMax*tf_tf - vd)
+        ph4 = jMax_jMax*tf_p4 - 2*vd_vd + 8*jMax*tf*(-pd + tf*vf)
+        ph5 = 5*af_p4 - 8*af_p3*jMax*tf - 12*af_af*jMax*(jMax*tf_tf + vd) +
+              24*af*jMax_jMax*(-2*pd + jMax*tf_p3 + 2*tf*vf) - 6*jMax_jMax*ph4
+        ph6 = -vd_vd + jMax*tf*(-2*pd + 3*tf*v0 - tf*vf) - af*g2
+
+        polynom_0 = -(4*(a0_p3 - af_p3) - 12*a0_a0*(af - jMax*tf) +
+                      6*a0*(2*af_af - 2*af*jMax*tf + jMax*(jMax*tf_tf - 2*vd)) +
+                      6*af*jMax*(3*jMax*tf_tf + 2*vd) -
+                      6*jMax_jMax*(-4*pd + jMax*tf_p3 - 2*tf*v0 + 6*tf*vf))/(3*jMax*ph1)
+        polynom_1 = -(-a0_p4 - af_p4 + 4*a0_p3*(af - jMax*tf) +
+                      a0_a0*(-6*af_af + 8*af*jMax*tf - 4*jMax*(jMax*tf_tf - vd)) +
+                      2*af_af*jMax*(jMax*tf_tf + 2*vd) -
+                      4*af*jMax_jMax*(-3*pd + jMax*tf_p3 + 2*tf*v0 + tf*vf) +
+                      jMax_jMax*(jMax_jMax*tf_p4 - 8*vd_vd + 4*jMax*tf*(-3*pd + tf*v0 + 2*tf*vf)) +
+                      2*a0*(2*af_p3 - 2*af_af*jMax*tf + af*jMax*(-3*jMax*tf_tf - 4*vd) +
+                            jMax_jMax*(-6*pd + jMax*tf_p3 - 4*tf*v0 + 10*tf*vf)))/(jMax_jMax*ph1)
+        polynom_2 = -(a0_p5 - af_p5 + af_p4*jMax*tf - 5*a0_p4*(af - jMax*tf) + 2*a0_p3*ph3 +
+                      4*af_p3*jMax*(jMax*tf_tf + vd) + 12*jMax_jMax*af*ph6 -
+                      2*a0_a0*(5*af_p3 - 9*af_af*jMax*tf - 6*af*jMax*vd +
+                               6*jMax_jMax*(-2*pd - tf*v0 + 3*tf*vf)) -
+                      12*jMax_jMax*jMax*ph2 + a0*ph5)/(3*jMax_jMax*jMax*ph1)
+        polynom_3 = -(-a0_p6 - af_p6 + 6*a0_p5*(af - jMax*tf) - 48*af_p3*jMax_jMax*g1 +
+                      72*jMax_jMax*jMax*(jMax*g1*g1 + vd_vd*vd + 2*af*g1*vd) - 3*a0_p4*ph3 -
+                      36*af_af*jMax_jMax*vd_vd + 6*af_p4*jMax*vd +
+                      4*a0_p3*(5*af_p3 - 9*af_af*jMax*tf - 6*af*jMax*vd +
+                               6*jMax_jMax*(-2*pd - tf*v0 + 3*tf*vf)) - 3*a0_a0*ph5 +
+                      6*a0*(af_p5 - af_p4*jMax*tf - 4*af_p3*jMax*(jMax*tf_tf + vd) +
+                            12*jMax_jMax*(-af*ph6 + jMax*ph2)))/(18*jMax_jMax*jMax_jMax*ph1)
+
+        t_max = (a0 - aMin)/jMax
+
+        for t_root in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+            t_root > t_max && continue
+            t = t_root
+
+            # Newton refinement
+            h1_inner = ad_ad/2 + jMax*(af*t + (jMax*t - a0)*(t - tf) - vd)
+            if h1_inner >= 0
+                h2_tmp = -ad + jMax*(tf - 2*t)
+                h3 = sqrt(h1_inner)
+                orig = (af_p3 - a0_p3 + 3*af*jMax*t*(af + jMax*t) + 3*a0_a0*(af + jMax*t) -
+                        3*a0*(af_af + 2*af*jMax*t + jMax_jMax*(t*t - tf_tf)) +
+                        3*jMax_jMax*(-2*pd + jMax*t*(t - tf)*tf + 2*tf*v0))/(6*jMax_jMax) -
+                       h3^3/(jMax*abs(jMax)) + ((-ad - jMax*t)*h1_inner)/jMax_jMax
+                deriv = (6*jMax*h2_tmp*h3/abs(jMax) + 2*(-ad - jMax*tf)*h2_tmp -
+                         2*(3*ad_ad + af*jMax*(8*t - 2*tf) + 4*a0*jMax*(-2*t + tf) +
+                            2*jMax*(jMax*t*(3*t - 2*tf) - vd)))/(4*jMax)
+                abs(deriv) > EPS && (t -= orig / deriv)
+            end
+
+            h1_inner = 2*ad_ad + 4*jMax*(ad*t + a0*tf + jMax*t*(t - tf) - vd)
+            h1_inner < 0 && continue
+            h1_val = sqrt(h1_inner)/abs(jMax)
+
+            buf.t[1] = 0
+            buf.t[2] = 0
+            buf.t[3] = t
+            buf.t[4] = tf - 2*t - ad/jMax - h1_val
+            buf.t[5] = h1_val/2
+            buf.t[6] = 0
+            buf.t[7] = tf - (t + buf.t[4] + buf.t[5])
+
+            if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # T 0124 UDUD
+    ph1 = -ad + jMax*tf
+    if abs(ph1) > EPS
+        ph0 = -2*pd - tf*v0 + 3*tf*vf
+        ph2 = jMax*tf_tf*g1 - vd*ph0
+        ph3 = 5*af_af + 2*jMax*(2*jMax*tf_tf - vd - 4*af*tf)
+        ph4 = jMax_jMax*tf_p4 - 2*vd_vd + 8*jMax*tf*(-pd + tf*vf)
+        ph5 = 5*af_p4 - 8*af_p3*jMax*tf - 12*af_af*jMax*(jMax*tf_tf + vd) +
+              24*af*jMax_jMax*(-2*pd + jMax*tf_p3 + 2*tf*vf) - 6*jMax_jMax*ph4
+        ph6 = -vd_vd + jMax*tf*(-2*pd + 3*tf*v0 - tf*vf)
+        ph7 = 3*jMax_jMax*ph1^2
+
+        abs(ph7) < EPS && @goto skip_t0124
+
+        polynom_0 = (4*af*tf - 2*jMax*tf_tf - 4*vd)/ph1
+        polynom_1 = (-2*(a0_p4 + af_p4) + 8*af_p3*jMax*tf + 6*af_af*jMax_jMax*tf_tf +
+                     8*a0_p3*(af - jMax*tf) - 12*a0_a0*(af - jMax*tf)^2 -
+                     12*af*jMax_jMax*(-pd + jMax*tf_p3 - 2*tf*v0 + 3*tf*vf) +
+                     2*a0*(4*af_p3 - 12*af_af*jMax*tf + 9*af*jMax_jMax*tf_tf -
+                           3*jMax_jMax*(2*pd + jMax*tf_p3 - 2*tf*vf)) +
+                     3*jMax_jMax*(jMax_jMax*tf_p4 + 4*vd_vd - 4*jMax*tf*(pd + tf*v0 - 2*tf*vf)))/ph7
+        polynom_2 = (-a0_p5 + af_p5 - af_p4*jMax*tf + 5*a0_p4*(af - jMax*tf) - 2*a0_p3*ph3 -
+                     4*af_p3*jMax*(jMax*tf_tf + vd) + 12*af_af*jMax_jMax*g2 - 12*af*jMax_jMax*ph6 +
+                     2*a0_a0*(5*af_p3 - 9*af_af*jMax*tf - 6*af*jMax*vd + 6*jMax_jMax*ph0) +
+                     12*jMax_jMax*jMax*ph2 +
+                     a0*(-5*af_p4 + 8*af_p3*jMax*tf + 12*af_af*jMax*(jMax*tf_tf + vd) -
+                         24*af*jMax_jMax*(-2*pd + jMax*tf_p3 + 2*tf*vf) + 6*jMax_jMax*ph4))/(jMax*ph7)
+        polynom_3 = -(a0_p6 + af_p6 - 6*a0_p5*(af - jMax*tf) + 48*af_p3*jMax_jMax*g1 -
+                      72*jMax_jMax*jMax*(jMax*g1*g1 + vd_vd*vd + 2*af*g1*vd) + 3*a0_p4*ph3 -
+                      6*af_p4*jMax*vd + 36*af_af*jMax_jMax*vd_vd -
+                      4*a0_p3*(5*af_p3 - 9*af_af*jMax*tf - 6*af*jMax*vd + 6*jMax_jMax*ph0) + 3*a0_a0*ph5 -
+                      6*a0*(af_p5 - af_p4*jMax*tf - 4*af_p3*jMax*(jMax*tf_tf + vd) +
+                            12*jMax_jMax*(af_af*g2 - af*ph6 + jMax*ph2)))/(6*jMax_jMax*ph7)
+
+        for t_root in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+            (t_root > tf || t_root > (aMax - a0)/jMax) && continue
+            t = t_root
+
+            h1_inner = ad_ad/(2*jMax_jMax) + (a0*(t + tf) - af*t + jMax*t*tf - vd)/jMax
+            h1_inner < 0 && continue
+            h1_val = sqrt(h1_inner)
+
+            buf.t[1] = t
+            buf.t[2] = tf - ad/jMax - 2*h1_val
+            buf.t[3] = h1_val
+            buf.t[4] = 0
+            buf.t[5] = ad/jMax + h1_val - t
+            buf.t[6] = 0
+            buf.t[7] = 0
+
+            if check_step2!(buf, UDUD, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+    @label skip_t0124
+
+    # 3-step profile (UZD)
+    h1_sq = -ad_ad + jMax*(2*(a0 + af)*tf - 4*vd + jMax*tf_tf)
+    if h1_sq >= 0
+        h1 = sqrt(h1_sq) / abs(jMax)
+
+        buf.t[1] = (tf - h1 + ad/jMax)/2
+        buf.t[2] = h1
+        buf.t[3] = (tf - h1 - ad/jMax)/2
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = 0
+
+        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # 3-step profile (UZU) - cubic polynomial
+    polynom_0 = ad_ad
+    polynom_1 = ad_ad*tf
+    polynom_2 = (a0_a0 + af_af + 10*a0*af)*tf_tf + 24*(tf*(af*v0 - a0*vf) - pd*ad) + 12*vd_vd
+    polynom_3 = -3*tf*((a0_a0 + af_af + 2*a0*af)*tf_tf - 4*vd*(a0 + af)*tf + 4*vd_vd)
+
+    for t_root in solve_cubic_real!(roots, polynom_0, polynom_1, polynom_2, polynom_3)
+        t_root > tf && continue
+        t = t_root
+
+        denom = tf - t
+        abs(denom) < EPS && continue
+        jf = ad/denom
+
+        abs(jf) < EPS && continue
+        denom2 = 2*jf*t
+        abs(denom2) < EPS && continue
+
+        buf.t[1] = (2*(vd - a0*tf) + ad*(t - tf))/denom2
+        buf.t[2] = t
+        buf.t[3] = 0
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = tf - (buf.t[1] + buf.t[2])
+
+        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
+            return true
+        end
+    end
+
+    # 3-step profile (UDU)
+    denom = 4*(ad - jMax*tf)
+    if abs(denom) > EPS
+        buf.t[1] = (ad_ad/jMax + 2*(a0 + af)*tf - jMax*tf_tf - 4*vd)/denom
+        buf.t[2] = 0
+        buf.t[3] = -ad/(2*jMax) + tf/2
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = tf - (buf.t[1] + buf.t[3])
+
+        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+    time_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with velocity limit only (no ACC0 or ACC1).
+"""
+function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                         p0, v0, a0, pf, vf, af,
+                         vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, a0_p6, af_p6, jMax_jMax, g1, g2) = pc
+
+    tz_min = max(0.0, -a0/jMax)
+    tz_max = min((tf - a0/jMax)/2, (aMax - a0)/jMax)
+
+    # Profile UDDU - simple case when v0=a0=vf=af=0
+    if abs(v0) < EPS && abs(a0) < EPS && abs(vf) < EPS && abs(af) < EPS
+        # Solve cubic: t³ - (tf/2)t² + pd/(2*jMax) = 0
+        for t_root in solve_cubic_real!(roots, 1.0, -tf/2, 0.0, pd/(2*jMax))
+            t_root > tf/4 && continue
+            t = t_root
+
+            # Newton refinement
+            if t > EPS
+                orig = -pd + jMax*t*t*(tf - 2*t)
+                deriv = 2*jMax*t*(tf - 3*t)
+                abs(deriv) > EPS && (t -= orig / deriv)
+            end
+
+            buf.t[1] = t
+            buf.t[2] = 0
+            buf.t[3] = t
+            buf.t[4] = tf - 4*t
+            buf.t[5] = t
+            buf.t[6] = 0
+            buf.t[7] = t
+
+            if check_step2!(buf, UDDU, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    else
+        # UDDU - general case with 5th order polynomial
+        p1 = af_af - 2*jMax*(-2*af*tf + jMax*tf_tf + 3*vd)
+        ph1 = af_p3 - 3*jMax_jMax*g1 - 3*af*jMax*vd
+        ph2 = af_p4 + 8*af_p3*jMax*tf + 12*jMax*(3*jMax*vd_vd - af_af*vd + 2*af*jMax*(g1 - tf*vd) - 2*jMax_jMax*tf*g1)
+        ph3 = a0*(af - jMax*tf)
+        ph4 = jMax*(-ad + jMax*tf)
+
+        abs(ph4) < EPS && @goto udud_general
+
+        # 5th order polynomial coefficients
+        polynom_0 = (15*a0_a0 + af_af + 4*af*jMax*tf - 16*ph3 - 2*jMax*(jMax*tf_tf + 3*vd))/(4*ph4)
+        polynom_1 = (29*a0_p3 - 2*af_p3 - 33*a0*ph3 + 6*jMax_jMax*g1 + 6*af*jMax*vd + 6*a0*p1)/(6*jMax*ph4)
+        polynom_2 = (61*a0_p4 - 76*a0_a0*ph3 - 16*a0*ph1 + 30*a0_a0*p1 + ph2)/(24*jMax_jMax*ph4)
+        polynom_3 = (a0*(7*a0_p4 - 10*a0_a0*ph3 - 4*a0*ph1 + 6*a0_a0*p1 + ph2))/(12*jMax_jMax*jMax*ph4)
+        polynom_4 = (7*a0_p6 + af_p6 - 12*a0_p4*ph3 + 48*af_p3*jMax_jMax*g1 - 8*a0_p3*ph1 -
+                     72*jMax_jMax*jMax*(jMax*g1*g1 + vd_vd*vd + 2*af*g1*vd) - 6*af_p4*jMax*vd +
+                     36*af_af*jMax_jMax*vd_vd + 9*a0_p4*p1 + 3*a0_a0*ph2)/(144*jMax_jMax*jMax_jMax*ph4)
+
+        # Solve quintic using quartic derivative to find intervals
+        deriv_0 = 5.0
+        deriv_1 = 4*polynom_0
+        deriv_2 = 3*polynom_1
+        deriv_3 = 2*polynom_2
+        deriv_4 = polynom_3
+
+        tz_current = tz_min
+
+        for tz in solve_quartic_real!(roots, deriv_0, deriv_1, deriv_2, deriv_3, deriv_4)
+            tz >= tz_max && continue
+            tz < tz_min && continue
+
+            # Evaluate polynomial at tz and tz_current
+            val_current = polynom_4 + tz_current*(polynom_3 + tz_current*(polynom_2 + tz_current*(polynom_1 + tz_current*(polynom_0 + tz_current))))
+            val_new = polynom_4 + tz*(polynom_3 + tz*(polynom_2 + tz*(polynom_1 + tz*(polynom_0 + tz))))
+
+            if val_current * val_new < 0
+                # Root in interval - use bisection
+                t = shrink_interval_poly5(polynom_0, polynom_1, polynom_2, polynom_3, polynom_4, tz_current, tz)
+
+                # Newton refinement
+                h1_sq = (a0_a0 + af_af)/(2*jMax_jMax) + (2*a0*t + jMax*t*t - vd)/jMax
+                if h1_sq >= 0
+                    h1 = sqrt(h1_sq)
+                    orig = -pd - (2*a0_p3 + 4*af_p3 + 24*a0*jMax*t*(af + jMax*(h1 + t - tf)) +
+                           6*a0_a0*(af + jMax*(2*t - tf)) + 6*(a0_a0 + af_af)*jMax*h1 +
+                           12*af*jMax*(jMax*t*t - vd) +
+                           12*jMax_jMax*(jMax*t*t*(h1 + t - tf) - tf*v0 - h1*vd))/(12*jMax_jMax)
+                    deriv_newton = -(a0 + jMax*t)*(3*(h1 + t) - 2*tf + (a0 + 2*af)/jMax)
+                    if !isnan(orig) && !isnan(deriv_newton) && abs(deriv_newton) > EPS
+                        t -= orig / deriv_newton
+                    end
+                end
+
+                h1_sq = (a0_a0 + af_af)/(2*jMax_jMax) + (t*(2*a0 + jMax*t) - vd)/jMax
+                h1_sq < 0 && (tz_current = tz; continue)
+                h1 = sqrt(h1_sq)
+
+                buf.t[1] = t
+                buf.t[2] = 0
+                buf.t[3] = t + a0/jMax
+                buf.t[4] = tf - 2*(t + h1) - (a0 + af)/jMax
+                buf.t[5] = h1
+                buf.t[6] = 0
+                buf.t[7] = h1 + af/jMax
+
+                if check_step2!(buf, UDDU, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                    return true
+                end
+            end
+            tz_current = tz
+        end
+
+        # Check interval from last extrema to tz_max
+        val_current = polynom_4 + tz_current*(polynom_3 + tz_current*(polynom_2 + tz_current*(polynom_1 + tz_current*(polynom_0 + tz_current))))
+        val_max = polynom_4 + tz_max*(polynom_3 + tz_max*(polynom_2 + tz_max*(polynom_1 + tz_max*(polynom_0 + tz_max))))
+        if val_current * val_max < 0
+            t = shrink_interval_poly5(polynom_0, polynom_1, polynom_2, polynom_3, polynom_4, tz_current, tz_max)
+
+            h1_sq = (a0_a0 + af_af)/(2*jMax_jMax) + (t*(2*a0 + jMax*t) - vd)/jMax
+            if h1_sq >= 0
+                h1 = sqrt(h1_sq)
+
+                buf.t[1] = t
+                buf.t[2] = 0
+                buf.t[3] = t + a0/jMax
+                buf.t[4] = tf - 2*(t + h1) - (a0 + af)/jMax
+                buf.t[5] = h1
+                buf.t[6] = 0
+                buf.t[7] = h1 + af/jMax
+
+                if check_step2!(buf, UDDU, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                    return true
+                end
+            end
+        end
+    end
+
+    @label udud_general
+    # Profile UDUD - general case with 6th order polynomial
+    if !(abs(v0) < EPS && abs(a0) < EPS && abs(vf) < EPS && abs(af) < EPS)
+        ph1 = af_af - 2*jMax*(2*af*tf + jMax*tf_tf - 3*vd)
+        ph2 = af_p3 - 3*jMax_jMax*g1 + 3*af*jMax*vd
+        ph3 = 2*jMax*tf*g1 + 3*vd_vd
+        ph4 = af_p4 - 8*af_p3*jMax*tf + 12*jMax*(jMax*ph3 + af_af*vd + 2*af*jMax*(g1 - tf*vd))
+        ph5 = af + jMax*tf
+
+        # 6th order polynomial coefficients
+        polynom_0 = (5*a0 - ph5)/jMax
+        polynom_1 = (39*a0_a0 - ph1 - 16*a0*ph5)/(4*jMax_jMax)
+        polynom_2 = (55*a0_p3 - 33*a0_a0*ph5 - 6*a0*ph1 + 2*ph2)/(6*jMax_jMax*jMax)
+        polynom_3 = (101*a0_p4 + ph4 - 76*a0_p3*ph5 - 30*a0_a0*ph1 + 16*a0*ph2)/(24*jMax_jMax*jMax_jMax)
+        polynom_4 = (a0*(11*a0_p4 + ph4 - 10*a0_p3*ph5 - 6*a0_a0*ph1 + 4*a0*ph2))/(12*jMax_jMax*jMax_jMax*jMax)
+        polynom_5 = (11*a0_p6 - af_p6 - 12*a0_p4*(a0*ph5) - 48*af_p3*jMax_jMax*g1 - 9*a0_p4*ph1 +
+                     72*jMax_jMax*jMax*(jMax*g1*g1 - vd_vd*vd - 2*af*g1*vd) - 6*af_p4*jMax*vd -
+                     36*af_af*jMax_jMax*vd_vd + 8*a0_p3*ph2 + 3*a0_a0*ph4)/(144*jMax_jMax*jMax_jMax*jMax_jMax)
+
+        # Solve using quintic derivative to find intervals
+        deriv_0 = 6.0
+        deriv_1 = 5*polynom_0
+        deriv_2 = 4*polynom_1
+        deriv_3 = 3*polynom_2
+        deriv_4 = 2*polynom_3
+        deriv_5 = polynom_4
+
+        # Use quartic solution on 4th derivative to find extrema
+        dderiv_0 = 30.0
+        dderiv_1 = 20*polynom_0
+        dderiv_2 = 12*polynom_1
+        dderiv_3 = 6*polynom_2
+        dderiv_4 = 2*polynom_3
+
+        dd_tz_current = tz_min
+        intervals = NTuple{2,T}[]
+
+        for tz in solve_quartic_real!(roots, dderiv_0, dderiv_1, dderiv_2, dderiv_3, dderiv_4)
+            tz >= tz_max && continue
+            tz < tz_min && continue
+
+            # Check sign change in 1st derivative
+            val_current = deriv_5 + dd_tz_current*(deriv_4 + dd_tz_current*(deriv_3 + dd_tz_current*(deriv_2 + dd_tz_current*(deriv_1 + dd_tz_current*deriv_0))))
+            val_new = deriv_5 + tz*(deriv_4 + tz*(deriv_3 + tz*(deriv_2 + tz*(deriv_1 + tz*deriv_0))))
+
+            if val_current * val_new < 0
+                push!(intervals, (dd_tz_current, tz))
+            end
+            dd_tz_current = tz
+        end
+
+        # Check last interval
+        val_current = deriv_5 + dd_tz_current*(deriv_4 + dd_tz_current*(deriv_3 + dd_tz_current*(deriv_2 + dd_tz_current*(deriv_1 + dd_tz_current*deriv_0))))
+        val_max = deriv_5 + tz_max*(deriv_4 + tz_max*(deriv_3 + tz_max*(deriv_2 + tz_max*(deriv_1 + tz_max*deriv_0))))
+        if val_current * val_max < 0
+            push!(intervals, (dd_tz_current, tz_max))
+        end
+
+        tz_current = tz_min
+
+        for (int_lo, int_hi) in intervals
+            # Find root of derivative in interval (extremum of polynomial)
+            tz = shrink_interval_poly5(deriv_1/deriv_0, deriv_2/deriv_0, deriv_3/deriv_0, deriv_4/deriv_0, deriv_5/deriv_0, int_lo, int_hi)
+
+            tz >= tz_max && continue
+
+            # Evaluate polynomial at tz
+            p_val = polynom_5 + tz*(polynom_4 + tz*(polynom_3 + tz*(polynom_2 + tz*(polynom_1 + tz*(polynom_0 + tz)))))
+
+            # Check if extremum is close to zero (root)
+            ddval = dderiv_4 + tz*(dderiv_3 + tz*(dderiv_2 + tz*(dderiv_1 + tz*dderiv_0)))
+            if abs(p_val) < 64 * abs(ddval) * 1e-12
+                t = tz
+            else
+                # Check for sign change
+                p_val_current = polynom_5 + tz_current*(polynom_4 + tz_current*(polynom_3 + tz_current*(polynom_2 + tz_current*(polynom_1 + tz_current*(polynom_0 + tz_current)))))
+                if p_val_current * p_val < 0
+                    t = shrink_interval_poly6(polynom_0, polynom_1, polynom_2, polynom_3, polynom_4, polynom_5, tz_current, tz)
+                else
+                    tz_current = tz
+                    continue
+                end
+            end
+
+            # Double Newton step
+            h1_sq = (af_af - a0_a0)/(2*jMax_jMax) - ((2*a0 + jMax*t)*t - vd)/jMax
+            if h1_sq >= 0
+                h1 = sqrt(h1_sq)
+                orig = -pd + (af_p3 - a0_p3 + 3*a0_a0*jMax*(tf - 2*t))/(6*jMax_jMax) + (2*a0 + jMax*t)*t*(tf - t) + (jMax*h1 - af)*h1*h1 + tf*v0
+                deriv_newton = (a0 + jMax*t)*(2*(af + jMax*tf) - 3*jMax*(h1 + t) - a0)/jMax
+
+                if abs(deriv_newton) > EPS
+                    t -= orig / deriv_newton
+
+                    h1_sq = (af_af - a0_a0)/(2*jMax_jMax) - ((2*a0 + jMax*t)*t - vd)/jMax
+                    if h1_sq >= 0
+                        h1 = sqrt(h1_sq)
+                        orig = -pd + (af_p3 - a0_p3 + 3*a0_a0*jMax*(tf - 2*t))/(6*jMax_jMax) + (2*a0 + jMax*t)*t*(tf - t) + (jMax*h1 - af)*h1*h1 + tf*v0
+                        if abs(orig) > 1e-9
+                            deriv_newton = (a0 + jMax*t)*(2*(af + jMax*tf) - 3*jMax*(h1 + t) - a0)/jMax
+                            abs(deriv_newton) > EPS && (t -= orig / deriv_newton)
+                        end
+                    end
+                end
+            end
+
+            h1_sq = (af_af - a0_a0)/(2*jMax_jMax) - ((2*a0 + jMax*t)*t - vd)/jMax
+            h1_sq < 0 && (tz_current = tz; continue)
+            h1 = sqrt(h1_sq)
+
+            buf.t[1] = t
+            buf.t[2] = 0
+            buf.t[3] = t + a0/jMax
+            buf.t[4] = tf - 2*(t + h1) + ad/jMax
+            buf.t[5] = h1
+            buf.t[6] = 0
+            buf.t[7] = h1 - af/jMax
+
+            if check_step2!(buf, UDUD, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+
+            tz_current = tz
+        end
+
+        # Check last interval to tz_max
+        p_val_current = polynom_5 + tz_current*(polynom_4 + tz_current*(polynom_3 + tz_current*(polynom_2 + tz_current*(polynom_1 + tz_current*(polynom_0 + tz_current)))))
+        p_val_max = polynom_5 + tz_max*(polynom_4 + tz_max*(polynom_3 + tz_max*(polynom_2 + tz_max*(polynom_1 + tz_max*(polynom_0 + tz_max)))))
+        if p_val_current * p_val_max < 0
+            t = shrink_interval_poly6(polynom_0, polynom_1, polynom_2, polynom_3, polynom_4, polynom_5, tz_current, tz_max)
+
+            h1_sq = (af_af - a0_a0)/(2*jMax_jMax) - ((2*a0 + jMax*t)*t - vd)/jMax
+            if h1_sq >= 0
+                h1 = sqrt(h1_sq)
+
+                buf.t[1] = t
+                buf.t[2] = 0
+                buf.t[3] = t + a0/jMax
+                buf.t[4] = tf - 2*(t + h1) + ad/jMax
+                buf.t[5] = h1
+                buf.t[6] = 0
+                buf.t[7] = h1 - af/jMax
+
+                if check_step2!(buf, UDUD, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+# Helper for bisection on 5th degree polynomial
+function shrink_interval_poly5(c0, c1, c2, c3, c4, lo, hi)
+    for _ in 1:64
+        mid = (lo + hi) / 2
+        val_mid = c4 + mid*(c3 + mid*(c2 + mid*(c1 + mid*(c0 + mid))))
+        val_lo = c4 + lo*(c3 + lo*(c2 + lo*(c1 + lo*(c0 + lo))))
+        if val_lo * val_mid < 0
+            hi = mid
+        else
+            lo = mid
+        end
+        abs(hi - lo) < 1e-14 && break
+    end
+    return (lo + hi) / 2
+end
+
+# Helper for bisection on 6th degree polynomial
+function shrink_interval_poly6(c0, c1, c2, c3, c4, c5, lo, hi)
+    for _ in 1:64
+        mid = (lo + hi) / 2
+        val_mid = c5 + mid*(c4 + mid*(c3 + mid*(c2 + mid*(c1 + mid*(c0 + mid)))))
+        val_lo = c5 + lo*(c4 + lo*(c3 + lo*(c2 + lo*(c1 + lo*(c0 + lo)))))
+        if val_lo * val_mid < 0
+            hi = mid
+        else
+            lo = mid
+        end
+        abs(hi - lo) < 1e-14 && break
+    end
+    return (lo + hi) / 2
+end
+
+"""
+    calculate_profile_step2!(roots, buf, tf, p0, v0, a0, pf, vf, af, jMax, vmax, vmin, amax, amin)
+
+Calculate a profile that achieves the target duration tf.
+This is Step 2 of the Ruckig algorithm - time synchronization.
+
+Returns true if a valid profile was found.
+"""
+function calculate_profile_step2!(roots::Roots, buf::ProfileBuffer{T}, tf, p0, v0, a0, pf, vf, af,
+                                  jMax, vmax, vmin, amax, amin) where T
+    pc = Step2PreComputed(tf, p0, v0, a0, pf, vf, af, jMax)
+    pd = pf - p0
+
+    # Determine primary direction
+    up_first = pd > tf * v0
+
+    if up_first
+        vMax, vMin = vmax, vmin
+        aMax, aMin = amax, amin
+        jMax_dir = jMax
+    else
+        vMax, vMin = vmin, vmax
+        aMax, aMin = amin, amax
+        jMax_dir = -jMax
+    end
+
+    # Try velocity-limited profiles (UP direction)
+    time_acc0_acc1_vel_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_acc0_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_acc1_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+
+    # Try velocity-limited profiles (DOWN direction)
+    time_acc0_acc1_vel_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_acc0_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_acc1_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+
+    # Try acceleration-limited profiles (UP direction)
+    time_acc0_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_acc0_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_none_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+
+    # Try acceleration-limited profiles (DOWN direction)
+    time_acc0_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_acc0_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_none_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+
+    return false
+end
+
+
+#=============================================================================
+ Multi-DOF Trajectory Calculation
+=============================================================================#
+
+"""
+    calculate_trajectory(lims::AbstractVector{<:JerkLimiter}; pf, p0, v0, a0, vf, af)
+
+Calculate time-synchronized trajectories for multiple degrees of freedom.
+All DOFs will have the same total duration.
+
+# Arguments
+- `lims`: Vector of JerkLimiter, one per DOF
+- `pf`: Vector of target positions (required)
+- `p0`: Vector of initial positions (default: zeros)
+- `v0`: Vector of initial velocities (default: zeros)
+- `a0`: Vector of initial accelerations (default: zeros)
+- `vf`: Vector of final velocities (default: zeros)
+- `af`: Vector of final accelerations (default: zeros)
+
+# Returns
+Vector of RuckigProfile, one per DOF, all with the same duration.
+"""
+function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
+    pf::AbstractVector,
+    p0::AbstractVector = zeros(T, length(lims)),
+    v0::AbstractVector = zeros(T, length(lims)),
+    a0::AbstractVector = zeros(T, length(lims)),
+    vf::AbstractVector = zeros(T, length(lims)),
+    af::AbstractVector = zeros(T, length(lims)),
+) where T
+    ndof = length(lims)
+    length(pf) == ndof || throw(ArgumentError("pf must have length $ndof"))
+    length(p0) == ndof || throw(ArgumentError("p0 must have length $ndof"))
+    length(v0) == ndof || throw(ArgumentError("v0 must have length $ndof"))
+    length(a0) == ndof || throw(ArgumentError("a0 must have length $ndof"))
+    length(vf) == ndof || throw(ArgumentError("vf must have length $ndof"))
+    length(af) == ndof || throw(ArgumentError("af must have length $ndof"))
+
+    # Step 1: Calculate minimum-time profile for each DOF independently
+    blocks = Vector{Block{Float64}}(undef, ndof)
+    for i in 1:ndof
+        profile = calculate_trajectory(lims[i];
+            p0=p0[i], v0=v0[i], a0=a0[i],
+            pf=pf[i], vf=vf[i], af=af[i])
+        blocks[i] = Block(profile)
+    end
+
+    # Find synchronization time (maximum of all minimum times)
+    t_sync = maximum(block.t_min for block in blocks)
+    limiting_dof = argmax([block.t_min for block in blocks])
+
+    # Check if t_sync is blocked for any DOF
+    for i in 1:ndof
+        if is_blocked(blocks[i], t_sync)
+            # TODO: Try next candidate time from block intervals
+            error("Synchronization time $t_sync is blocked for DOF $i")
+        end
+    end
+
+    # Step 2: Recalculate non-limiting DOFs for synchronized duration
+    profiles = Vector{RuckigProfile{Float64}}(undef, ndof)
+
+    for i in 1:ndof
+        if i == limiting_dof
+            # Limiting DOF uses its minimum-time profile
+            profiles[i] = blocks[i].p_min
+        elseif abs(t_sync - blocks[i].t_min) < T_PRECISION
+            # Duration matches, use existing profile
+            profiles[i] = blocks[i].p_min
+        else
+            # Need to recalculate for synchronized duration (Step 2)
+            buf = lims[i].buffer
+            clear!(buf)
+
+            success = calculate_profile_step2!(lims[i].roots, buf, t_sync,
+                p0[i], v0[i], a0[i], pf[i], vf[i], af[i],
+                lims[i].jmax, lims[i].vmax, lims[i].vmin,
+                lims[i].amax, lims[i].amin)
+
+            if !success
+                error("Failed to find synchronized profile for DOF $i at duration $t_sync")
+            end
+
+            profiles[i] = RuckigProfile(buf, pf[i], vf[i], af[i])
+        end
+    end
+
+    return profiles
+end
+
+"""
+    evaluate_at(profiles::AbstractVector{<:RuckigProfile}, t)
+
+Evaluate all DOF profiles at time t.
+Returns (positions, velocities, accelerations, jerks) as vectors.
+"""
+function evaluate_at(profiles::AbstractVector{<:RuckigProfile{T}}, t::Real) where T
+    ndof = length(profiles)
+    ps = Vector{T}(undef, ndof)
+    vs = Vector{T}(undef, ndof)
+    as = Vector{T}(undef, ndof)
+    js = Vector{T}(undef, ndof)
+
+    for i in 1:ndof
+        ps[i], vs[i], as[i], js[i] = evaluate_at(profiles[i], t)
+    end
+
+    return ps, vs, as, js
+end
+
+"""
+    evaluate_dt(profiles::AbstractVector{<:RuckigProfile}, Ts)
+
+Evaluate all DOF profiles at regular time intervals.
+Returns matrices (pos, vel, acc, jerk) where each column is a DOF,
+plus the time vector ts.
+"""
+function evaluate_dt(profiles::AbstractVector{<:RuckigProfile{T}}, Ts) where T
+    ndof = length(profiles)
+    Tf = duration(profiles[1])  # All profiles have same duration (synchronized)
+    ts = 0:Ts:Tf
+    n = length(ts)
+
+    pos = Matrix{T}(undef, n, ndof)
+    vel = Matrix{T}(undef, n, ndof)
+    acc = Matrix{T}(undef, n, ndof)
+    jerk = Matrix{T}(undef, n, ndof)
+
+    for j in 1:ndof
+        for (i, t) in enumerate(ts)
+            pos[i, j], vel[i, j], acc[i, j], jerk[i, j] = evaluate_at(profiles[j], t)
+        end
+    end
+
+    return pos, vel, acc, jerk, ts
 end
