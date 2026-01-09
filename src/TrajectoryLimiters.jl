@@ -53,13 +53,17 @@ end
 """
     z_to_x(z1, z2, z3, T, U)
 
-Transform z-coordinates back to physical state (W transform from jerk2.pdf eq. 9).
+Transform z-coordinates back to physical state (W transform, computed as inverse of W⁻¹).
+
+W = TU * [T²    -T²    T²/6]
+         [0      T    -T/2 ]
+         [0      0     1   ]
 """
 function z_to_x(z1, z2, z3, T, U)
     TU = T * U
     T2 = T^2
-    pos = TU * (T2/6 * z1 - T2/2 * z2 + T2/2 * z3)
-    vel = TU * (T * z2 - T/2 * z3)
+    pos = TU * T2 * (z1 - z2 + z3/6)
+    vel = TU * T * (z2 - z3/2)
     acc = TU * z3
     return pos, vel, acc
 end
@@ -247,7 +251,7 @@ X, Ẋ, Ẍ, X⃛ = limiter(R::Vector) # Uses a zero initial state
 # Keyword Arguments
 - `Np`: Prediction horizon
 """
-function JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=60)
+function JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=100)
     Ts, ẋM, ẍM, x⃛M = promote(Ts, ẋM, ẍM, x⃛M)
     T, U = Ts, x⃛M
     TU = T * U
@@ -264,10 +268,15 @@ function JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=60)
     mpc = LinearMPC.MPC(Ad, bd; C=Cd, Ts=Float64(Ts), Np)
 
     # Set objective in z-space (tune weights as needed)
-    set_objective!(mpc; Q=[1, 0, 0], R=[1e-10], Rr=[1e-10], Qf=[10, 1, 1])
+    set_objective!(mpc; Q=[1e1, 1000, 100], R=[1e-8], Rr=[1e-6], Qf=[1e1, 1000, 100])
 
     # Set jerk (input) bounds - u is still physical jerk
     set_input_bounds!(mpc; umin=[-x⃛M], umax=[x⃛M])
+
+    add_constraint!(mpc;
+        Au=[1.0;;],  # 
+        lb=[0], ub=[0],
+        soft=false, ks=Np-4:Np)  # Enforce zero jerk at end of horizon
 
     # Velocity constraint in z-space:
     # From z_to_x: vel = TU * (T * z2 - T/2 * z3)
@@ -295,15 +304,15 @@ function JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M; Np=60)
 
     mpc.settings.reference_preview = true
 
-    # LinearMPC.move_block!(mpc, [ones(40); 1ones(100)])
+    LinearMPC.move_block!(mpc, [ones(80); 2ones(100)])
 
     # Setup the MPC (converts to QP form)
     setup!(mpc)
 
-    LinearMPC.DAQP.settings(mpc.opt_model, Dict(
-        :dual_tol => 1e-10,
-        :pivot_tol => 1e-5,
-    ))
+    # LinearMPC.DAQP.settings(mpc.opt_model, Dict(
+    #     :dual_tol => 1e-10,
+    #     :pivot_tol => 1e-5,
+    # ))
 
     JerkTrajectoryLimiter(Ts, ẋM, ẍM, x⃛M, mpc)
 end
@@ -371,7 +380,7 @@ function trajlim(state::JerkState, R::AbstractMatrix, limiter::JerkTrajectoryLim
     for i = 1:size(R, 2)
         R_z[1, i], R_z[2, i], R_z[3, i] = x_to_z(R[1, i], R[2, i], R[3, i], T, U)
     end
-
+    R_z .*= [1,0,0]
     # Compute control (u is physical jerk)
     u_vec = compute_control(limiter.mpc, z; r=R_z, check=true)
     u = u_vec[1]

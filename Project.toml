@@ -1,9 +1,14 @@
 name = "TrajectoryLimiters"
 uuid = "9792e600-fe43-4e4e-833b-462f466b8006"
-authors = ["Fredrik Bagge Carlson"]
 version = "0.1.0"
+authors = ["Fredrik Bagge Carlson"]
+
+[deps]
+ControlSystemsBase = "aaaaaaaa-a6ca-5380-bf3e-84a91bcd477e"
+LinearMPC = "82e1c212-e1a2-49d2-b26a-a31d6968e3bd"
 
 [compat]
+ControlSystemsBase = "1.20.1"
 julia = "1.8"
 
 [extras]
