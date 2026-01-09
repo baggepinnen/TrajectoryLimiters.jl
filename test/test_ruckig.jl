@@ -655,3 +655,11 @@ end
     waypoints = [(p = randn(7),) for i = 1:1000]
     @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
 end
+
+
+@testset "known failure case" begin
+    lim = JerkLimiter(; vmax=5.378090911418406, amax=21.580739221501887, jmax=250.48205176578452)
+    p0,v0,a0 = (0.48825150691793306, 0.0, 0.0)
+    pf,vf,af = (-1.3966905677540724, 0.0, 0.0)
+    calculate_trajectory(lim; p0, v0, a0, pf, vf, af)
+end

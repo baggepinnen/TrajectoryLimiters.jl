@@ -11,7 +11,7 @@ export calculate_trajectory, calculate_waypoint_trajectory, evaluate_at, evaluat
  Constants (matching reference implementation)
 =============================================================================#
 
-const EPS = eps(Float64)
+const EPS = 1e-12  # Matching reference implementation's v_eps/a_eps/j_eps
 const P_PRECISION = 1e-8
 const V_PRECISION = 1e-8
 const A_PRECISION = 1e-10
@@ -1027,6 +1027,39 @@ function time_acc0_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
 end
 
 """
+Two-step ACC1_VEL profile (reaches aMin and vMax, skips aMax phase).
+From reference: time_acc1_vel_two_step
+"""
+function time_acc1_vel_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
+                                  jMax, vMax, vMin, aMax, aMin) where T
+    jMax_jMax = jMax^2
+    a0_a0 = a0^2
+    af_af = af^2
+    a0_p3 = a0^3
+    af_p3 = af^3
+    af_p4 = af^4
+    pd = pf - p0
+    vf_vf = vf^2
+
+    buf.t[1] = 0
+    buf.t[2] = 0
+    buf.t[3] = a0/jMax
+    buf.t[4] = -(3*af_p4 - 8*aMin*(af_p3 - a0_p3) - 24*aMin*jMax*(a0*v0 - af*vf) +
+                 6*af_af*(aMin^2 - 2*jMax*vf) -
+                 12*jMax*(2*aMin*jMax*pd + aMin^2*(vf + vMax) + jMax*(vMax^2 - vf_vf) +
+                          aMin*a0*(a0_a0 - 2*jMax*(v0 + vMax))/jMax)) / (24*aMin*jMax_jMax*vMax)
+    buf.t[5] = -aMin/jMax
+    buf.t[6] = -(af_af/2 - aMin^2 + jMax*(vMax - vf))/(aMin*jMax)
+    buf.t[7] = buf.t[5] + af/jMax
+
+    if check!(buf, UDDU, LIMIT_ACC1_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        return true
+    end
+
+    return false
+end
+
+"""
 Two-step VEL profile (simplified velocity-limited profile).
 """
 function time_vel_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
@@ -1216,6 +1249,10 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
         return RuckigProfile(buf, pf, vf, af)
     end
 
+    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
     if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
         return RuckigProfile(buf, pf, vf, af)
     end
@@ -1241,6 +1278,10 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
     end
 
     if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
         return RuckigProfile(buf, pf, vf, af)
     end
 
