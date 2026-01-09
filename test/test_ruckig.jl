@@ -449,6 +449,42 @@ end
     @test vsf[2] ≈ 0.0 atol=1e-6
 end
 
+@testset "Multi-DOF evaluate_dt" begin
+    lims = [
+        JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),
+        JerkLimiter(; vmax=5.0, amax=30.0, jmax=500.0),
+    ]
+
+    profiles = calculate_trajectory(lims; pf=[1.0, 2.0])
+
+    # Test matrix evaluate_dt
+    pos, vel, acc, jerk, ts = evaluate_dt(profiles, 0.001)
+
+    @test size(pos, 2) == 2  # 2 DOFs
+    @test size(vel, 2) == 2
+    @test size(acc, 2) == 2
+    @test size(jerk, 2) == 2
+    @test size(pos, 1) == length(ts)
+
+    # Check boundary values
+    @test pos[1, 1] ≈ 0.0
+    @test pos[1, 2] ≈ 0.0
+    @test pos[end, 1] ≈ 1.0 atol=1e-3
+    @test pos[end, 2] ≈ 2.0 atol=1e-3
+
+    # Check that matrix version matches scalar version
+    for (i, t) in enumerate(ts[1:10:end])
+        for j in 1:2
+            p, v, a, jk = evaluate_at(profiles[j], t)
+            idx = 1 + (i-1)*10
+            @test pos[idx, j] ≈ p
+            @test vel[idx, j] ≈ v
+            @test acc[idx, j] ≈ a
+            @test jerk[idx, j] ≈ jk
+        end
+    end
+end
+
 @testset "Multi-DOF with initial states" begin
     lims = [
         JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),
@@ -526,4 +562,88 @@ end
     # Both DOFs still reach their targets
     @test profiles[1].p[8] ≈ 2.0 atol=1e-6
     @test profiles[2].p[8] ≈ 2.0 atol=1e-6
+end
+
+@testset "Multi-DOF waypoint trajectories" begin
+    lims = [
+        JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),
+        JerkLimiter(; vmax=5.0, amax=30.0, jmax=500.0),
+    ]
+
+    # Basic 2-waypoint (equivalent to single segment)
+    waypoints = [(p=[0.0, 0.0],), (p=[1.0, 2.0],)]
+    ts, ps, vs, as, js = calculate_waypoint_trajectory(lims, waypoints, 0.001)
+
+    @test size(ps, 2) == 2  # 2 DOFs
+    @test ps[1, 1] ≈ 0.0
+    @test ps[1, 2] ≈ 0.0
+    @test ps[end, 1] ≈ 1.0 atol=1e-3
+    @test ps[end, 2] ≈ 2.0 atol=1e-3
+    @test vs[end, 1] ≈ 0.0 atol=1e-3
+    @test vs[end, 2] ≈ 0.0 atol=1e-3
+
+    # 3 waypoints
+    waypoints = [
+        (p = [0.0, 0.0],),
+        (p = [1.0, 2.0],),
+        (p = [3.0, 4.0],),
+    ]
+    ts, ps, vs, as, js = calculate_waypoint_trajectory(lims, waypoints, 0.001)
+
+    @test ps[1, 1] ≈ 0.0
+    @test ps[1, 2] ≈ 0.0
+    @test ps[end, 1] ≈ 3.0 atol=1e-3
+    @test ps[end, 2] ≈ 4.0 atol=1e-3
+
+    # With non-zero velocities at waypoints
+    waypoints = [
+        (p = [0.0, 0.0],),
+        (p = [2.0, 3.0], v = [0.1, 0.5]),
+        (p = [5.0, 6.0],),
+    ]
+    ts, ps, vs, as, js = calculate_waypoint_trajectory(lims, waypoints, 0.001)
+
+    @test ps[1, 1] ≈ 0.0
+    @test ps[1, 2] ≈ 0.0
+    @test ps[end, 1] ≈ 5.0 atol=1e-3
+    @test ps[end, 2] ≈ 6.0 atol=1e-3
+
+    # Check limits are respected for each DOF
+    for i in eachindex(ts)
+        for (j, lim) in enumerate(lims)
+            @test lim.vmin - 1e-6 <= vs[i, j] <= lim.vmax + 1e-6
+            @test lim.amin - 1e-6 <= as[i, j] <= lim.amax + 1e-6
+            @test -lim.jmax - 1e-6 <= js[i, j] <= lim.jmax + 1e-6
+        end
+    end
+
+    # Check time is monotonically increasing
+    for i in 2:length(ts)
+        @test ts[i] > ts[i-1]
+    end
+end
+
+@testset "Multi-DOF waypoint trajectory with 3 DOFs" begin
+    lims = [
+        JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),
+        JerkLimiter(; vmax=5.0, amax=30.0, jmax=500.0),
+        JerkLimiter(; vmax=8.0, amax=40.0, jmax=800.0),
+    ]
+
+    waypoints = [
+        (p = [0.0, 0.0, 0.0],),
+        (p = [1.0, 2.0, 1.5], v = [0.1, 0.3, 0.4]),
+        (p = [3.0, 4.0, 3.0],),
+    ]
+    ts, ps, vs, as, js = calculate_waypoint_trajectory(lims, waypoints, 0.001)
+
+    @test size(ps, 2) == 3  # 3 DOFs
+    @test ps[end, 1] ≈ 3.0 atol=1e-3
+    @test ps[end, 2] ≈ 4.0 atol=1e-3
+    @test ps[end, 3] ≈ 3.0 atol=1e-3
+
+    # All DOFs end at rest
+    @test vs[end, 1] ≈ 0.0 atol=1e-3
+    @test vs[end, 2] ≈ 0.0 atol=1e-3
+    @test vs[end, 3] ≈ 0.0 atol=1e-3
 end

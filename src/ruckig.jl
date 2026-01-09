@@ -1349,6 +1349,99 @@ function calculate_waypoint_trajectory(lim::JerkLimiter, waypoints, Ts)
     return all_ts, all_ps, all_vs, all_as, all_js
 end
 
+"""
+Extract waypoint state arrays for multi-DOF trajectories.
+"""
+function get_waypoint_state_multidof(wp, ndof)
+    p = wp.p
+    v = hasproperty(wp, :v) ? wp.v : zeros(eltype(p), ndof)
+    a = hasproperty(wp, :a) ? wp.a : zeros(eltype(p), ndof)
+    (p, v, a)
+end
+
+"""
+    calculate_waypoint_trajectory(lims::AbstractVector{<:JerkLimiter}, waypoints, Ts)
+
+Calculate time-synchronized trajectory passing through specified waypoints for multiple DOFs.
+
+Each waypoint is a named tuple with arrays for each state:
+- `p`: position array (required)
+- `v`: velocity array (optional, defaults to zeros)
+- `a`: acceleration array (optional, defaults to zeros)
+
+# Example
+```julia
+lims = [
+    JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),
+    JerkLimiter(; vmax=5.0, amax=30.0, jmax=500.0),
+]
+waypoints = [
+    (p = [0.0, 0.0],),
+    (p = [1.0, 2.0], v = [2.0, 1.0]),
+    (p = [3.0, 4.0],),
+]
+ts, ps, vs, as, js = calculate_waypoint_trajectory(lims, waypoints, 0.001)
+```
+
+Returns `(ts, ps, vs, as, js)` where `ps`, `vs`, `as`, `js` are matrices
+with each column corresponding to a DOF.
+"""
+function calculate_waypoint_trajectory(lims::AbstractVector{<:JerkLimiter{T}}, waypoints, Ts) where T
+    n = length(waypoints)
+    n < 2 && error("Need at least 2 waypoints")
+    ndof = length(lims)
+
+    # Collect all segments
+    all_ts = T[]
+    all_ps = Vector{T}[]
+    all_vs = Vector{T}[]
+    all_as = Vector{T}[]
+    all_js = Vector{T}[]
+
+    t_offset = zero(T)
+
+    for i in 1:(n-1)
+        # Extract states at waypoints
+        p0, v0, a0 = get_waypoint_state_multidof(waypoints[i], ndof)
+        pf, vf, af = get_waypoint_state_multidof(waypoints[i+1], ndof)
+
+        # Calculate synchronized trajectory for this segment
+        profiles = calculate_trajectory(lims; p0, v0, a0, pf, vf, af)
+
+        # Sample at Ts intervals
+        ps, vs, as, js, ts = evaluate_dt(profiles, Ts)
+
+        # Shift times by offset and append
+        if i == 1
+            append!(all_ts, ts .+ t_offset)
+            for k in axes(ps, 1)
+                push!(all_ps, ps[k, :])
+                push!(all_vs, vs[k, :])
+                push!(all_as, as[k, :])
+                push!(all_js, js[k, :])
+            end
+        else
+            # Skip first point to avoid duplicates at waypoint boundaries
+            append!(all_ts, (ts .+ t_offset)[2:end])
+            for k in 2:size(ps, 1)
+                push!(all_ps, ps[k, :])
+                push!(all_vs, vs[k, :])
+                push!(all_as, as[k, :])
+                push!(all_js, js[k, :])
+            end
+        end
+
+        t_offset += duration(profiles[1])
+    end
+
+    # Convert vectors of vectors to matrices
+    ps_mat = reduce(hcat, all_ps)'
+    vs_mat = reduce(hcat, all_vs)'
+    as_mat = reduce(hcat, all_as)'
+    js_mat = reduce(hcat, all_js)'
+
+    return all_ts, Matrix(ps_mat), Matrix(vs_mat), Matrix(as_mat), Matrix(js_mat)
+end
 
 
 #=============================================================================
