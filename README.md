@@ -3,9 +3,14 @@
 [![Build Status](https://github.com/baggepinnen/TrajectoryLimiters.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/baggepinnen/TrajectoryLimiters.jl/actions/workflows/CI.yml?query=branch%3Amain)
 [![Coverage](https://codecov.io/gh/baggepinnen/TrajectoryLimiters.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/baggepinnen/TrajectoryLimiters.jl)
 
-Contains an implementation of 
+Contains implementations of 
 > Nonlinear filters for the generation of smooth trajectories
 > R. Zanasi, C. Guarino Lo Bianco, A. Tonielli
+
+and the _ruckig_ algorithm from
+
+> Jerk-limited Real-time Trajectory Generation with Arbitrary Target States
+> M. Berscheid, T. Kröger
 
 This nonlinear trajectory filter takes a pre-defined reference trajectory $r(t)$ (uniformly sampled in $t$) and filters it (causally) such that the velocity and acceleration are bounded by $ẋ_M$ and $ẍ_M$.
 
@@ -91,7 +96,7 @@ julia> @btime $limiter(TrajectoryLimiters.State(0.0), 0.0);
   17.372 ns (0 allocations: 0 bytes)
   ```
 
-## Jerk-Limited Trajectory Generation
+## Ruckig: Jerk-Limited Trajectory Generation
 
 This package also includes a `JerkLimiter` for generating time-optimal jerk-limited trajectories. This is based on the Ruckig algorithm:
 

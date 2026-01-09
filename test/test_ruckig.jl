@@ -27,6 +27,8 @@ end
 
     # Move from 0 to 1
     profile = calculate_trajectory(lim, 0.0, 0.0, 0.0, 1.0)
+    
+    # 743.932 ns (62 allocations: 3.02 KiB)
 
     @test profile.t_sum[7] > 0
     @test profile.p[1] ≈ 0.0

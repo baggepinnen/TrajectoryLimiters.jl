@@ -78,6 +78,57 @@ end
 RuckigProfile(::Type{T}) where T = RuckigProfile{T}()
 
 """
+    Roots{T}
+
+Mutable storage for polynomial roots to avoid allocations.
+Stores up to 4 roots with a count of valid entries.
+"""
+mutable struct Roots{T}
+    r1::T
+    r2::T
+    r3::T
+    r4::T
+    count::Int
+end
+
+Roots{T}() where T = Roots{T}(T(NaN), T(NaN), T(NaN), T(NaN), 0)
+
+function clear!(r::Roots{T}) where T
+    r.r1 = r.r2 = r.r3 = r.r4 = T(NaN)
+    r.count = 0
+    r
+end
+
+function Base.push!(r::Roots{T}, val) where T
+    r.count += 1
+    if r.count == 1
+        r.r1 = val
+    elseif r.count == 2
+        r.r2 = val
+    elseif r.count == 3
+        r.r3 = val
+    else
+        r.r4 = val
+    end
+    r
+end
+
+Base.length(r::Roots) = r.count
+
+# Iterator interface for for-loop consumption
+Base.iterate(r::Roots) = r.count >= 1 ? (r.r1, 2) : nothing
+function Base.iterate(r::Roots, i)
+    i > r.count && return nothing
+    if i == 2
+        return (r.r2, 3)
+    elseif i == 3
+        return (r.r3, 4)
+    else
+        return (r.r4, 5)
+    end
+end
+
+"""
     JerkLimiter{T}
 
 Jerk-limited trajectory generator with directional limits.
@@ -88,11 +139,13 @@ struct JerkLimiter{T}
     amax::T
     amin::T
     jmax::T
+    roots::Roots{Float64}  # Always Float64 since polynomial roots are floating-point
 end
 
 function JerkLimiter(vmax, vmin, amax, amin, jmax)
-    args = promote(vmax, vmin, amax, amin, jmax)
-    JerkLimiter(args...)
+    T = promote_type(typeof(vmax), typeof(vmin), typeof(amax), typeof(amin), typeof(jmax))
+    # Roots are always Float64 since polynomial solving produces floating-point results
+    JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}())
 end
 
 JerkLimiter(vmax, amax, jmax) = JerkLimiter(vmax, -vmax, amax, -amax, jmax)
@@ -102,31 +155,37 @@ JerkLimiter(vmax, amax, jmax) = JerkLimiter(vmax, -vmax, amax, -amax, jmax)
 =============================================================================#
 
 """
-Solve ax² + bx + c = 0 for real roots.
+Solve ax² + bx + c = 0 for real roots, storing results in `roots`.
 """
-function solve_quadratic_real(a, b, c)
+function solve_quadratic_real!(roots::Roots, a, b, c)
+    clear!(roots)
     if abs(a) < EPS
-        abs(b) < EPS && return Float64[]
-        return [-c/b]
+        abs(b) < EPS && return roots
+        push!(roots, -c/b)
+        return roots
     end
 
     disc = b^2 - 4a*c
-    disc < 0 && return Float64[]
+    disc < 0 && return roots
 
     if disc < EPS
-        return [-b / (2a)]
+        push!(roots, -b / (2a))
+        return roots
     end
 
     sqrt_disc = sqrt(disc)
-    return [(-b - sqrt_disc) / (2a), (-b + sqrt_disc) / (2a)]
+    push!(roots, (-b - sqrt_disc) / (2a))
+    push!(roots, (-b + sqrt_disc) / (2a))
+    return roots
 end
 
 """
 Solve ax³ + bx² + cx + d = 0 for real roots using Cardano's formula.
 """
-function solve_cubic_real(a, b, c, d)
+function solve_cubic_real!(roots::Roots, a, b, c, d)
+    clear!(roots)
     if abs(a) < EPS
-        return solve_quadratic_real(b, c, d)
+        return solve_quadratic_real!(roots, b, c, d)
     end
 
     # Normalize
@@ -137,8 +196,6 @@ function solve_cubic_real(a, b, c, d)
     bb = 2p^3/27 - p*q/3 + r
 
     disc = bb^2/4 + aa^3/27
-
-    roots = Float64[]
 
     if disc > EPS
         u = cbrt(-bb/2 + sqrt(disc))
@@ -165,10 +222,11 @@ end
 """
 Solve ax⁴ + bx³ + cx² + dx + e = 0 for real roots using Ferrari's method.
 """
-function solve_quartic_real(a, b, c, d, e)
+function solve_quartic_real!(roots::Roots, a, b, c, d, e)
+    clear!(roots)
     # Handle non-quartic case
     if abs(a) < EPS
-        return solve_cubic_real(b, c, d, e)
+        return solve_cubic_real!(roots, b, c, d, e)
     end
 
     # Normalize to monic quartic: x^4 + px^3 + qx^2 + rx + s = 0
@@ -178,7 +236,7 @@ function solve_quartic_real(a, b, c, d, e)
     if abs(s) < EPS
         if abs(r) < EPS
             # x^4 + px^3 + qx^2 = x^2(x^2 + px + q) = 0
-            roots = Float64[0.0]
+            push!(roots, 0.0)
             D = p^2 - 4*q
             if abs(D) < EPS
                 push!(roots, -p/2)
@@ -187,12 +245,14 @@ function solve_quartic_real(a, b, c, d, e)
                 push!(roots, (-p - sqrtD)/2)
                 push!(roots, (-p + sqrtD)/2)
             end
-            return unique(sort(roots))
+            return roots
         end
 
         if abs(p) < EPS && abs(q) < EPS
             # x^4 + rx = x(x^3 + r) = 0
-            return sort([0.0, -cbrt(r)])
+            push!(roots, 0.0)
+            push!(roots, -cbrt(r))
+            return roots
         end
     end
 
@@ -206,14 +266,13 @@ function solve_quartic_real(a, b, c, d, e)
     resolvent_roots = solve_cubic_all_real(a3, b3, c3)
 
     # Choose y with maximal absolute value
-    y = resolvent_roots[1]
-    for i in 2:length(resolvent_roots)
-        if abs(resolvent_roots[i]) > abs(y)
-            y = resolvent_roots[i]
-        end
+    y = resolvent_roots.r1
+    if resolvent_roots.count >= 2 && abs(resolvent_roots.r2) > abs(y)
+        y = resolvent_roots.r2
     end
-
-    roots = Float64[]
+    if resolvent_roots.count >= 3 && abs(resolvent_roots.r3) > abs(y)
+        y = resolvent_roots.r3
+    end
 
     D = y^2 - 4*s
     if abs(D) < EPS
@@ -260,11 +319,13 @@ function solve_quartic_real(a, b, c, d, e)
         push!(roots, (-p2 + sqrtD2)/2)
     end
 
-    return unique(sort(roots))
+    return roots
 end
 
 # Solve cubic returning all real roots (for resolvent cubic in quartic solver)
-function solve_cubic_all_real(a, b, c)
+# Marked @inline so compiler can optimize away the Roots allocation
+@inline function solve_cubic_all_real(a, b, c)
+    roots = Roots{Float64}()
     # Cubic: x^3 + ax^2 + bx + c = 0 (Cardano's formula)
     a_over_3 = a / 3
     a2 = a^2
@@ -284,9 +345,9 @@ function solve_cubic_all_real(a, b, c)
         theta = acos(t) / 3
         ux = cos(theta) * qq
         uyi = sin(theta) * qq
-        return [ux - a_over_3,
-                ux * cos120 - uyi * sin120 - a_over_3,
-                ux * cos120 + uyi * sin120 - a_over_3]
+        push!(roots, ux - a_over_3)
+        push!(roots, ux * cos120 - uyi * sin120 - a_over_3)
+        push!(roots, ux * cos120 + uyi * sin120 - a_over_3)
     else
         # One real root (or two if discriminant is zero)
         A = -cbrt(abs(r) + sqrt(max(r2 - q3, 0.0)))
@@ -298,12 +359,13 @@ function solve_cubic_all_real(a, b, c)
         x1 = -(A + B) / 2 - a_over_3
         x2_imag = sqrt(3.0) * (A - B) / 2
 
+        push!(roots, x0)
         if abs(x2_imag) < EPS
-            return [x0, x1, x1]
-        else
-            return [x0]
+            push!(roots, x1)
+            push!(roots, x1)
         end
     end
+    return roots
 end
 
 #=============================================================================
@@ -561,7 +623,7 @@ end
 """
 Try ACC0, ACC1, and NONE profiles (no velocity limit reached).
 """
-function time_all_none_acc0_acc1!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
+function time_all_none_acc0_acc1!(roots::Roots, profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
                                   jMax, vMax, vMin, aMax, aMin) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
@@ -589,7 +651,7 @@ function time_all_none_acc0_acc1!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf,
 
     # Reference uses solve_quart_monic with [0, polynom_none_1, polynom_none_2, polynom_none_3]
     # This represents t^4 + 0*t^3 + polynom_none_1*t^2 + polynom_none_2*t + polynom_none_3 = 0
-    for t in solve_quartic_real(1.0, 0.0, polynom_none_1, polynom_none_2, polynom_none_3)
+    for t in solve_quartic_real!(roots, 1.0, 0.0, polynom_none_1, polynom_none_2, polynom_none_3)
         (t < t_min_none || t > t_max_none) && continue
 
         # Single Newton step for refinement (regarding pd)
@@ -629,7 +691,7 @@ function time_all_none_acc0_acc1!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf,
     polynom_acc0_2 = 0.0
     polynom_acc0_3 = h0_acc0 / (12*jMax_jMax*jMax_jMax)
 
-    for t in solve_quartic_real(1.0, polynom_acc0_0, polynom_acc0_1, polynom_acc0_2, polynom_acc0_3)
+    for t in solve_quartic_real!(roots, 1.0, polynom_acc0_0, polynom_acc0_1, polynom_acc0_2, polynom_acc0_3)
         (t < t_min_acc0 || t > t_max_acc0) && continue
 
         # Single Newton step for refinement
@@ -667,7 +729,7 @@ function time_all_none_acc0_acc1!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf,
     polynom_acc1_2 = 2*(a0 - aMin)*h2_acc1 / (jMax_jMax*jMax)
     polynom_acc1_3 = h0_acc1 / (jMax_jMax*jMax_jMax)
 
-    for t in solve_quartic_real(1.0, polynom_acc1_0, polynom_acc1_1, polynom_acc1_2, polynom_acc1_3)
+    for t in solve_quartic_real!(roots, 1.0, polynom_acc1_0, polynom_acc1_1, polynom_acc1_2, polynom_acc1_3)
         (t < t_min_acc1 || t > t_max_acc1) && continue
 
         # Double Newton step for refinement
@@ -914,7 +976,7 @@ function find_profile(lim::JerkLimiter{T}, p0, v0, a0, pf, vf, af=zero(T)) where
         end
 
         # Try ACC0, ACC1, NONE
-        if time_all_none_acc0_acc1!(profile, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        if time_all_none_acc0_acc1!(lim.roots, profile, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
             return profile
         end
 
@@ -966,7 +1028,7 @@ function find_profile(lim::JerkLimiter{T}, p0, v0, a0, pf, vf, af=zero(T)) where
             return profile
         end
 
-        if time_all_none_acc0_acc1!(profile, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
+        if time_all_none_acc0_acc1!(lim.roots, profile, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
                                     jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
             profile.p .*= -1
             profile.v .*= -1
