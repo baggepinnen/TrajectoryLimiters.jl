@@ -212,8 +212,6 @@ plot(
     plot(ts, acc, ylabel="Acceleration", label=""),
     layout=(3,1), xlabel="Time [s]", size=(600,450)
 )
-hline!([0], sp=2, ls=:dash, c=:gray, label="")
-hline!([0], sp=3, ls=:dash, c=:gray, label="")
 ```
 
 ![initial velocity](https://private-user-images.githubusercontent.com/3797491/533803584-67ab9661-6ca0-4d5f-82dc-6d3b9cb9bbea.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NDkyNjMsIm5iZiI6MTc2Nzk0ODk2MywicGF0aCI6Ii8zNzk3NDkxLzUzMzgwMzU4NC02N2FiOTY2MS02Y2EwLTRkNWYtODJkYy02ZDNiOWNiOWJiZWEucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMDg1NjAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9NWI2NzkxODNkMWQ1OTNjYmZlNzk0MDM1ZTY2OTEyZDQzOTdmMmQ5NDcxNTBmZGMxMTQ1YWNlN2JlMzk0ODM4OSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.W3uS4WPk5_24CBGcerWHkRdTM6LKKbyGlTTxwrja9dg)
@@ -230,6 +228,58 @@ lim = JerkLimiter(;
     jmax=1000.0
 )
 ```
+
+### Multi-DOF Synchronized Trajectories
+
+For systems with multiple degrees of freedom (e.g., robotic arms, CNC machines), trajectories can be synchronized so that all DOFs reach their targets simultaneously. Each DOF can have different constraints, and the algorithm finds the time-optimal synchronized duration.
+
+The multi-DOF algorithm is invoked by passing an array of `JerkLimiter` instances to `calculate_trajectory`, one for each DOF:
+
+```julia
+using TrajectoryLimiters
+
+# Create limiters with different constraints for each DOF
+lims = [
+    JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),  # DOF 1
+    JerkLimiter(; vmax=5.0,  amax=40.0, jmax=500.0),   # DOF 2
+    JerkLimiter(; vmax=8.0,  amax=30.0, jmax=800.0),   # DOF 3
+]
+
+# Plan synchronized trajectories to target positions
+profiles = calculate_trajectory(lims;
+    pf = [1.0, 2.0, 0.5],  # Target positions for each DOF
+)
+
+# Evaluate all DOFs at a specific time
+t = 0.1
+ps, vs, as, js = evaluate_at(profiles, t)  # Returns vectors of length 3
+
+# Evaluate with initial states
+profiles = calculate_trajectory(lims;
+    p0 = [0.0, 1.0, 0.0],   # Initial positions
+    v0 = [1.0, 0.0, 0.5],   # Initial velocities
+    pf = [5.0, 4.0, 2.0],   # Target positions
+)
+
+# Sample and plot
+pos, vel, acc, jerk, ts = evaluate_dt(profiles, 0.001)
+
+plot(
+    plot(ts, pos, ylabel="Position", label=""),
+    plot(ts, vel, ylabel="Velocity", label=""),
+    plot(ts, acc, ylabel="Acceleration", label=""),
+    plot(ts, jerk, ylabel="Jerk", label=""),
+    layout=(4,1), xlabel="Time [s]", size=(600,700)
+)
+hline!([10 5 8], sp=2, ls=:dash, label="", c=(1:3)')
+hline!([50 30 40], sp=3, ls=:dash, label="", c=(1:3)')
+hline!([1000 500 800], sp=4, ls=:dash, label="", c=(1:3)')
+```
+
+![multi DOF synch](https://private-user-images.githubusercontent.com/3797491/533882036-2afc3934-d2bd-4043-baeb-910ff08fd03f.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NjEzOTMsIm5iZiI6MTc2Nzk2MTA5MywicGF0aCI6Ii8zNzk3NDkxLzUzMzg4MjAzNi0yYWZjMzkzNC1kMmJkLTQwNDMtYmFlYi05MTBmZjA4ZmQwM2YucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMTIxODEzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9Y2FmZmVmZDA5ZTUzNWMxYTJhYTk4MjUyNTdhNWM4ZmE2ZDQ2NGI1MjQ5ZWEzNDNjNzIxNzkxOWFmYjkyNGFkOCZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.329-h_Jy3DHIrLbz3dC75bRFI4e95B7wfl4FfqNKjCs)
+
+The image shows how different parts of the trajectory is limited by different degrees of freedom, all three DOF start and reach the end at the same time.
+
 
 ### Profile Structure
 

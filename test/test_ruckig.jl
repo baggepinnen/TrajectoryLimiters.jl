@@ -367,3 +367,163 @@ end
     @test ps[end] ≈ 5.0 atol=1e-3
     @test vs[end] ≈ 0.0 atol=1e-3
 end
+
+@testset "Multi-DOF synchronized trajectories" begin
+    # Two DOFs with different constraints
+    lims = [
+        JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),
+        JerkLimiter(; vmax=5.0, amax=30.0, jmax=500.0),
+    ]
+
+    # Basic test: both DOFs start at rest, end at rest
+    profiles = calculate_trajectory(lims; pf=[1.0, 2.0])
+
+    # All profiles should have the same duration
+    @test duration(profiles[1]) ≈ duration(profiles[2])
+
+    # Check boundary conditions for each DOF
+    @test profiles[1].p[1] ≈ 0.0
+    @test profiles[1].v[1] ≈ 0.0
+    @test profiles[1].a[1] ≈ 0.0
+    @test profiles[1].p[8] ≈ 1.0 atol=1e-6
+    @test profiles[1].v[8] ≈ 0.0 atol=1e-6
+    @test profiles[1].a[8] ≈ 0.0 atol=1e-6
+
+    @test profiles[2].p[1] ≈ 0.0
+    @test profiles[2].v[1] ≈ 0.0
+    @test profiles[2].a[1] ≈ 0.0
+    @test profiles[2].p[8] ≈ 2.0 atol=1e-6
+    @test profiles[2].v[8] ≈ 0.0 atol=1e-6
+    @test profiles[2].a[8] ≈ 0.0 atol=1e-6
+
+    # Check limits are respected for each DOF
+    T_total = duration(profiles[1])
+    for t in range(0, T_total, length=100)
+        for (i, lim) in enumerate(lims)
+            p, v, a, j = evaluate_at(profiles[i], t)
+            @test lim.vmin - 1e-6 <= v <= lim.vmax + 1e-6
+            @test lim.amin - 1e-6 <= a <= lim.amax + 1e-6
+            @test -lim.jmax - 1e-6 <= j <= lim.jmax + 1e-6
+        end
+    end
+end
+
+@testset "Multi-DOF evaluate_at" begin
+    lims = [
+        JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),
+        JerkLimiter(; vmax=5.0, amax=30.0, jmax=500.0),
+    ]
+
+    profiles = calculate_trajectory(lims; pf=[1.0, 2.0])
+
+    # Test vector evaluate_at
+    t = 0.05
+    ps, vs, as, js = evaluate_at(profiles, t)
+
+    @test length(ps) == 2
+    @test length(vs) == 2
+    @test length(as) == 2
+    @test length(js) == 2
+
+    # Check that vector version matches scalar version
+    for i in 1:2
+        p, v, a, j = evaluate_at(profiles[i], t)
+        @test ps[i] ≈ p
+        @test vs[i] ≈ v
+        @test as[i] ≈ a
+        @test js[i] ≈ j
+    end
+
+    # Test at boundaries
+    ps0, vs0, as0, js0 = evaluate_at(profiles, 0.0)
+    @test ps0[1] ≈ 0.0
+    @test ps0[2] ≈ 0.0
+    @test vs0[1] ≈ 0.0
+    @test vs0[2] ≈ 0.0
+
+    T_total = duration(profiles[1])
+    psf, vsf, asf, jsf = evaluate_at(profiles, T_total)
+    @test psf[1] ≈ 1.0 atol=1e-6
+    @test psf[2] ≈ 2.0 atol=1e-6
+    @test vsf[1] ≈ 0.0 atol=1e-6
+    @test vsf[2] ≈ 0.0 atol=1e-6
+end
+
+@testset "Multi-DOF with initial states" begin
+    lims = [
+        JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),
+        JerkLimiter(; vmax=8.0, amax=40.0, jmax=800.0),
+    ]
+
+    # Start with different initial positions and velocities
+    profiles = calculate_trajectory(lims;
+        p0=[1.0, 2.0],
+        v0=[2.0, 1.0],
+        pf=[5.0, 6.0],
+    )
+
+    # All profiles should have the same duration
+    @test duration(profiles[1]) ≈ duration(profiles[2])
+
+    # Check initial conditions
+    @test profiles[1].p[1] ≈ 1.0
+    @test profiles[1].v[1] ≈ 2.0
+    @test profiles[2].p[1] ≈ 2.0
+    @test profiles[2].v[1] ≈ 1.0
+
+    # Check final conditions
+    @test profiles[1].p[8] ≈ 5.0 atol=1e-6
+    @test profiles[2].p[8] ≈ 6.0 atol=1e-6
+    @test profiles[1].v[8] ≈ 0.0 atol=1e-6
+    @test profiles[2].v[8] ≈ 0.0 atol=1e-6
+end
+
+@testset "Multi-DOF with 3 DOFs" begin
+    lims = [
+        JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),
+        JerkLimiter(; vmax=5.0, amax=30.0, jmax=500.0),
+        JerkLimiter(; vmax=8.0, amax=40.0, jmax=800.0),
+    ]
+
+    profiles = calculate_trajectory(lims; pf=[1.0, 2.0, 0.5])
+
+    # All profiles should have the same duration
+    T = duration(profiles[1])
+    @test duration(profiles[2]) ≈ T
+    @test duration(profiles[3]) ≈ T
+
+    # Check final positions
+    @test profiles[1].p[8] ≈ 1.0 atol=1e-6
+    @test profiles[2].p[8] ≈ 2.0 atol=1e-6
+    @test profiles[3].p[8] ≈ 0.5 atol=1e-6
+
+    # Check limits are respected for each DOF
+    for t in range(0, T, length=100)
+        for (i, lim) in enumerate(lims)
+            p, v, a, j = evaluate_at(profiles[i], t)
+            @test lim.vmin - 1e-6 <= v <= lim.vmax + 1e-6
+            @test lim.amin - 1e-6 <= a <= lim.amax + 1e-6
+            @test -lim.jmax - 1e-6 <= j <= lim.jmax + 1e-6
+        end
+    end
+end
+
+@testset "Multi-DOF limiting DOF identification" begin
+    # DOF 2 has tighter velocity constraint, so for equal distances
+    # it should be the limiting DOF
+    lims = [
+        JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),
+        JerkLimiter(; vmax=2.0, amax=50.0, jmax=1000.0),  # Much slower
+    ]
+
+    # Same distance for both DOFs
+    profiles = calculate_trajectory(lims; pf=[2.0, 2.0])
+
+    # Synchronized duration should be longer than DOF 1 alone would need
+    profile_single = calculate_trajectory(lims[1]; pf=2.0)
+    @test duration(profiles[1]) > duration(profile_single)
+
+    # Both DOFs still reach their targets
+    @test profiles[1].p[8] ≈ 2.0 atol=1e-6
+    @test profiles[2].p[8] ≈ 2.0 atol=1e-6
+end

@@ -118,6 +118,68 @@ Base.Broadcast.broadcastable(p::RuckigProfile) = Ref(p)
 
 duration(p::RuckigProfile) = p.t_sum[end]
 
+#=============================================================================
+ Block: Stores profile and blocked time intervals for synchronization
+=============================================================================#
+
+"""
+    BlockInterval{T}
+
+Represents a blocked time interval [left, right) with an associated profile
+that becomes valid at the right endpoint.
+"""
+struct BlockInterval{T}
+    left::T
+    right::T
+    profile::RuckigProfile{T}
+end
+
+"""
+    Block{T}
+
+Stores the minimum-time profile and any blocked time intervals.
+Used to find valid synchronization times across multiple DOFs.
+
+A DOF is "blocked" at time t if:
+- t < t_min (faster than minimum time), OR
+- t is within interval a: a.left < t < a.right, OR
+- t is within interval b: b.left < t < b.right
+"""
+struct Block{T}
+    p_min::RuckigProfile{T}       # Minimum-time profile
+    t_min::T                       # Minimum duration
+    a::Union{Nothing, BlockInterval{T}}  # First blocked interval (optional)
+    b::Union{Nothing, BlockInterval{T}}  # Second blocked interval (optional)
+end
+
+"""Create a Block with just the minimum profile (no blocked intervals)."""
+function Block(p_min::RuckigProfile{T}) where T
+    Block{T}(p_min, duration(p_min), nothing, nothing)
+end
+
+"""Check if time t is blocked for this DOF."""
+function is_blocked(block::Block, t)
+    t < block.t_min && return true
+    !isnothing(block.a) && block.a.left < t < block.a.right && return true
+    !isnothing(block.b) && block.b.left < t < block.b.right && return true
+    return false
+end
+
+"""Get the appropriate profile for time t."""
+function get_profile(block::Block, t)
+    if !isnothing(block.b) && t >= block.b.right
+        return block.b.profile
+    end
+    if !isnothing(block.a) && t >= block.a.right
+        return block.a.profile
+    end
+    return block.p_min
+end
+
+#=============================================================================
+ Roots: Storage for polynomial roots
+=============================================================================#
+
 """
     Roots{T}
 
@@ -995,7 +1057,6 @@ function time_vel_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
     return false
 end
 
-
 #=============================================================================
  State Evaluation
 =============================================================================#
@@ -1286,4 +1347,487 @@ function calculate_waypoint_trajectory(lim::JerkLimiter, waypoints, Ts)
     end
 
     return all_ts, all_ps, all_vs, all_as, all_js
+end
+
+
+
+#=============================================================================
+ Step 2: Time-Synchronized Profile Calculation
+
+ These functions calculate profiles for a GIVEN duration tf, rather than
+ finding the minimum-time profile. Used for multi-DOF synchronization.
+=============================================================================#
+
+"""
+Pre-computed expressions for Step2 calculations to avoid repeated computation.
+"""
+struct Step2PreComputed{T}
+    pd::T       # pf - p0
+    tf::T       # target duration
+    tf_tf::T    # tf^2
+    tf_p3::T    # tf^3
+    tf_p4::T    # tf^4
+    vd::T       # vf - v0
+    vd_vd::T    # vd^2
+    v0_v0::T    # v0^2
+    vf_vf::T    # vf^2
+    ad::T       # af - a0
+    ad_ad::T    # ad^2
+    a0_a0::T    # a0^2
+    af_af::T    # af^2
+    a0_p3::T    # a0^3
+    a0_p4::T    # a0^4
+    a0_p5::T    # a0^5
+    a0_p6::T    # a0^6
+    af_p3::T    # af^3
+    af_p4::T    # af^4
+    af_p5::T    # af^5
+    af_p6::T    # af^6
+    jMax_jMax::T  # jMax^2
+    g1::T       # -pd + tf*v0
+    g2::T       # -2pd + tf*(v0 + vf)
+end
+
+function Step2PreComputed(tf, p0, v0, a0, pf, vf, af, jMax)
+    pd = pf - p0
+    tf_tf = tf * tf
+    tf_p3 = tf_tf * tf
+    tf_p4 = tf_tf * tf_tf
+
+    vd = vf - v0
+    vd_vd = vd * vd
+    v0_v0 = v0 * v0
+    vf_vf = vf * vf
+
+    ad = af - a0
+    ad_ad = ad * ad
+    a0_a0 = a0 * a0
+    af_af = af * af
+
+    a0_p3 = a0 * a0_a0
+    a0_p4 = a0_a0 * a0_a0
+    a0_p5 = a0_p3 * a0_a0
+    a0_p6 = a0_p4 * a0_a0
+    af_p3 = af * af_af
+    af_p4 = af_af * af_af
+    af_p5 = af_p3 * af_af
+    af_p6 = af_p4 * af_af
+
+    jMax_jMax = jMax * jMax
+    g1 = -pd + tf * v0
+    g2 = -2pd + tf * (v0 + vf)
+
+    Step2PreComputed(pd, tf, tf_tf, tf_p3, tf_p4, vd, vd_vd, v0_v0, vf_vf,
+                     ad, ad_ad, a0_a0, af_af, a0_p3, a0_p4, a0_p5, a0_p6,
+                     af_p3, af_p4, af_p5, af_p6, jMax_jMax, g1, g2)
+end
+
+"""
+Check profile for Step2 with target duration tf.
+Returns true if profile is valid and matches duration.
+"""
+function check_step2!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::ReachedLimits,
+                      tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, jMax_limit=Inf) where T
+    # Check jerk limit if provided
+    abs(jf) > jMax_limit + EPS && return false
+
+    # Use existing check function
+    result = check!(buf, control_signs, limits, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+    if !result
+        return false
+    end
+
+    # Verify total duration matches tf
+    abs(buf.t_sum[7] - tf) > T_PRECISION && return false
+
+    return true
+end
+
+"""
+    time_acc0_acc1_vel_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile reaching both acceleration limits and velocity limit.
+"""
+function time_acc0_acc1_vel_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                                   p0, v0, a0, pf, vf, af,
+                                   vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, tf_p3, tf_p4, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+
+    # Profile UDDU, Solution 1
+    if (2*(aMax - aMin) + ad)/jMax < tf
+        h1_sq = (a0_p4 + af_p4 - 4*a0_p3*(2*aMax + aMin)/3 - 4*af_p3*(aMax + 2*aMin)/3 +
+                 2*(a0_a0 - af_af)*aMax^2 +
+                 (4*a0*aMax - 2*a0_a0)*(af_af - 2*af*aMin + (aMin - aMax)*aMin + 2*jMax*(aMin*tf - vd)) +
+                 2*af_af*(aMin^2 + 2*jMax*(aMax*tf - vd)) +
+                 4*jMax*(2*aMin*(af*vd + jMax*g1) + (aMax^2 - aMin^2)*vd + jMax*vd_vd) +
+                 8*aMax*jMax_jMax*(pd - tf*vf))/(aMax*aMin) +
+                4*af_af + 2*a0_a0 + (4*af + aMax - aMin)*(aMax - aMin) +
+                4*jMax*(aMin - aMax + jMax*tf - 2*af)*tf
+
+        h1_sq >= 0 || return false
+        h1 = sqrt(h1_sq) * sign(jMax)
+
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = (-(af_af - a0_a0 + 2*aMax^2 + aMin*(aMin - 2*ad - 3*aMax) + 2*jMax*(aMin*tf - vd)) + aMin*h1)/(2*(aMax - aMin)*jMax)
+        buf.t[3] = aMax/jMax
+        buf.t[4] = (aMin - aMax + h1)/(2*jMax)
+        buf.t[5] = -aMin/jMax
+        buf.t[6] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + buf.t[4] + 2*buf.t[5] + af/jMax)
+        buf.t[7] = buf.t[5] + af/jMax
+
+        if check_step2!(buf, UDDU, LIMIT_ACC0_ACC1_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # Profile UDUD
+    if (-a0 + 4*aMax - af)/jMax < tf
+        denom = a0_a0 + af_af - 2*(a0 + af)*aMax + 2*(aMax^2 - aMax*jMax*tf + jMax*vd)
+        abs(denom) < EPS && return false
+
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = (3*(a0_p4 + af_p4) - 4*(a0_p3 + af_p3)*aMax - 4*af_p3*aMax +
+                    24*(a0 + af)*aMax^3 - 6*(af_af + a0_a0)*(aMax^2 - 2*jMax*vd) +
+                    6*a0_a0*(af_af - 2*af*aMax - 2*aMax*jMax*tf) -
+                    12*aMax^2*(2*aMax^2 - 2*aMax*jMax*tf + jMax*vd) -
+                    24*af*aMax*jMax*vd + 12*jMax_jMax*(2*aMax*g1 + vd_vd))/(12*aMax*jMax*denom)
+        buf.t[3] = aMax/jMax
+        buf.t[4] = (-a0_a0 - af_af + 2*aMax*(a0 + af - 2*aMax) - 2*jMax*vd)/(2*aMax*jMax) + tf
+        buf.t[5] = buf.t[3]
+        buf.t[6] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + buf.t[4] + 2*buf.t[5] - af/jMax)
+        buf.t[7] = buf.t[5] - af/jMax
+
+        if check_step2!(buf, UDUD, LIMIT_ACC0_ACC1_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+    time_acc0_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile reaching both acceleration limits (no velocity limit).
+"""
+function time_acc0_acc1_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                               p0, v0, a0, pf, vf, af,
+                               vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, tf_p3, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+
+    # Simple case: a0 ≈ 0 and af ≈ 0
+    if abs(a0) < EPS && abs(af) < EPS
+        h1 = 2*aMin*g1 + vd_vd + aMax*(2*pd + aMin*tf_tf - 2*tf*vf)
+        h2 = (aMax - aMin)*(-aMin*vd + aMax*(aMin*tf - vd))
+
+        abs(h1) < EPS && return false
+        jf = h2/h1
+
+        abs(jf) < EPS && return false
+
+        buf.t[1] = aMax/jf
+        buf.t[2] = (-2*aMax*h1 + aMin^2*g2)/h2
+        buf.t[3] = buf.t[1]
+        buf.t[4] = 0
+        buf.t[5] = -aMin/jf
+        buf.t[6] = tf - (2*buf.t[1] + buf.t[2] + 2*buf.t[5])
+        buf.t[7] = buf.t[5]
+
+        if check_step2!(buf, UDDU, LIMIT_ACC0_ACC1, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
+            return true
+        end
+    end
+
+    # UDDU general case
+    h_denom = 2*aMin*g1 + vd_vd + aMax*(2*pd + aMin*tf_tf - 2*tf*vf)
+    abs(h_denom) < EPS && return false
+
+    h1_sq = 144*(((aMax - aMin)*(-aMin*vd + aMax*(aMin*tf - vd)) -
+                   af_af*(aMax*tf - vd) + 2*af*aMin*(aMax*tf - vd) +
+                   a0_a0*(aMin*tf + v0 - vf) - 2*a0*aMax*(aMin*tf - vd))^2) +
+            48*ad*(3*a0_p3 - 3*af_p3 + 12*aMax*aMin*(-aMax + aMin) +
+                   4*af_af*(aMax + 2*aMin) +
+                   a0*(-3*af_af + 8*af*(aMin - aMax) + 6*(aMax^2 + 2*aMax*aMin - aMin^2)) +
+                   6*af*(aMax^2 - 2*aMax*aMin - aMin^2) +
+                   a0_a0*(3*af - 4*(2*aMax + aMin)))*h_denom
+
+    h1_sq >= 0 || return false
+    h1 = sqrt(h1_sq)
+
+    jf = -(3*af_af*aMax*tf - 3*a0_a0*aMin*tf - 6*ad*aMax*aMin*tf +
+           3*aMax*aMin*(aMin - aMax)*tf + 3*(a0_a0 - af_af)*vd +
+           6*vd*(af*aMin - a0*aMax) + 3*(aMax^2 - aMin^2)*vd + h1/4)/(6*h_denom)
+
+    abs(jf) < EPS && return false
+
+    buf.t[1] = (aMax - a0)/jf
+    buf.t[2] = (a0_a0 - af_af + 2*ad*aMin - 2*(aMax^2 - 2*aMax*aMin + aMin^2 + aMin*jf*tf - jf*vd))/(2*(aMax - aMin)*jf)
+    buf.t[3] = aMax/jf
+    buf.t[4] = 0
+    buf.t[5] = -aMin/jf
+    buf.t[6] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + 2*buf.t[5] + af/jf)
+    buf.t[7] = buf.t[5] + af/jf
+
+    if check_step2!(buf, UDDU, LIMIT_ACC0_ACC1, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
+        return true
+    end
+
+    return false
+end
+
+"""
+    time_none_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with no limits reached.
+"""
+function time_none_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                          p0, v0, a0, pf, vf, af,
+                          vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, tf_p3, tf_p4, vd, vd_vd, v0_v0, vf_vf, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+
+    # Special case: start from rest with zero acceleration
+    if abs(v0) < EPS && abs(a0) < EPS && abs(af) < EPS
+        h1_sq = tf_tf*vf_vf + (4*pd - tf*vf)^2
+        h1_sq >= 0 || return false
+        h1 = sqrt(h1_sq)
+        jf = 4*(4*pd - 2*tf*vf + h1)/tf_p3
+
+        abs(jf) < EPS && return false
+
+        buf.t[1] = tf/4
+        buf.t[2] = 0
+        buf.t[3] = 2*buf.t[1]
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = buf.t[1]
+
+        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
+            return true
+        end
+    end
+
+    # 3-step profile (UZD)
+    h1_sq = -ad_ad + jMax*(2*(a0 + af)*tf - 4*vd + jMax*tf_tf)
+    if h1_sq >= 0
+        h1 = sqrt(h1_sq) / abs(jMax)
+
+        buf.t[1] = (tf - h1 + ad/jMax)/2
+        buf.t[2] = h1
+        buf.t[3] = (tf - h1 - ad/jMax)/2
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = 0
+
+        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # 3-step profile (UDU)
+    denom = 4*(ad - jMax*tf)
+    if abs(denom) > EPS
+        buf.t[1] = (ad_ad/jMax + 2*(a0 + af)*tf - jMax*tf_tf - 4*vd)/denom
+        buf.t[2] = 0
+        buf.t[3] = -ad/(2*jMax) + tf/2
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = tf - (buf.t[1] + buf.t[3])
+
+        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+    calculate_profile_step2!(buf, tf, p0, v0, a0, pf, vf, af, jMax, vmax, vmin, amax, amin)
+
+Calculate a profile that achieves the target duration tf.
+This is Step 2 of the Ruckig algorithm - time synchronization.
+
+Returns true if a valid profile was found.
+"""
+function calculate_profile_step2!(buf::ProfileBuffer{T}, tf, p0, v0, a0, pf, vf, af,
+                                  jMax, vmax, vmin, amax, amin) where T
+    pc = Step2PreComputed(tf, p0, v0, a0, pf, vf, af, jMax)
+    pd = pf - p0
+
+    # Determine primary direction
+    up_first = pd > tf * v0
+
+    if up_first
+        vMax, vMin = vmax, vmin
+        aMax, aMin = amax, amin
+        jMax_dir = jMax
+    else
+        vMax, vMin = vmin, vmax
+        aMax, aMin = amin, amax
+        jMax_dir = -jMax
+    end
+
+    # Try velocity-limited profiles first (UP direction)
+    time_acc0_acc1_vel_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+
+    # Try DOWN direction velocity-limited profiles
+    time_acc0_acc1_vel_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+
+    # Try acceleration-limited profiles (UP direction)
+    time_acc0_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+
+    # Try DOWN direction
+    time_acc0_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+
+    # Try no-limits profiles (UP direction)
+    time_none_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+
+    # Try DOWN direction
+    time_none_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+
+    return false
+end
+
+
+#=============================================================================
+ Multi-DOF Trajectory Calculation
+=============================================================================#
+
+"""
+    calculate_trajectory(lims::AbstractVector{<:JerkLimiter}; pf, p0, v0, a0, vf, af)
+
+Calculate time-synchronized trajectories for multiple degrees of freedom.
+All DOFs will have the same total duration.
+
+# Arguments
+- `lims`: Vector of JerkLimiter, one per DOF
+- `pf`: Vector of target positions (required)
+- `p0`: Vector of initial positions (default: zeros)
+- `v0`: Vector of initial velocities (default: zeros)
+- `a0`: Vector of initial accelerations (default: zeros)
+- `vf`: Vector of final velocities (default: zeros)
+- `af`: Vector of final accelerations (default: zeros)
+
+# Returns
+Vector of RuckigProfile, one per DOF, all with the same duration.
+"""
+function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
+    pf::AbstractVector,
+    p0::AbstractVector = zeros(T, length(lims)),
+    v0::AbstractVector = zeros(T, length(lims)),
+    a0::AbstractVector = zeros(T, length(lims)),
+    vf::AbstractVector = zeros(T, length(lims)),
+    af::AbstractVector = zeros(T, length(lims)),
+) where T
+    ndof = length(lims)
+    length(pf) == ndof || throw(ArgumentError("pf must have length $ndof"))
+    length(p0) == ndof || throw(ArgumentError("p0 must have length $ndof"))
+    length(v0) == ndof || throw(ArgumentError("v0 must have length $ndof"))
+    length(a0) == ndof || throw(ArgumentError("a0 must have length $ndof"))
+    length(vf) == ndof || throw(ArgumentError("vf must have length $ndof"))
+    length(af) == ndof || throw(ArgumentError("af must have length $ndof"))
+
+    # Step 1: Calculate minimum-time profile for each DOF independently
+    blocks = Vector{Block{Float64}}(undef, ndof)
+    for i in 1:ndof
+        profile = calculate_trajectory(lims[i];
+            p0=p0[i], v0=v0[i], a0=a0[i],
+            pf=pf[i], vf=vf[i], af=af[i])
+        blocks[i] = Block(profile)
+    end
+
+    # Find synchronization time (maximum of all minimum times)
+    t_sync = maximum(block.t_min for block in blocks)
+    limiting_dof = argmax([block.t_min for block in blocks])
+
+    # Check if t_sync is blocked for any DOF
+    for i in 1:ndof
+        if is_blocked(blocks[i], t_sync)
+            # TODO: Try next candidate time from block intervals
+            error("Synchronization time $t_sync is blocked for DOF $i")
+        end
+    end
+
+    # Step 2: Recalculate non-limiting DOFs for synchronized duration
+    profiles = Vector{RuckigProfile{Float64}}(undef, ndof)
+
+    for i in 1:ndof
+        if i == limiting_dof
+            # Limiting DOF uses its minimum-time profile
+            profiles[i] = blocks[i].p_min
+        elseif abs(t_sync - blocks[i].t_min) < T_PRECISION
+            # Duration matches, use existing profile
+            profiles[i] = blocks[i].p_min
+        else
+            # Need to recalculate for synchronized duration (Step 2)
+            buf = lims[i].buffer
+            clear!(buf)
+
+            success = calculate_profile_step2!(buf, t_sync,
+                p0[i], v0[i], a0[i], pf[i], vf[i], af[i],
+                lims[i].jmax, lims[i].vmax, lims[i].vmin,
+                lims[i].amax, lims[i].amin)
+
+            if !success
+                error("Failed to find synchronized profile for DOF $i at duration $t_sync")
+            end
+
+            profiles[i] = RuckigProfile(buf, pf[i], vf[i], af[i])
+        end
+    end
+
+    return profiles
+end
+
+"""
+    evaluate_at(profiles::AbstractVector{<:RuckigProfile}, t)
+
+Evaluate all DOF profiles at time t.
+Returns (positions, velocities, accelerations, jerks) as vectors.
+"""
+function evaluate_at(profiles::AbstractVector{<:RuckigProfile{T}}, t::Real) where T
+    ndof = length(profiles)
+    ps = Vector{T}(undef, ndof)
+    vs = Vector{T}(undef, ndof)
+    as = Vector{T}(undef, ndof)
+    js = Vector{T}(undef, ndof)
+
+    for i in 1:ndof
+        ps[i], vs[i], as[i], js[i] = evaluate_at(profiles[i], t)
+    end
+
+    return ps, vs, as, js
+end
+
+"""
+    evaluate_dt(profiles::AbstractVector{<:RuckigProfile}, Ts)
+
+Evaluate all DOF profiles at regular time intervals.
+Returns matrices (pos, vel, acc, jerk) where each column is a DOF,
+plus the time vector ts.
+"""
+function evaluate_dt(profiles::AbstractVector{<:RuckigProfile{T}}, Ts) where T
+    ndof = length(profiles)
+    Tf = duration(profiles[1])  # All profiles have same duration (synchronized)
+    ts = 0:Ts:Tf
+    n = length(ts)
+
+    pos = Matrix{T}(undef, n, ndof)
+    vel = Matrix{T}(undef, n, ndof)
+    acc = Matrix{T}(undef, n, ndof)
+    jerk = Matrix{T}(undef, n, ndof)
+
+    for j in 1:ndof
+        for (i, t) in enumerate(ts)
+            pos[i, j], vel[i, j], acc[i, j], jerk[i, j] = evaluate_at(profiles[j], t)
+        end
+    end
+
+    return pos, vel, acc, jerk, ts
 end
