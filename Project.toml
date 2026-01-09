@@ -1,9 +1,13 @@
 name = "TrajectoryLimiters"
 uuid = "9792e600-fe43-4e4e-833b-462f466b8006"
+version = "0.1.1"
 authors = ["Fredrik Bagge Carlson"]
-version = "0.1.0"
+
+[deps]
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [compat]
+StaticArrays = "1.9.16"
 julia = "1.8"
 
 [extras]
