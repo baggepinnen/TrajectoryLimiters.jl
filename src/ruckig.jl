@@ -5,7 +5,7 @@
 # License of reference: MIT License https://github.com/pantor/ruckig/blob/main/LICENSE
 
 export JerkLimiter, RuckigProfile
-export calculate_trajectory, evaluate_at, evaluate_dt
+export calculate_trajectory, calculate_waypoint_trajectory, evaluate_at, evaluate_dt, duration
 
 #=============================================================================
  Constants (matching reference implementation)
@@ -115,6 +115,8 @@ end
 
 # Allow RuckigProfile to broadcast as a scalar
 Base.Broadcast.broadcastable(p::RuckigProfile) = Ref(p)
+
+duration(p::RuckigProfile) = p.t_sum[end]
 
 """
     Roots{T}
@@ -1004,7 +1006,7 @@ end
 Evaluate profile at time t.
 """
 function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
-    T_total = profile.t_sum[7]
+    T_total = duration(profile)
 
     if t <= 0
         return profile.p[1], profile.v[1], profile.a[1], profile.j[1]
@@ -1071,7 +1073,7 @@ Evaluate the trajectory at regular time intervals from 0 to the total duration.
 Returns `(positions, velocities, accelerations, jerks, ts)` where `ts` is the time vector.
 """
 function evaluate_dt(profile::RuckigProfile, Ts)
-    T = profile.t_sum[7]
+    T = duration(profile)
     ts = 0:Ts:T
     pos, vel, acc, jerk = evaluate_at(profile, ts)
     pos, vel, acc, jerk, ts
@@ -1200,4 +1202,88 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
 
     error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, 0)")
 
+end
+
+#=============================================================================
+ Waypoint Trajectories
+=============================================================================#
+
+"""
+Extract position, velocity, acceleration from a waypoint named tuple.
+Defaults to v=0.0, a=0.0 if not specified.
+"""
+function get_waypoint_state(wp)
+    p = wp.p
+    v = hasproperty(wp, :v) ? wp.v : 0.0
+    a = hasproperty(wp, :a) ? wp.a : 0.0
+    (p, v, a)
+end
+
+"""
+    calculate_waypoint_trajectory(lim, waypoints, Ts)
+
+Calculate time-optimal trajectory passing through specified waypoints.
+
+# Arguments
+- `lim`: JerkLimiter with constraints
+- `waypoints`: Vector of named tuples with fields:
+  - `p`: Position at waypoint (required)
+  - `v`: Velocity at waypoint (default: 0.0)
+  - `a`: Acceleration at waypoint (default: 0.0)
+- `Ts`: Sample interval for output
+
+# Returns
+`(ts, ps, vs, as, js)` - Arrays of time, position, velocity, acceleration, jerk
+
+# Example
+```julia
+lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+waypoints = [(p=0.0,), (p=2.0, v=5.0), (p=5.0,)]
+ts, ps, vs, as, js = calculate_waypoint_trajectory(lim, waypoints)
+```
+"""
+function calculate_waypoint_trajectory(lim::JerkLimiter, waypoints, Ts)
+    n = length(waypoints)
+    n < 2 && error("Need at least 2 waypoints")
+
+    # Collect all segments
+    all_ts = Float64[]
+    all_ps = Float64[]
+    all_vs = Float64[]
+    all_as = Float64[]
+    all_js = Float64[]
+
+    t_offset = 0.0
+
+    for i in 1:(n-1)
+        # Extract states at waypoints
+        p0, v0, a0 = get_waypoint_state(waypoints[i])
+        pf, vf, af = get_waypoint_state(waypoints[i+1])
+
+        # Calculate time-optimal trajectory for this segment
+        profile = calculate_trajectory(lim; p0, v0, a0, pf, vf, af)
+
+        # Sample at Ts intervals
+        ps, vs, as, js, ts = evaluate_dt(profile, Ts)
+
+        # Shift times by offset and append
+        if i == 1
+            append!(all_ts, ts .+ t_offset)
+            append!(all_ps, ps)
+            append!(all_vs, vs)
+            append!(all_as, as)
+            append!(all_js, js)
+        else
+            # Skip first point to avoid duplicates at waypoint boundaries
+            append!(all_ts, (ts .+ t_offset)[2:end])
+            append!(all_ps, ps[2:end])
+            append!(all_vs, vs[2:end])
+            append!(all_as, as[2:end])
+            append!(all_js, js[2:end])
+        end
+
+        t_offset += duration(profile)
+    end
+
+    return all_ts, all_ps, all_vs, all_as, all_js
 end

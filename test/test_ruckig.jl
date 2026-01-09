@@ -28,7 +28,7 @@ end
     # Move from 0 to 1
     profile = calculate_trajectory(lim; pf=1.0)
 
-    @test profile.t_sum[7] > 0
+    @test duration(profile) > 0
     @test profile.p[1] ≈ 0.0
     @test profile.v[1] ≈ 0.0
     @test profile.a[1] ≈ 0.0
@@ -37,7 +37,7 @@ end
     @test profile.a[8] ≈ 0.0 atol=1e-6
 
     # Check trajectory stays within limits
-    for t in range(0, profile.t_sum[7], length=100)
+    for t in range(0, duration(profile), length=100)
         p, v, a, j = evaluate_at(profile, t)
         @test lim.vmin - 1e-6 <= v <= lim.vmax + 1e-6
         @test lim.amin - 1e-6 <= a <= lim.amax + 1e-6
@@ -51,7 +51,7 @@ end
     # Move from 1 to 0
     profile = calculate_trajectory(lim; p0=1.0, pf=0.0)
 
-    @test profile.t_sum[7] > 0
+    @test duration(profile) > 0
     @test profile.p[1] ≈ 1.0
     @test profile.p[8] ≈ 0.0 atol=1e-6
     @test profile.v[8] ≈ 0.0 atol=1e-6
@@ -69,7 +69,7 @@ end
     @test a ≈ 0.0
 
     # At t=T_total
-    T_total = profile.t_sum[7]
+    T_total = duration(profile)
     p, v, a, j = evaluate_at(profile, T_total)
     @test p ≈ 1.0 atol=1e-6
     @test v ≈ 0.0 atol=1e-6
@@ -87,7 +87,7 @@ end
     # Start with v0 = 5, move forward
     profile = calculate_trajectory(lim; v0=5.0, pf=2.0)
 
-    @test profile.t_sum[7] > 0
+    @test duration(profile) > 0
     @test profile.p[1] ≈ 0.0
     @test profile.v[1] ≈ 5.0
     @test profile.p[8] ≈ 2.0 atol=1e-6
@@ -101,7 +101,7 @@ end
     # Long distance should hit velocity limit
     profile = calculate_trajectory(lim; pf=10.0)
 
-    @test profile.t_sum[7] > 0
+    @test duration(profile) > 0
 
     # Check max velocity reached is close to limit
     max_v = maximum(profile.v)
@@ -131,7 +131,7 @@ end
     Ts = 0.001
     prev_p, prev_v, prev_a, _ = evaluate_at(profile, 0.0)
 
-    for t in Ts:Ts:profile.t_sum[7]
+    for t in Ts:Ts:duration(profile)
         p, v, a, j = evaluate_at(profile, t)
 
         # Position should be monotonic for this trajectory
@@ -153,7 +153,7 @@ end
         lim = JerkLimiter(; vmax, amax, jmax)
         profile = calculate_trajectory(lim; pf=2.0)
 
-        @test profile.t_sum[7] > 0
+        @test duration(profile) > 0
         @test profile.p[8] ≈ 2.0 atol=1e-6
         @test profile.v[8] ≈ 0.0 atol=1e-6
         @test profile.a[8] ≈ 0.0 atol=1e-6
@@ -178,7 +178,7 @@ end
         profile = calculate_trajectory(lim; pf=2.0)
 
         # Check trajectory stays within limits
-        for t in range(0, profile.t_sum[7], length=100)
+        for t in range(0, duration(profile), length=100)
             p, v, a, j = evaluate_at(profile, t)
             @test lim.vmin - 1e-6 <= v <= lim.vmax + 1e-6
             @test lim.amin - 1e-6 <= a <= lim.amax + 1e-6
@@ -191,7 +191,7 @@ end
     lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
     profile = calculate_trajectory(lim; pf=2.0)
 
-    ts = range(0, profile.t_sum[7], length=50)
+    ts = range(0, duration(profile), length=50)
     pos, vel, acc, jerk = evaluate_at(profile, ts)
 
     @test length(pos) == 50
@@ -222,7 +222,7 @@ end
     pos, vel, acc, jerk, ts = evaluate_dt(profile, 0.001)
 
     @test ts[1] == 0.0
-    @test ts[end] <= profile.t_sum[7]
+    @test ts[end] <= duration(profile)
     @test step(ts) == 0.001
 
     # Check boundary values
@@ -243,7 +243,7 @@ end
     # End at vf=3.0 (moving when we arrive)
     profile = calculate_trajectory(lim; pf=5.0, vf=3.0)
 
-    @test profile.t_sum[7] > 0
+    @test duration(profile) > 0
     @test profile.p[1] ≈ 0.0
     @test profile.v[1] ≈ 0.0
     @test profile.p[8] ≈ 5.0 atol=1e-6
@@ -251,7 +251,7 @@ end
     @test profile.a[8] ≈ 0.0 atol=1e-6
 
     # Verify via evaluate_at at final time
-    T_total = profile.t_sum[7]
+    T_total = duration(profile)
     p, v, a, j = evaluate_at(profile, T_total)
     @test p ≈ 5.0 atol=1e-6
     @test v ≈ 3.0 atol=1e-6
@@ -264,7 +264,7 @@ end
     # End at af=10.0 (accelerating when we arrive)
     profile = calculate_trajectory(lim; pf=2.0, af=10.0)
 
-    @test profile.t_sum[7] > 0
+    @test duration(profile) > 0
     @test profile.p[1] ≈ 0.0
     @test profile.v[1] ≈ 0.0
     @test profile.a[1] ≈ 0.0
@@ -273,7 +273,7 @@ end
     @test profile.a[8] ≈ 10.0 atol=1e-6
 
     # Verify via evaluate_at at final time
-    T_total = profile.t_sum[7]
+    T_total = duration(profile)
     p, v, a, j = evaluate_at(profile, T_total)
     @test p ≈ 2.0 atol=1e-6
     @test v ≈ 0.0 atol=1e-6
@@ -286,13 +286,13 @@ end
     # End at vf=2.0 and af=5.0
     profile = calculate_trajectory(lim; pf=3.0, vf=2.0, af=5.0)
 
-    @test profile.t_sum[7] > 0
+    @test duration(profile) > 0
     @test profile.p[8] ≈ 3.0 atol=1e-6
     @test profile.v[8] ≈ 2.0 atol=1e-6
     @test profile.a[8] ≈ 5.0 atol=1e-6
 
     # Check trajectory stays within limits
-    for t in range(0, profile.t_sum[7], length=100)
+    for t in range(0, duration(profile), length=100)
         p, v, a, j = evaluate_at(profile, t)
         @test lim.vmin - 1e-6 <= v <= lim.vmax + 1e-6
         @test lim.amin - 1e-6 <= a <= lim.amax + 1e-6
@@ -306,11 +306,64 @@ end
     # Start and end with non-zero states
     profile = calculate_trajectory(lim; p0=1.0, v0=2.0, a0=5.0, pf=4.0, vf=1.0, af=3.0)
 
-    @test profile.t_sum[7] > 0
+    @test duration(profile) > 0
     @test profile.p[1] ≈ 1.0
     @test profile.v[1] ≈ 2.0
     @test profile.a[1] ≈ 5.0
     @test profile.p[8] ≈ 4.0 atol=1e-6
     @test profile.v[8] ≈ 1.0 atol=1e-6
     @test profile.a[8] ≈ 3.0 atol=1e-6
+end
+
+@testset "Waypoint trajectories" begin
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+    # Basic 2-waypoint (equivalent to single segment)
+    waypoints = [(p=0.0,), (p=1.0,)]
+    ts, ps, vs, as, js = calculate_waypoint_trajectory(lim, waypoints, 0.001)
+    @test ps[1] ≈ 0.0
+    @test ps[end] ≈ 1.0 atol=1e-3
+    @test vs[end] ≈ 0.0 atol=1e-3
+
+    # 3 waypoints
+    waypoints = [(p=0.0,), (p=1.0,), (p=3.0,)]
+    ts, ps, vs, as, js = calculate_waypoint_trajectory(lim, waypoints, 0.001)
+    @test ps[1] ≈ 0.0
+    @test ps[end] ≈ 3.0 atol=1e-3
+
+    # With non-zero velocities at waypoints
+    waypoints = [(p=0.0,), (p=2.0, v=5.0), (p=5.0,)]
+    ts, ps, vs, as, js = calculate_waypoint_trajectory(lim, waypoints, 0.001)
+    @test ps[1] ≈ 0.0
+    @test ps[end] ≈ 5.0 atol=1e-3
+
+    # Check limits are respected
+    for i in eachindex(ts)
+        @test lim.vmin - 1e-6 <= vs[i] <= lim.vmax + 1e-6
+        @test lim.amin - 1e-6 <= as[i] <= lim.amax + 1e-6
+        @test -lim.jmax - 1e-6 <= js[i] <= lim.jmax + 1e-6
+    end
+
+    # Check time is monotonically increasing
+    for i in 2:length(ts)
+        @test ts[i] > ts[i-1]
+    end
+end
+
+@testset "Waypoint trajectory with all states specified" begin
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+    # All waypoints with full state specification
+    waypoints = [
+        (p=0.0, v=0.0, a=0.0),
+        (p=2.0, v=3.0, a=5.0),
+        (p=5.0, v=0.0, a=0.0),
+    ]
+    ts, ps, vs, as, js = calculate_waypoint_trajectory(lim, waypoints, 0.001)
+
+    @test ps[1] ≈ 0.0
+    @test vs[1] ≈ 0.0
+    @test as[1] ≈ 0.0
+    @test ps[end] ≈ 5.0 atol=1e-3
+    @test vs[end] ≈ 0.0 atol=1e-3
 end

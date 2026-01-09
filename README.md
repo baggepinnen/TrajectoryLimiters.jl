@@ -128,6 +128,8 @@ lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
 # Plan a trajectory from rest at position 0 to rest at position 1
 profile = calculate_trajectory(lim; pf=1.0)
 
+Tf = duration(profile)  # Total trajectory duration
+
 # Evaluate the trajectory at any time
 t = 0.05 # May also be a vector of time points
 p, v, a, j = evaluate_at(profile, t)
