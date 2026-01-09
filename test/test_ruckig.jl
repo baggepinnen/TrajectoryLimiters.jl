@@ -144,3 +144,45 @@ end
         prev_p, prev_v, prev_a = p, v, a
     end
 end
+
+@testset "Low jerk trajectories (two-step profiles)" begin
+    # Low jerk requires two-step profile fallbacks
+    vmax, amax = 10.0, 50.0
+
+    for jmax in (5000.0, 1000.0, 500.0, 200.0)
+        lim = JerkLimiter(vmax, amax, jmax)
+        profile = calculate_trajectory(lim, 0.0, 0.0, 0.0, 2.0)
+
+        @test profile.t_sum[7] > 0
+        @test profile.p[8] ≈ 2.0 atol=1e-6
+        @test profile.v[8] ≈ 0.0 atol=1e-6
+        @test profile.a[8] ≈ 0.0 atol=1e-6
+
+        # Lower jerk should result in longer duration
+        # (smoother acceleration requires more time)
+    end
+
+    # Verify duration ordering: lower jerk → longer time
+    p_high = calculate_trajectory(JerkLimiter(vmax, amax, 5000.0), 0.0, 0.0, 0.0, 2.0)
+    p_med  = calculate_trajectory(JerkLimiter(vmax, amax, 1000.0), 0.0, 0.0, 0.0, 2.0)
+    p_low  = calculate_trajectory(JerkLimiter(vmax, amax, 200.0), 0.0, 0.0, 0.0, 2.0)
+
+    @test p_high.t_sum[7] < p_med.t_sum[7] < p_low.t_sum[7]
+end
+
+@testset "Various jerk levels with limits check" begin
+    vmax, amax = 10.0, 50.0
+
+    for jmax in (5000.0, 1000.0, 200.0)
+        lim = JerkLimiter(vmax, amax, jmax)
+        profile = calculate_trajectory(lim, 0.0, 0.0, 0.0, 2.0)
+
+        # Check trajectory stays within limits
+        for t in range(0, profile.t_sum[7], length=100)
+            p, v, a, j = evaluate_at(profile, t)
+            @test lim.vmin - 1e-6 <= v <= lim.vmax + 1e-6
+            @test lim.amin - 1e-6 <= a <= lim.amax + 1e-6
+            @test -lim.jmax - 1e-6 <= j <= lim.jmax + 1e-6
+        end
+    end
+end

@@ -186,7 +186,7 @@ plot!(t3, a3, label="jmax=200", sp=3)
 plot!(t3, j3, label="jmax=200", sp=4)
 ```
 
-![jerk comparison](figs/jerk_comparison.png)
+![jerk comparison](https://private-user-images.githubusercontent.com/3797491/533803613-392a2c6e-9f39-46a9-a361-b775ce70709b.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NDkyNjMsIm5iZiI6MTc2Nzk0ODk2MywicGF0aCI6Ii8zNzk3NDkxLzUzMzgwMzYxMy0zOTJhMmM2ZS05ZjM5LTQ2YTktYTM2MS1iNzc1Y2U3MDcwOWIucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMDg1NjAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9YTg1ODg2MmM3M2VmNDhjMDU5MWFlNTI4YjQ0NjkzZWQyMzMxMDAyOTc0NjY5NGY0MDIxNDk1YmQ5NjllYTliMCZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.w0P7_MfhlPrd6tog8eowHvZ5H31mzSbL0tFbY6Wf9_A)
 
 Lower jerk limits produce smoother acceleration profiles at the cost of longer trajectory duration. The jerk (bottom plot) shows how the rate of acceleration change is bounded.
 
@@ -219,7 +219,7 @@ hline!([0], sp=2, ls=:dash, c=:gray, label="")
 hline!([0], sp=3, ls=:dash, c=:gray, label="")
 ```
 
-![initial velocity](figs/initial_velocity.png)
+![initial velocity](https://private-user-images.githubusercontent.com/3797491/533803584-67ab9661-6ca0-4d5f-82dc-6d3b9cb9bbea.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NDkyNjMsIm5iZiI6MTc2Nzk0ODk2MywicGF0aCI6Ii8zNzk3NDkxLzUzMzgwMzU4NC02N2FiOTY2MS02Y2EwLTRkNWYtODJkYy02ZDNiOWNiOWJiZWEucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMDg1NjAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9NWI2NzkxODNkMWQ1OTNjYmZlNzk0MDM1ZTY2OTEyZDQzOTdmMmQ5NDcxNTBmZGMxMTQ1YWNlN2JlMzk0ODM4OSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.W3uS4WPk5_24CBGcerWHkRdTM6LKKbyGlTTxwrja9dg)
 
 ### Asymmetric Limits
 
