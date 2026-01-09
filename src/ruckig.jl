@@ -4,8 +4,6 @@
 # Reference implementation: https://github.com/pantor/ruckig
 # License of reference: MIT License https://github.com/pantor/ruckig/blob/main/LICENSE
 
-using StaticArrays
-
 export JerkLimiter, RuckigProfile
 export calculate_trajectory, evaluate_at, evaluate_dt
 
@@ -44,38 +42,76 @@ end
 =============================================================================#
 
 """
+    ProfileBuffer{T}
+
+Mutable buffer for computing trajectory profiles. Stored in JerkLimiter
+to avoid allocations during trajectory calculation.
+"""
+mutable struct ProfileBuffer{T}
+    t::Vector{T}       # Phase durations (length 7)
+    t_sum::Vector{T}   # Cumulative times (length 7)
+    j::Vector{T}       # Jerk values (length 7)
+    a::Vector{T}       # Acceleration at boundaries (length 8)
+    v::Vector{T}       # Velocity at boundaries (length 8)
+    p::Vector{T}       # Position at boundaries (length 8)
+    limits::ReachedLimits
+    control_signs::ControlSigns
+end
+
+function ProfileBuffer{T}() where T
+    ProfileBuffer{T}(
+        zeros(T, 7), zeros(T, 7), zeros(T, 7),
+        zeros(T, 8), zeros(T, 8), zeros(T, 8),
+        LIMIT_NONE, UDDU
+    )
+end
+
+function clear!(buf::ProfileBuffer{T}) where T
+    fill!(buf.t, zero(T))
+    fill!(buf.t_sum, zero(T))
+    fill!(buf.j, zero(T))
+    fill!(buf.a, zero(T))
+    fill!(buf.v, zero(T))
+    fill!(buf.p, zero(T))
+    buf.limits = LIMIT_NONE
+    buf.control_signs = UDDU
+    buf
+end
+
+"""
     RuckigProfile{T}
 
-A 7-phase jerk-limited trajectory profile.
+A 7-phase jerk-limited trajectory profile (immutable result).
 """
-mutable struct RuckigProfile{T}
-    t::MVector{7,T}       # Phase durations
-    t_sum::MVector{7,T}   # Cumulative times
-    j::MVector{7,T}       # Jerk values
-    a::MVector{8,T}       # Acceleration at boundaries
-    v::MVector{8,T}       # Velocity at boundaries
-    p::MVector{8,T}       # Position at boundaries
+struct RuckigProfile{T}
+    t::NTuple{7,T}        # Phase durations
+    t_sum::NTuple{7,T}    # Cumulative times
+    j::NTuple{7,T}        # Jerk values
+    a::NTuple{8,T}        # Acceleration at boundaries
+    v::NTuple{8,T}        # Velocity at boundaries
+    p::NTuple{8,T}        # Position at boundaries
     pf::T                 # Target position
     vf::T                 # Target velocity
     af::T                 # Target acceleration
     limits::ReachedLimits
     control_signs::ControlSigns
-
-    function RuckigProfile{T}() where T
-        new{T}(
-            MVector{7,T}(zeros(T, 7)),
-            MVector{7,T}(zeros(T, 7)),
-            MVector{7,T}(zeros(T, 7)),
-            MVector{8,T}(zeros(T, 8)),
-            MVector{8,T}(zeros(T, 8)),
-            MVector{8,T}(zeros(T, 8)),
-            zero(T), zero(T), zero(T),
-            LIMIT_NONE, UDDU
-        )
-    end
 end
 
-RuckigProfile(::Type{T}) where T = RuckigProfile{T}()
+"""
+Create RuckigProfile from ProfileBuffer.
+"""
+function RuckigProfile(buf::ProfileBuffer{T}, pf, vf, af) where T
+    RuckigProfile{T}(
+        NTuple{7,T}(buf.t),
+        NTuple{7,T}(buf.t_sum),
+        NTuple{7,T}(buf.j),
+        NTuple{8,T}(buf.a),
+        NTuple{8,T}(buf.v),
+        NTuple{8,T}(buf.p),
+        pf, vf, af,
+        buf.limits, buf.control_signs
+    )
+end
 
 # Allow RuckigProfile to broadcast as a scalar
 Base.Broadcast.broadcastable(p::RuckigProfile) = Ref(p)
@@ -131,6 +167,7 @@ function Base.iterate(r::Roots, i)
     end
 end
 
+
 """
     JerkLimiter{T}
 
@@ -152,12 +189,13 @@ struct JerkLimiter{T}
     amax::T
     amin::T
     jmax::T
-    roots::Roots{Float64}  # Always Float64 since polynomial roots are floating-point
+    roots::Roots{Float64}           # Always Float64 since polynomial roots are floating-point
+    buffer::ProfileBuffer{Float64}  # Always Float64 for computation
 end
 
 function JerkLimiter(; vmax, amax, jmax, vmin=-vmax, amin=-amax)
     T = promote_type(typeof(vmax), typeof(vmin), typeof(amax), typeof(amin), typeof(jmax))
-    JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}())
+    JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}(), ProfileBuffer{Float64}())
 end
 
 #=============================================================================
@@ -383,84 +421,81 @@ end
 =============================================================================#
 
 """
-    check!(profile, control_signs, limits, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af) -> Bool
+    check!(buf, control_signs, limits, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af) -> Bool
 
 Validate profile: check times >= 0, integrate, verify limits and final state.
 This matches the reference implementation's check() template function.
 """
-function check!(profile::RuckigProfile{T}, control_signs::ControlSigns, limits::ReachedLimits,
+function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::ReachedLimits,
                 jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af=zero(T)) where T
 
     # Set jerk pattern based on control signs
     if control_signs == UDDU
-        profile.j .= (jf, 0, -jf, 0, -jf, 0, jf)
+        buf.j[1], buf.j[2], buf.j[3], buf.j[4], buf.j[5], buf.j[6], buf.j[7] = jf, 0, -jf, 0, -jf, 0, jf
     else  # UDUD
-        profile.j .= (jf, 0, -jf, 0, jf, 0, -jf)
+        buf.j[1], buf.j[2], buf.j[3], buf.j[4], buf.j[5], buf.j[6], buf.j[7] = jf, 0, -jf, 0, jf, 0, -jf
     end
 
     # Check all times non-negative (NaN < x is false, so check explicitly)
     @inbounds for i in 1:7
-        (isnan(profile.t[i]) || profile.t[i] < -T_PRECISION) && return false
-        profile.t[i] = max(profile.t[i], zero(T))
+        (isnan(buf.t[i]) || buf.t[i] < -T_PRECISION) && return false
+        buf.t[i] = max(buf.t[i], zero(T))
     end
 
     # Integrate profile (Eq. 2-4 from paper)
-    profile.a[1] = a0
-    profile.v[1] = v0
-    profile.p[1] = p0
+    buf.a[1] = a0
+    buf.v[1] = v0
+    buf.p[1] = p0
 
     cumtime = zero(T)
     @inbounds for i in 1:7
-        ti = profile.t[i]
-        ji = profile.j[i]
-        ai = profile.a[i]
-        vi = profile.v[i]
-        pi = profile.p[i]
+        ti = buf.t[i]
+        ji = buf.j[i]
+        ai = buf.a[i]
+        vi = buf.v[i]
+        pi = buf.p[i]
 
-        profile.a[i+1] = ai + ti * ji
-        profile.v[i+1] = vi + ti * (ai + ti * ji / 2)
-        profile.p[i+1] = pi + ti * (vi + ti * (ai / 2 + ti * ji / 6))
+        buf.a[i+1] = ai + ti * ji
+        buf.v[i+1] = vi + ti * (ai + ti * ji / 2)
+        buf.p[i+1] = pi + ti * (vi + ti * (ai / 2 + ti * ji / 6))
 
         cumtime += ti
-        profile.t_sum[i] = cumtime
+        buf.t_sum[i] = cumtime
     end
 
     # Check final state
-    abs(profile.p[8] - pf) > P_PRECISION && return false
-    abs(profile.v[8] - vf) > V_PRECISION && return false
-    abs(profile.a[8] - af) > A_PRECISION && return false
+    abs(buf.p[8] - pf) > P_PRECISION && return false
+    abs(buf.v[8] - vf) > V_PRECISION && return false
+    abs(buf.a[8] - af) > A_PRECISION && return false
 
     # Check acceleration limits at critical points (indices 2, 4, 6 in 1-based = boundaries after phases 1, 3, 5)
     @inbounds for i in (2, 4, 6)
-        (profile.a[i] > aMax + EPS || profile.a[i] < aMin - EPS) && return false
+        (buf.a[i] > aMax + EPS || buf.a[i] < aMin - EPS) && return false
     end
 
     # Check velocity limits at critical points (indices 4-7 in 1-based)
     @inbounds for i in 4:7
-        (profile.v[i] > vMax + EPS || profile.v[i] < vMin - EPS) && return false
+        (buf.v[i] > vMax + EPS || buf.v[i] < vMin - EPS) && return false
     end
 
     # Check velocity at acceleration zero-crossings
     @inbounds for i in 3:6
-        profile.t[i] < EPS && continue
-        ai, ji = profile.a[i], profile.j[i]
+        buf.t[i] < EPS && continue
+        ai, ji = buf.a[i], buf.j[i]
         abs(ji) < EPS && continue
 
         # Time when acceleration crosses zero within this phase
-        if ai * profile.a[i+1] < -EPS
+        if ai * buf.a[i+1] < -EPS
             t_zero = -ai / ji
-            if 0 < t_zero < profile.t[i]
-                v_at_zero = profile.v[i] - ai^2 / (2ji)
+            if 0 < t_zero < buf.t[i]
+                v_at_zero = buf.v[i] - ai^2 / (2ji)
                 (v_at_zero > vMax + EPS || v_at_zero < vMin - EPS) && return false
             end
         end
     end
 
-    profile.pf = pf
-    profile.vf = vf
-    profile.af = af
-    profile.limits = limits
-    profile.control_signs = control_signs
+    buf.limits = limits
+    buf.control_signs = control_signs
 
     return true
 end
@@ -473,7 +508,7 @@ end
 Try all velocity-limited profiles (ACC0_ACC1_VEL, ACC1_VEL, ACC0_VEL, VEL).
 Returns true if any valid profile is found.
 """
-function time_all_vel!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
+function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                        jMax, vMax, vMin, aMax, aMin) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
@@ -489,15 +524,15 @@ function time_all_vel!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
 
     # Strategy 1: ACC0_ACC1_VEL (reach aMax, vMax, aMin)
     begin
-        profile.t[1] = (-a0 + aMax) / jMax
-        profile.t[2] = (a0_a0/2 - aMax^2 - jMax*(v0 - vMax)) / (aMax * jMax)
-        profile.t[3] = aMax / jMax
-        profile.t[5] = -aMin / jMax
-        profile.t[6] = -(af_af/2 - aMin^2 - jMax*(vf - vMax)) / (aMin * jMax)
-        profile.t[7] = profile.t[5] + af / jMax
+        buf.t[1] = (-a0 + aMax) / jMax
+        buf.t[2] = (a0_a0/2 - aMax^2 - jMax*(v0 - vMax)) / (aMax * jMax)
+        buf.t[3] = aMax / jMax
+        buf.t[5] = -aMin / jMax
+        buf.t[6] = -(af_af/2 - aMin^2 - jMax*(vf - vMax)) / (aMin * jMax)
+        buf.t[7] = buf.t[5] + af / jMax
 
         # Compute t[4] from position constraint (equation from reference)
-        profile.t[4] = (3*(a0_p4*aMin - af_p4*aMax) +
+        buf.t[4] = (3*(a0_p4*aMin - af_p4*aMax) +
                         8*aMax*aMin*(af_p3 - a0_p3 + 3*jMax*(a0*v0 - af*vf)) +
                         6*a0_a0*aMin*(aMax^2 - 2*jMax*v0) -
                         6*af_af*aMax*(aMin^2 - 2*jMax*vf) -
@@ -505,7 +540,7 @@ function time_all_vel!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
                                 (aMin - aMax)*jMax*vMax^2 +
                                 jMax*(aMax*vf_vf - aMin*v0_v0))) / (24*aMax*aMin*jMax_jMax*vMax)
 
-        if check!(profile, UDDU, LIMIT_ACC0_ACC1_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(buf, UDDU, LIMIT_ACC0_ACC1_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
         end
     end
@@ -513,40 +548,40 @@ function time_all_vel!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
     # Strategy 2: ACC1_VEL (reach vMax and aMin, not aMax)
     begin
         t_acc0 = sqrt(max(0.0, a0_a0/(2*jMax_jMax) + (vMax - v0)/jMax))
-        profile.t[1] = t_acc0 - a0/jMax
-        profile.t[2] = 0
-        profile.t[3] = t_acc0
-        profile.t[5] = -aMin / jMax
-        profile.t[6] = -(af_af/2 - aMin^2 - jMax*(vf - vMax)) / (aMin * jMax)
-        profile.t[7] = profile.t[5] + af / jMax
+        buf.t[1] = t_acc0 - a0/jMax
+        buf.t[2] = 0
+        buf.t[3] = t_acc0
+        buf.t[5] = -aMin / jMax
+        buf.t[6] = -(af_af/2 - aMin^2 - jMax*(vf - vMax)) / (aMin * jMax)
+        buf.t[7] = buf.t[5] + af / jMax
 
-        t_acc1 = profile.t[7]
-        profile.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
+        t_acc1 = buf.t[7]
+        buf.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
                        (a0*v0 - af*vf + (af_af*t_acc1 + a0_a0*t_acc0)/2)/(jMax*vMax) -
                        (v0/vMax + 1.0)*t_acc0 - (vf/vMax + 1.0)*t_acc1 + pd/vMax
 
-        if check!(profile, UDDU, LIMIT_ACC1_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(buf, UDDU, LIMIT_ACC1_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
         end
     end
 
     # Strategy 3: ACC0_VEL (reach aMax and vMax, not aMin)
     begin
-        profile.t[1] = (-a0 + aMax) / jMax
-        profile.t[2] = (a0_a0/2 - aMax^2 - jMax*(v0 - vMax)) / (aMax * jMax)
-        profile.t[3] = aMax / jMax
+        buf.t[1] = (-a0 + aMax) / jMax
+        buf.t[2] = (a0_a0/2 - aMax^2 - jMax*(v0 - vMax)) / (aMax * jMax)
+        buf.t[3] = aMax / jMax
 
         t_acc1 = sqrt(max(0.0, af_af/(2*jMax_jMax) + (vMax - vf)/jMax))
-        profile.t[5] = t_acc1
-        profile.t[6] = 0
-        profile.t[7] = t_acc1 + af/jMax
+        buf.t[5] = t_acc1
+        buf.t[6] = 0
+        buf.t[7] = t_acc1 + af/jMax
 
-        t_acc0 = profile.t[1]
-        profile.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
+        t_acc0 = buf.t[1]
+        buf.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
                        (a0*v0 - af*vf + (af_af*t_acc1 + a0_a0*t_acc0)/2)/(jMax*vMax) -
                        (v0/vMax + 1.0)*t_acc0 - (vf/vMax + 1.0)*t_acc1 + pd/vMax
 
-        if check!(profile, UDDU, LIMIT_ACC0_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(buf, UDDU, LIMIT_ACC0_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
         end
     end
@@ -556,18 +591,18 @@ function time_all_vel!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
         t_acc0 = sqrt(max(0.0, a0_a0/(2*jMax_jMax) + (vMax - v0)/jMax))
         t_acc1 = sqrt(max(0.0, af_af/(2*jMax_jMax) + (vMax - vf)/jMax))
 
-        profile.t[1] = t_acc0 - a0/jMax
-        profile.t[2] = 0
-        profile.t[3] = t_acc0
-        profile.t[5] = t_acc1
-        profile.t[6] = 0
-        profile.t[7] = t_acc1 + af/jMax
+        buf.t[1] = t_acc0 - a0/jMax
+        buf.t[2] = 0
+        buf.t[3] = t_acc0
+        buf.t[5] = t_acc1
+        buf.t[6] = 0
+        buf.t[7] = t_acc1 + af/jMax
 
-        profile.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
+        buf.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
                        (a0*v0 - af*vf + (af_af*t_acc1 + a0_a0*t_acc0)/2)/(jMax*vMax) -
                        (v0/vMax + 1.0)*t_acc0 - (vf/vMax + 1.0)*t_acc1 + pd/vMax
 
-        if check!(profile, UDDU, LIMIT_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(buf, UDDU, LIMIT_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
         end
     end
@@ -578,7 +613,7 @@ end
 """
 Try ACC0_ACC1 profile (reach both aMax and aMin, but not vMax).
 """
-function time_acc0_acc1!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
+function time_acc0_acc1!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                          jMax, vMax, vMin, aMax, aMin) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
@@ -614,15 +649,15 @@ function time_acc0_acc1!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
 
         t1_cond && t5_cond || continue
 
-        profile.t[1] = (-a0 + aMax) / jMax
-        profile.t[2] = h2 - h1_sign * h1 / aMax
-        profile.t[3] = aMax / jMax
-        profile.t[4] = 0
-        profile.t[5] = -aMin / jMax
-        profile.t[6] = h3 + h1_sign * h1 / aMin
-        profile.t[7] = profile.t[5] + af / jMax
+        buf.t[1] = (-a0 + aMax) / jMax
+        buf.t[2] = h2 - h1_sign * h1 / aMax
+        buf.t[3] = aMax / jMax
+        buf.t[4] = 0
+        buf.t[5] = -aMin / jMax
+        buf.t[6] = h3 + h1_sign * h1 / aMin
+        buf.t[7] = buf.t[5] + af / jMax
 
-        if check!(profile, UDDU, LIMIT_ACC0_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(buf, UDDU, LIMIT_ACC0_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
         end
     end
@@ -633,7 +668,7 @@ end
 """
 Try ACC0, ACC1, and NONE profiles (no velocity limit reached).
 """
-function time_all_none_acc0_acc1!(roots::Roots, profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
+function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                                   jMax, vMax, vMin, aMax, aMin) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
@@ -673,15 +708,15 @@ function time_all_none_acc0_acc1!(roots::Roots, profile::RuckigProfile{T}, p0, v
         end
 
         h0 = h2_none/(2*jMax*t)
-        profile.t[1] = h0 + t/2 - a0/jMax
-        profile.t[2] = 0
-        profile.t[3] = t
-        profile.t[4] = 0
-        profile.t[5] = 0
-        profile.t[6] = 0
-        profile.t[7] = -h0 + t/2 + af/jMax
+        buf.t[1] = h0 + t/2 - a0/jMax
+        buf.t[2] = 0
+        buf.t[3] = t
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = -h0 + t/2 + af/jMax
 
-        if check!(profile, UDDU, LIMIT_NONE, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(buf, UDDU, LIMIT_NONE, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
         end
     end
@@ -712,15 +747,15 @@ function time_all_none_acc0_acc1!(roots::Roots, profile::RuckigProfile{T}, p0, v
             t -= orig / deriv
         end
 
-        profile.t[1] = (-a0 + aMax)/jMax
-        profile.t[2] = h3_acc0 - 2*t + jMax/aMax*t^2
-        profile.t[3] = t
-        profile.t[4] = 0
-        profile.t[5] = 0
-        profile.t[6] = 0
-        profile.t[7] = (af - aMax)/jMax + t
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = h3_acc0 - 2*t + jMax/aMax*t^2
+        buf.t[3] = t
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = (af - aMax)/jMax + t
 
-        if check!(profile, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(buf, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
         end
     end
@@ -754,15 +789,15 @@ function time_all_none_acc0_acc1!(roots::Roots, profile::RuckigProfile{T}, p0, v
             end
         end
 
-        profile.t[1] = t
-        profile.t[2] = 0
-        profile.t[3] = (a0 - aMin)/jMax + t
-        profile.t[4] = 0
-        profile.t[5] = 0
-        profile.t[6] = h3_acc1 - (2*a0 + jMax*t)*t/aMin
-        profile.t[7] = (af - aMin)/jMax
+        buf.t[1] = t
+        buf.t[2] = 0
+        buf.t[3] = (a0 - aMin)/jMax + t
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = h3_acc1 - (2*a0 + jMax*t)*t/aMin
+        buf.t[7] = (af - aMin)/jMax
 
-        if check!(profile, UDDU, LIMIT_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(buf, UDDU, LIMIT_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
         end
     end
@@ -777,7 +812,7 @@ end
 """
 Two-step NONE profile (simplified profile without acceleration limits).
 """
-function time_none_two_step!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
+function time_none_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                               jMax, vMax, vMin, aMax, aMin) where T
     a0_a0 = a0^2
     af_af = af^2
@@ -786,29 +821,29 @@ function time_none_two_step!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
     h0_sq = (a0_a0 + af_af)/2 + jMax*(vf - v0)
     if h0_sq >= 0
         h0 = sqrt(h0_sq) * sign(jMax)
-        profile.t[1] = (h0 - a0)/jMax
-        profile.t[2] = 0
-        profile.t[3] = (h0 - af)/jMax
-        profile.t[4] = 0
-        profile.t[5] = 0
-        profile.t[6] = 0
-        profile.t[7] = 0
+        buf.t[1] = (h0 - a0)/jMax
+        buf.t[2] = 0
+        buf.t[3] = (h0 - af)/jMax
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = 0
 
-        if check!(profile, UDDU, LIMIT_NONE, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(buf, UDDU, LIMIT_NONE, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
         end
     end
 
     # Single step (only jerk phase)
-    profile.t[1] = (af - a0)/jMax
-    profile.t[2] = 0
-    profile.t[3] = 0
-    profile.t[4] = 0
-    profile.t[5] = 0
-    profile.t[6] = 0
-    profile.t[7] = 0
+    buf.t[1] = (af - a0)/jMax
+    buf.t[2] = 0
+    buf.t[3] = 0
+    buf.t[4] = 0
+    buf.t[5] = 0
+    buf.t[6] = 0
+    buf.t[7] = 0
 
-    if check!(profile, UDDU, LIMIT_NONE, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+    if check!(buf, UDDU, LIMIT_NONE, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
         return true
     end
 
@@ -818,7 +853,7 @@ end
 """
 Two-step ACC0 profile (simplified profile reaching only aMax).
 """
-function time_acc0_two_step!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
+function time_acc0_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                               jMax, vMax, vMin, aMax, aMin) where T
     jMax_jMax = jMax^2
     a0_a0 = a0^2
@@ -831,29 +866,29 @@ function time_acc0_two_step!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
 
     # Strategy 1: Two-step (t[1]=0)
     if abs(a0) > EPS
-        profile.t[1] = 0
-        profile.t[2] = (af_af - a0_a0 + 2*jMax*(vf - v0))/(2*a0*jMax)
-        profile.t[3] = (a0 - af)/jMax
-        profile.t[4] = 0
-        profile.t[5] = 0
-        profile.t[6] = 0
-        profile.t[7] = 0
+        buf.t[1] = 0
+        buf.t[2] = (af_af - a0_a0 + 2*jMax*(vf - v0))/(2*a0*jMax)
+        buf.t[3] = (a0 - af)/jMax
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = 0
 
-        if check!(profile, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(buf, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
         end
     end
 
     # Strategy 2: Three-step reaching aMax
-    profile.t[1] = (-a0 + aMax)/jMax
-    profile.t[2] = (a0_a0 + af_af - 2*aMax^2 + 2*jMax*(vf - v0))/(2*aMax*jMax)
-    profile.t[3] = (-af + aMax)/jMax
-    profile.t[4] = 0
-    profile.t[5] = 0
-    profile.t[6] = 0
-    profile.t[7] = 0
+    buf.t[1] = (-a0 + aMax)/jMax
+    buf.t[2] = (a0_a0 + af_af - 2*aMax^2 + 2*jMax*(vf - v0))/(2*aMax*jMax)
+    buf.t[3] = (-af + aMax)/jMax
+    buf.t[4] = 0
+    buf.t[5] = 0
+    buf.t[6] = 0
+    buf.t[7] = 0
 
-    if check!(profile, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+    if check!(buf, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
         return true
     end
 
@@ -875,15 +910,15 @@ function time_acc0_two_step!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
                 if a_peak > 0
                     a_peak = sqrt(a_peak)
 
-                    profile.t[1] = (a_peak - a0)/jMax
-                    profile.t[2] = 0
-                    profile.t[3] = (a_peak - af)/jMax
-                    profile.t[4] = 0
-                    profile.t[5] = 0
-                    profile.t[6] = 0
-                    profile.t[7] = 0
+                    buf.t[1] = (a_peak - a0)/jMax
+                    buf.t[2] = 0
+                    buf.t[3] = (a_peak - af)/jMax
+                    buf.t[4] = 0
+                    buf.t[5] = 0
+                    buf.t[6] = 0
+                    buf.t[7] = 0
 
-                    if check!(profile, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                    if check!(buf, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
                         return true
                     end
                 end
@@ -893,15 +928,15 @@ function time_acc0_two_step!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
 
     # Strategy 4: Three-step with fixed time constraint (from reference lines 353-369)
     t_fixed = (aMax - aMin)/jMax
-    profile.t[1] = (-a0 + aMax)/jMax
-    profile.t[2] = (a0_a0 - af_af)/(2*aMax*jMax) + (vf - v0 + jMax*t_fixed^2)/aMax - 2*t_fixed
-    profile.t[3] = t_fixed
-    profile.t[4] = 0
-    profile.t[5] = 0
-    profile.t[6] = 0
-    profile.t[7] = (af - aMin)/jMax
+    buf.t[1] = (-a0 + aMax)/jMax
+    buf.t[2] = (a0_a0 - af_af)/(2*aMax*jMax) + (vf - v0 + jMax*t_fixed^2)/aMax - 2*t_fixed
+    buf.t[3] = t_fixed
+    buf.t[4] = 0
+    buf.t[5] = 0
+    buf.t[6] = 0
+    buf.t[7] = (af - aMin)/jMax
 
-    if check!(profile, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+    if check!(buf, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
         return true
     end
 
@@ -911,7 +946,7 @@ end
 """
 Two-step VEL profile (simplified velocity-limited profile).
 """
-function time_vel_two_step!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
+function time_vel_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                              jMax, vMax, vMin, aMax, aMin) where T
     jMax_jMax = jMax^2
     a0_a0 = a0^2
@@ -925,33 +960,33 @@ function time_vel_two_step!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
     h1 = sqrt(h1_sq)
 
     # Solution 1: t[1] = -a0/jMax (decelerate to zero first)
-    profile.t[1] = -a0/jMax
-    profile.t[2] = 0
-    profile.t[3] = 0
-    profile.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
+    buf.t[1] = -a0/jMax
+    buf.t[2] = 0
+    buf.t[3] = 0
+    buf.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
                    (a0*v0 - af*vf + (af_af*h1)/2)/(jMax*vMax) -
                    (vf/vMax + 1.0)*h1 + pd/vMax
-    profile.t[5] = h1
-    profile.t[6] = 0
-    profile.t[7] = h1 + af/jMax
+    buf.t[5] = h1
+    buf.t[6] = 0
+    buf.t[7] = h1 + af/jMax
 
-    if check!(profile, UDDU, LIMIT_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+    if check!(buf, UDDU, LIMIT_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
         return true
     end
 
     # Solution 2: t[3] = a0/jMax (accelerate through zero)
-    profile.t[1] = 0
-    profile.t[2] = 0
-    profile.t[3] = a0/jMax
-    profile.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
+    buf.t[1] = 0
+    buf.t[2] = 0
+    buf.t[3] = a0/jMax
+    buf.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
                    (a0*v0 - af*vf + (af_af*h1 + a0_p3/jMax)/2)/(jMax*vMax) -
                    (v0/vMax + 1.0)*a0/jMax -
                    (vf/vMax + 1.0)*h1 + pd/vMax
-    profile.t[5] = h1
-    profile.t[6] = 0
-    profile.t[7] = h1 + af/jMax
+    buf.t[5] = h1
+    buf.t[6] = 0
+    buf.t[7] = h1 + af/jMax
 
-    if check!(profile, UDDU, LIMIT_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+    if check!(buf, UDDU, LIMIT_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
         return true
     end
 
@@ -1061,44 +1096,43 @@ Calculate time-optimal trajectory from (p0, v0, a0) to (pf, vf, 0).
 """
 function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a0=zero(T), vf=zero(T), af=zero(T)) where T
 
-    (; vmax, vmin, amax, amin, jmax) = lim
-
-    # Try UP direction first (positive jerk starts the motion)
-    profile = RuckigProfile(T)
+    (; vmax, vmin, amax, amin, jmax, buffer) = lim
+    buf = buffer
+    clear!(buf)
 
     # For positive displacement, try UP direction profiles
     if pf >= p0
         # Try velocity-limited profiles first
-        if time_all_vel!(profile, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return profile
+        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            return RuckigProfile(buf, pf, vf, af)
         end
 
         # Try ACC0_ACC1 (reaches amax and amin)
-        if time_acc0_acc1!(profile, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return profile
+        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            return RuckigProfile(buf, pf, vf, af)
         end
 
         # Try ACC0, ACC1, NONE
-        if time_all_none_acc0_acc1!(lim.roots, profile, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return profile
+        if time_all_none_acc0_acc1!(lim.roots, buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            return RuckigProfile(buf, pf, vf, af)
         end
 
         # Try two-step fallback profiles
-        if time_none_two_step!(profile, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return profile
+        if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            return RuckigProfile(buf, pf, vf, af)
         end
 
-        if time_acc0_two_step!(profile, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return profile
+        if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            return RuckigProfile(buf, pf, vf, af)
         end
 
-        if time_vel_two_step!(profile, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return profile
+        if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            return RuckigProfile(buf, pf, vf, af)
         end
     end
 
     # Try DOWN direction (flip the problem)
-    profile = RuckigProfile(T)
+    clear!(buf)
     p0_flip, pf_flip = -p0, -pf
     v0_flip, vf_flip = -v0, -vf
     a0_flip, af_flip = -a0, -af
@@ -1106,78 +1140,60 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
     amax_flip, amin_flip = -amin, -amax
 
     if pf_flip >= p0_flip
-        if time_all_vel!(profile, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
+        if time_all_vel!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
                          jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
             # Flip back
-            profile.p .*= -1
-            profile.v .*= -1
-            profile.a .*= -1
-            profile.j .*= -1
-            profile.pf = pf
-            profile.vf = vf
-            profile.af = af
-            return profile
+            buf.p .*= -1
+            buf.v .*= -1
+            buf.a .*= -1
+            buf.j .*= -1
+            return RuckigProfile(buf, pf, vf, af)
         end
 
-        if time_acc0_acc1!(profile, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
+        if time_acc0_acc1!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
                            jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            profile.p .*= -1
-            profile.v .*= -1
-            profile.a .*= -1
-            profile.j .*= -1
-            profile.pf = pf
-            profile.vf = vf
-            profile.af = af
-            return profile
+            buf.p .*= -1
+            buf.v .*= -1
+            buf.a .*= -1
+            buf.j .*= -1
+            return RuckigProfile(buf, pf, vf, af)
         end
 
-        if time_all_none_acc0_acc1!(lim.roots, profile, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
+        if time_all_none_acc0_acc1!(lim.roots, buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
                                     jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            profile.p .*= -1
-            profile.v .*= -1
-            profile.a .*= -1
-            profile.j .*= -1
-            profile.pf = pf
-            profile.vf = vf
-            profile.af = af
-            return profile
+            buf.p .*= -1
+            buf.v .*= -1
+            buf.a .*= -1
+            buf.j .*= -1
+            return RuckigProfile(buf, pf, vf, af)
         end
 
         # Try two-step fallback profiles for DOWN direction
-        if time_none_two_step!(profile, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
+        if time_none_two_step!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
                                jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            profile.p .*= -1
-            profile.v .*= -1
-            profile.a .*= -1
-            profile.j .*= -1
-            profile.pf = pf
-            profile.vf = vf
-            profile.af = af
-            return profile
+            buf.p .*= -1
+            buf.v .*= -1
+            buf.a .*= -1
+            buf.j .*= -1
+            return RuckigProfile(buf, pf, vf, af)
         end
 
-        if time_acc0_two_step!(profile, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
+        if time_acc0_two_step!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
                                jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            profile.p .*= -1
-            profile.v .*= -1
-            profile.a .*= -1
-            profile.j .*= -1
-            profile.pf = pf
-            profile.vf = vf
-            profile.af = af
-            return profile
+            buf.p .*= -1
+            buf.v .*= -1
+            buf.a .*= -1
+            buf.j .*= -1
+            return RuckigProfile(buf, pf, vf, af)
         end
 
-        if time_vel_two_step!(profile, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
+        if time_vel_two_step!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
                               jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            profile.p .*= -1
-            profile.v .*= -1
-            profile.a .*= -1
-            profile.j .*= -1
-            profile.pf = pf
-            profile.vf = vf
-            profile.af = af
-            return profile
+            buf.p .*= -1
+            buf.v .*= -1
+            buf.a .*= -1
+            buf.j .*= -1
+            return RuckigProfile(buf, pf, vf, af)
         end
     end
 

@@ -200,7 +200,7 @@ lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
 profile = calculate_trajectory(lim; v0=5.0, pf=3.0)
 
 # Sample and plot
-pos, vel, acc, jerk, ts = evaluate_dt(profile)
+pos, vel, acc, jerk, ts = evaluate_dt(profile, 0.001)
 
 plot(
     plot(ts, pos, ylabel="Position", label=""),

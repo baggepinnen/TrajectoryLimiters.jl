@@ -219,7 +219,7 @@ end
     profile = calculate_trajectory(lim; pf=2.0)
 
     # Default Ts=0.001
-    pos, vel, acc, jerk, ts = evaluate_dt(profile)
+    pos, vel, acc, jerk, ts = evaluate_dt(profile, 0.001)
 
     @test ts[1] == 0.0
     @test ts[end] <= profile.t_sum[7]
