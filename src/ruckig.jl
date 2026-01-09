@@ -48,20 +48,20 @@ Mutable buffer for computing trajectory profiles. Stored in JerkLimiter
 to avoid allocations during trajectory calculation.
 """
 mutable struct ProfileBuffer{T}
-    t::Vector{T}       # Phase durations (length 7)
-    t_sum::Vector{T}   # Cumulative times (length 7)
-    j::Vector{T}       # Jerk values (length 7)
-    a::Vector{T}       # Acceleration at boundaries (length 8)
-    v::Vector{T}       # Velocity at boundaries (length 8)
-    p::Vector{T}       # Position at boundaries (length 8)
+    t::Memory{T}       # Phase durations (length 7)
+    t_sum::Memory{T}   # Cumulative times (length 7)
+    j::Memory{T}       # Jerk values (length 7)
+    a::Memory{T}       # Acceleration at boundaries (length 8)
+    v::Memory{T}       # Velocity at boundaries (length 8)
+    p::Memory{T}       # Position at boundaries (length 8)
     limits::ReachedLimits
     control_signs::ControlSigns
 end
 
 function ProfileBuffer{T}() where T
     ProfileBuffer{T}(
-        zeros(T, 7), zeros(T, 7), zeros(T, 7),
-        zeros(T, 8), zeros(T, 8), zeros(T, 8),
+        Memory{T}(undef, 7), Memory{T}(undef, 7), Memory{T}(undef, 7),
+        Memory{T}(undef, 8), Memory{T}(undef, 8), Memory{T}(undef, 8),
         LIMIT_NONE, UDDU
     )
 end
