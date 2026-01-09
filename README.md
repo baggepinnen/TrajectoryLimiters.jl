@@ -186,7 +186,7 @@ plot!(t3, a3, label="jmax=200", sp=3)
 plot!(t3, j3, label="jmax=200", sp=4)
 ```
 
-![jerk comparison](https://private-user-images.githubusercontent.com/3797491/533803613-392a2c6e-9f39-46a9-a361-b775ce70709b.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NDkyNjMsIm5iZiI6MTc2Nzk0ODk2MywicGF0aCI6Ii8zNzk3NDkxLzUzMzgwMzYxMy0zOTJhMmM2ZS05ZjM5LTQ2YTktYTM2MS1iNzc1Y2U3MDcwOWIucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMDg1NjAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9YTg1ODg2MmM3M2VmNDhjMDU5MWFlNTI4YjQ0NjkzZWQyMzMxMDAyOTc0NjY5NGY0MDIxNDk1YmQ5NjllYTliMCZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.w0P7_MfhlPrd6tog8eowHvZ5H31mzSbL0tFbY6Wf9_A)
+![jerk comparison](https://github.com/user-attachments/assets/392a2c6e-9f39-46a9-a361-b775ce70709b)
 
 Lower jerk limits produce smoother acceleration profiles at the cost of longer trajectory duration. The jerk (bottom plot) shows how the rate of acceleration change is bounded.
 
@@ -214,7 +214,7 @@ plot(
 )
 ```
 
-![initial velocity](https://private-user-images.githubusercontent.com/3797491/533803584-67ab9661-6ca0-4d5f-82dc-6d3b9cb9bbea.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NDkyNjMsIm5iZiI6MTc2Nzk0ODk2MywicGF0aCI6Ii8zNzk3NDkxLzUzMzgwMzU4NC02N2FiOTY2MS02Y2EwLTRkNWYtODJkYy02ZDNiOWNiOWJiZWEucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMDg1NjAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9NWI2NzkxODNkMWQ1OTNjYmZlNzk0MDM1ZTY2OTEyZDQzOTdmMmQ5NDcxNTBmZGMxMTQ1YWNlN2JlMzk0ODM4OSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.W3uS4WPk5_24CBGcerWHkRdTM6LKKbyGlTTxwrja9dg)
+![initial velocity](https://github.com/user-attachments/assets/67ab9661-6ca0-4d5f-82dc-6d3b9cb9bbea)
 
 ### Asymmetric Limits
 
@@ -276,7 +276,7 @@ hline!([50 40 30], sp=3, ls=:dash, label="", c=(1:3)')
 hline!([1000 500 800], sp=4, ls=:dash, label="", c=(1:3)')
 ```
 
-![multi DOF synch](https://private-user-images.githubusercontent.com/3797491/533966423-4c2bf06e-d985-4aac-8286-bc517f72ef51.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NzM0ODMsIm5iZiI6MTc2Nzk3MzE4MywicGF0aCI6Ii8zNzk3NDkxLzUzMzk2NjQyMy00YzJiZjA2ZS1kOTg1LTRhYWMtODI4Ni1iYzUxN2Y3MmVmNTEucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMTUzOTQzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9YmJiMDVmMGQwMDY4YjJmODNmNGYxMzBkNjUxZTAxODcyOGFjZDU4MzY3NWVlZDJhZTU2ZmEwYTYzZDIxMjBkMyZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.jhKbOsmt6F6RVD2ph8f1lMSn4z7BMDOXlLoj-UBcjRw)
+![multi DOF synch](https://github.com/user-attachments/assets/4c2bf06e-d985-4aac-8286-bc517f72ef51)
 
 The image shows how different parts of the trajectory is limited by different degrees of freedom, all three DOF start and reach the end at the same time.
 
@@ -382,7 +382,7 @@ opt = Optim.minimizer(res)
 ts_opt, pos_opt, vel_opt, acc_opt, jerk_opt = calculate_waypoint_trajectory(lims, get_waypoints(opt), 0.001)
 plot!(pos_opt[:, 1], pos_opt[:, 2], label="Optimized Path")
 ```
-![optimized trajectory](https://private-user-images.githubusercontent.com/3797491/533931993-02161a30-0a75-4471-8212-e8d9488192d0.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NjkxNTEsIm5iZiI6MTc2Nzk2ODg1MSwicGF0aCI6Ii8zNzk3NDkxLzUzMzkzMTk5My0wMjE2MWEzMC0wYTc1LTQ0NzEtODIxMi1lOGQ5NDg4MTkyZDAucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMTQyNzMxWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9ZGQ5NmZhODUzMzM1NjZhYWQ5YmQ0NDhkNDI2OTU5NTE5NWYyMDA4NDYwYTY1OWQyM2RjYTdmODIxZjBmMGYxYSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.usNMB6A5Fr1yJR8esDMdCtEvozr5-NBZA_t8Ne7GwkU)
+![optimized trajectory](https://github.com/user-attachments/assets/02161a30-0a75-4471-8212-e8d9488192d0)
 
 ### Profile Structure
 
