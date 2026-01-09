@@ -307,12 +307,68 @@ waypoints = [
 ts, pos, vel, acc, jerk = calculate_waypoint_trajectory(lims, waypoints, 0.001)
 
 # Plot the trajectory in XY space
-plot(pos[:, 1], pos[:, 2], label="Path", xlabel="X", ylabel="Y", aspect_ratio=:equal)
-scatter!([wp.p[1] for wp in waypoints], [wp.p[2] for wp in waypoints],
+scatter([wp.p[1] for wp in waypoints], [wp.p[2] for wp in waypoints],
          label="Waypoints", ms=8, c=:red)
+plot!(pos[:, 1], pos[:, 2], label="Path", xlabel="X", ylabel="Y", aspect_ratio=:equal, c=1)
 ```
 
-Each segment between waypoints is time-synchronized across all DOFs, ensuring coordinated motion through the entire path.
+Each segment between waypoints is time-synchronized across all DOFs, ensuring coordinated motion through the entire path. Note, the trajectory is in general not globally time optimal since the velocity and acceleration targets at the waypoints are not optimized.
+
+#### Optimizing for global time-optimality
+We could try to optimize the waypoint velocities in order to minimize the total trajectory time (not a supported feature yet, this is only an example):
+```julia
+using Optim
+
+function cost(velocities_and_accelerations)
+    waypoints = [
+        (p = [0.0, 0.0],),
+        (p = [2.0, 1.0], v = velocities_and_accelerations[1:2], a = velocities_and_accelerations[7:8]),
+        (p = [3.0, 3.0], v = velocities_and_accelerations[3:4], a = velocities_and_accelerations[9:10]),
+        (p = [-0.5, 2.0], v = velocities_and_accelerations[5:6], a = velocities_and_accelerations[11:12]),
+        (p = [0.0, 0.0],),
+    ]
+    try
+        ts, _ = calculate_waypoint_trajectory(lims, waypoints, 0.001)
+        return last(ts)  # Total trajectory time
+    catch
+        return Inf  # Infeasible trajectory
+    end
+end
+
+initial_velocities = zeros(12)  # 3 waypoints * 2 DOF each
+
+res = Optim.optimize(
+    cost,
+    initial_velocities,
+    ParticleSwarm(),
+    Optim.Options(
+        store_trace       = true,
+        show_trace        = true,
+        show_every        = 1,
+        iterations        = 1000,
+        allow_f_increases = false,
+        time_limit        = 100,
+        x_abstol          = 0,
+        f_abstol          = 0,
+        g_tol             = 1e-8,
+        f_calls_limit     = 0,
+        g_calls_limit     = 0,
+    ),
+)
+
+opt = Optim.minimizer(res)
+
+optimal_waypoits = [
+    (p = [0.0, 0.0],),
+    (p = [2.0, 1.0], v = opt[1:2], a = opt[7:8]),
+    (p = [3.0, 3.0], v = opt[3:4], a = opt[9:10]),
+    (p = [-0.5, 2.0], v = opt[5:6], a = opt[11:12]),
+    (p = [0.0, 0.0],),
+]
+ts_opt, pos_opt, vel_opt, acc_opt, jerk_opt = calculate_waypoint_trajectory(lims, optimal_waypoits, 0.001)
+plot!(pos_opt[:, 1], pos_opt[:, 2], label="Optimized Path")
+```
+![optimized trajectory](https://private-user-images.githubusercontent.com/3797491/533931993-02161a30-0a75-4471-8212-e8d9488192d0.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NjkxNTEsIm5iZiI6MTc2Nzk2ODg1MSwicGF0aCI6Ii8zNzk3NDkxLzUzMzkzMTk5My0wMjE2MWEzMC0wYTc1LTQ0NzEtODIxMi1lOGQ5NDg4MTkyZDAucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMTQyNzMxWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9ZGQ5NmZhODUzMzM1NjZhYWQ5YmQ0NDhkNDI2OTU5NTE5NWYyMDA4NDYwYTY1OWQyM2RjYTdmODIxZjBmMGYxYSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.usNMB6A5Fr1yJR8esDMdCtEvozr5-NBZA_t8Ne7GwkU)
 
 ### Profile Structure
 
