@@ -236,3 +236,81 @@ end
     @test step(ts2) == 0.01
     @test length(ts2) < length(ts)  # Coarser sampling = fewer points
 end
+
+@testset "Trajectory with non-zero final velocity" begin
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+    # End at vf=3.0 (moving when we arrive)
+    profile = calculate_trajectory(lim; pf=5.0, vf=3.0)
+
+    @test profile.t_sum[7] > 0
+    @test profile.p[1] ≈ 0.0
+    @test profile.v[1] ≈ 0.0
+    @test profile.p[8] ≈ 5.0 atol=1e-6
+    @test profile.v[8] ≈ 3.0 atol=1e-6
+    @test profile.a[8] ≈ 0.0 atol=1e-6
+
+    # Verify via evaluate_at at final time
+    T_total = profile.t_sum[7]
+    p, v, a, j = evaluate_at(profile, T_total)
+    @test p ≈ 5.0 atol=1e-6
+    @test v ≈ 3.0 atol=1e-6
+    @test a ≈ 0.0 atol=1e-6
+end
+
+@testset "Trajectory with non-zero final acceleration" begin
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+    # End at af=10.0 (accelerating when we arrive)
+    profile = calculate_trajectory(lim; pf=2.0, af=10.0)
+
+    @test profile.t_sum[7] > 0
+    @test profile.p[1] ≈ 0.0
+    @test profile.v[1] ≈ 0.0
+    @test profile.a[1] ≈ 0.0
+    @test profile.p[8] ≈ 2.0 atol=1e-6
+    @test profile.v[8] ≈ 0.0 atol=1e-6
+    @test profile.a[8] ≈ 10.0 atol=1e-6
+
+    # Verify via evaluate_at at final time
+    T_total = profile.t_sum[7]
+    p, v, a, j = evaluate_at(profile, T_total)
+    @test p ≈ 2.0 atol=1e-6
+    @test v ≈ 0.0 atol=1e-6
+    @test a ≈ 10.0 atol=1e-6
+end
+
+@testset "Trajectory with non-zero final velocity and acceleration" begin
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+    # End at vf=2.0 and af=5.0
+    profile = calculate_trajectory(lim; pf=3.0, vf=2.0, af=5.0)
+
+    @test profile.t_sum[7] > 0
+    @test profile.p[8] ≈ 3.0 atol=1e-6
+    @test profile.v[8] ≈ 2.0 atol=1e-6
+    @test profile.a[8] ≈ 5.0 atol=1e-6
+
+    # Check trajectory stays within limits
+    for t in range(0, profile.t_sum[7], length=100)
+        p, v, a, j = evaluate_at(profile, t)
+        @test lim.vmin - 1e-6 <= v <= lim.vmax + 1e-6
+        @test lim.amin - 1e-6 <= a <= lim.amax + 1e-6
+        @test -lim.jmax - 1e-6 <= j <= lim.jmax + 1e-6
+    end
+end
+
+@testset "Trajectory with all non-zero boundary conditions" begin
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+    # Start and end with non-zero states
+    profile = calculate_trajectory(lim; p0=1.0, v0=2.0, a0=5.0, pf=4.0, vf=1.0, af=3.0)
+
+    @test profile.t_sum[7] > 0
+    @test profile.p[1] ≈ 1.0
+    @test profile.v[1] ≈ 2.0
+    @test profile.a[1] ≈ 5.0
+    @test profile.p[8] ≈ 4.0 atol=1e-6
+    @test profile.v[8] ≈ 1.0 atol=1e-6
+    @test profile.a[8] ≈ 3.0 atol=1e-6
+end

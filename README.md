@@ -12,13 +12,15 @@ and the _ruckig_ algorithm from
 > Jerk-limited Real-time Trajectory Generation with Arbitrary Target States
 > M. Berscheid, T. Kröger
 
-This nonlinear trajectory filter takes a pre-defined reference trajectory $r(t)$ (uniformly sampled in $t$) and filters it (causally) such that the velocity and acceleration are bounded by $ẋ_M$ and $ẍ_M$.
+The ruckig algorithm is a time-optimal jerk-limited trajectory generator for point-to-point motions with arbitrary initial and target states.
 
-What is this good for? Some applications call for a dynamically feasible reference trajectory, i.e., a trajectory with bounded velocity and acceleration, but all you have access to is an instantaneous reference $r(t)$ that might change abruptly, e.g., from an operator changing a set point. In such situations, this filter performs the required pre-processing of the reference to provide a smoother, dynamically feasible reference trajectory. If you already have a trajectory planner that outputs dynamically feasible trajectories, you do not need this package. 
+The nonlinear trajectory filter takes a pre-defined reference trajectory $r(t)$ (uniformly sampled in $t$) and filters it (causally) such that the velocity and acceleration are bounded by $ẋ_M$ and $ẍ_M$.
 
-## Usage
+What is this good for? Some applications call for a dynamically feasible reference trajectory, i.e., a trajectory with bounded velocity and acceleration, but all you have access to is an instantaneous reference $r(t)$ that might change abruptly, e.g., from an operator changing a set point. In such situations, this filter performs the required pre-processing of the reference to provide a smoother, dynamically feasible reference trajectory. If you already have a trajectory planner that outputs dynamically feasible trajectories (like the _ruckig_ algorithm), you do not need this filter.
 
-To filter an entire trajectory, create a `TrajectoryLimiter` and call it like a function:
+## Trajectory filtering
+
+To filter an entire preexisting trajectory, create a `TrajectoryLimiter` and call it like a function:
 ```julia
 using TrajectoryLimiters
 
@@ -112,7 +114,7 @@ Unlike the `TrajectoryLimiter` which filters an existing reference signal, `Jerk
 - **Time-optimal**: Generates the fastest possible trajectory within the given constraints
 - **Jerk-limited**: Ensures smooth acceleration profiles (no discontinuities in acceleration)
 - **Arbitrary initial state**: Supports starting from any position, velocity, and acceleration
-- **Non-zero target velocity**: Can plan trajectories that end at a specified velocity (not just rest-to-rest)
+- **Non-zero target velocity and acceleration**: Can plan trajectories that end at a specified velocity and acceleration (not just rest-to-rest)
 - **Asymmetric limits**: Supports different limits for positive and negative directions
 
 ### Basic Usage

@@ -1082,9 +1082,9 @@ end
 =============================================================================#
 
 """
-    calculate_trajectory(lim::JerkLimiter; pf, p0=0, v0=0, a0=0, vf=0)
+    calculate_trajectory(lim::JerkLimiter; pf, p0=0, v0=0, a0=0, vf=0, af=0)
 
-Calculate time-optimal trajectory from (p0, v0, a0) to (pf, vf, 0).
+Calculate time-optimal trajectory from (p0, v0, a0) to (pf, vf, af).
 
 # Arguments
 - `lim`: JerkLimiter with velocity, acceleration, and jerk constraints
@@ -1093,6 +1093,7 @@ Calculate time-optimal trajectory from (p0, v0, a0) to (pf, vf, 0).
 - `a0`: Initial acceleration (default: 0)
 - `pf`: Target position (required)
 - `vf`: Target velocity (default: 0)
+- `af`: Target acceleration (default: 0)
 """
 function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a0=zero(T), vf=zero(T), af=zero(T)) where T
 
