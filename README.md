@@ -121,18 +121,17 @@ Unlike the `TrajectoryLimiter` which filters an existing reference signal, `Jerk
 using TrajectoryLimiters
 
 # Create a jerk limiter with symmetric limits
-vmax = 10.0   # Maximum velocity (±10)
-amax = 50.0   # Maximum acceleration (±50)
-jmax = 1000.0 # Maximum jerk (±1000)
-
-lim = JerkLimiter(vmax, amax, jmax)
+lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
 
 # Plan a trajectory from rest at position 0 to rest at position 1
-profile = calculate_trajectory(lim, 0.0, 0.0, 0.0, 1.0)
+profile = calculate_trajectory(lim; pf=1.0)
 
 # Evaluate the trajectory at any time
-t = 0.05
+t = 0.05 # May also be a vector of time points
 p, v, a, j = evaluate_at(profile, t)
+
+# Evaluate entire trajectory at fixed time interval 0.001
+P, V, A, J, ts = evaluate_dt(profile, 0.001)
 ```
 
 ### Example: Comparing Different Constraint Levels
@@ -151,28 +150,20 @@ jmax_high = 5000.0   # Sharp acceleration changes
 jmax_med  = 1000.0   # Moderate smoothness
 jmax_low  = 200.0    # Very smooth acceleration
 
-lim_high = JerkLimiter(vmax, amax, jmax_high)
-lim_med  = JerkLimiter(vmax, amax, jmax_med)
-lim_low  = JerkLimiter(vmax, amax, jmax_low)
+lim_high = JerkLimiter(; vmax, amax, jmax=jmax_high)
+lim_med  = JerkLimiter(; vmax, amax, jmax=jmax_med)
+lim_low  = JerkLimiter(; vmax, amax, jmax=jmax_low)
 
-# Plan trajectories from (p=0, v=0, a=0) to (p=2, v=0)
-p0, v0, a0, pf = 0.0, 0.0, 0.0, 2.0
-
-prof_high = calculate_trajectory(lim_high, p0, v0, a0, pf)
-prof_med  = calculate_trajectory(lim_med, p0, v0, a0, pf)
-prof_low  = calculate_trajectory(lim_low, p0, v0, a0, pf)
+# Plan trajectories to position 2 (defaults: p0=0, v0=0, a0=0, vf=0)
+prof_high = calculate_trajectory(lim_high; pf=2.0)
+prof_med  = calculate_trajectory(lim_med; pf=2.0)
+prof_low  = calculate_trajectory(lim_low; pf=2.0)
 
 # Sample trajectories for plotting
-function sample_profile(prof, dt=0.001)
-    T = prof.t_sum[7]
-    ts = 0:dt:T
-    data = [evaluate_at(prof, t) for t in ts]
-    ts, [d[1] for d in data], [d[2] for d in data], [d[3] for d in data], [d[4] for d in data]
-end
-
-t1, p1, v1, a1, j1 = sample_profile(prof_high)
-t2, p2, v2, a2, j2 = sample_profile(prof_med)
-t3, p3, v3, a3, j3 = sample_profile(prof_low)
+Ts = 0.001
+p1, v1, a1, j1, t1 = evaluate_dt(prof_high, Ts)
+p2, v2, a2, j2, t2 = evaluate_dt(prof_med, Ts)
+p3, v3, a3, j3, t3 = evaluate_dt(prof_low, Ts)
 
 plot(
     plot(t1, p1, label="jmax=5000", ylabel="Position"),
@@ -203,21 +194,18 @@ The algorithm handles arbitrary initial states, including non-zero velocity and 
 using TrajectoryLimiters
 using Plots
 
-lim = JerkLimiter(10.0, 50.0, 1000.0)
+lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
 
 # Start with initial velocity v0=5, plan to rest at position 3
-p0, v0, a0, pf, vf = 0.0, 5.0, 0.0, 3.0, 0.0
-profile = calculate_trajectory(lim, p0, v0, a0, pf, vf)
+profile = calculate_trajectory(lim; v0=5.0, pf=3.0)
 
 # Sample and plot
-T = profile.t_sum[7]
-ts = 0:0.001:T
-data = [evaluate_at(profile, t) for t in ts]
+pos, vel, acc, jerk, ts = evaluate_dt(profile)
 
 plot(
-    plot(ts, [d[1] for d in data], ylabel="Position", label=""),
-    plot(ts, [d[2] for d in data], ylabel="Velocity", label=""),
-    plot(ts, [d[3] for d in data], ylabel="Acceleration", label=""),
+    plot(ts, pos, ylabel="Position", label=""),
+    plot(ts, vel, ylabel="Velocity", label=""),
+    plot(ts, acc, ylabel="Acceleration", label=""),
     layout=(3,1), xlabel="Time [s]", size=(600,450)
 )
 hline!([0], sp=2, ls=:dash, c=:gray, label="")
@@ -228,15 +216,15 @@ hline!([0], sp=3, ls=:dash, c=:gray, label="")
 
 ### Asymmetric Limits
 
-For applications where positive and negative motion have different constraints (e.g., gravity-affected systems), use the full constructor:
+For applications where positive and negative motion have different constraints (e.g., gravity-affected systems), specify the directional limits:
 
 ```julia
 # Different limits for positive/negative directions
-vmax, vmin = 10.0, -5.0    # Can move faster in positive direction
-amax, amin = 50.0, -30.0   # Can accelerate faster than decelerate
-jmax = 1000.0
-
-lim = JerkLimiter(vmax, vmin, amax, amin, jmax)
+lim = JerkLimiter(;
+    vmax=10.0, vmin=-5.0,    # Can move faster in positive direction
+    amax=50.0, amin=-30.0,   # Can accelerate faster than decelerate
+    jmax=1000.0
+)
 ```
 
 ### Profile Structure

@@ -7,7 +7,7 @@
 using StaticArrays
 
 export JerkLimiter, RuckigProfile
-export calculate_trajectory, evaluate_at
+export calculate_trajectory, evaluate_at, evaluate_dt
 
 #=============================================================================
  Constants (matching reference implementation)
@@ -77,6 +77,9 @@ end
 
 RuckigProfile(::Type{T}) where T = RuckigProfile{T}()
 
+# Allow RuckigProfile to broadcast as a scalar
+Base.Broadcast.broadcastable(p::RuckigProfile) = Ref(p)
+
 """
     Roots{T}
 
@@ -132,6 +135,16 @@ end
     JerkLimiter{T}
 
 Jerk-limited trajectory generator with directional limits.
+
+# Constructor
+    JerkLimiter(; vmax, amax, jmax, vmin=-vmax, amin=-amax)
+
+# Arguments
+- `vmax`: Maximum velocity
+- `amax`: Maximum acceleration
+- `jmax`: Maximum jerk
+- `vmin`: Minimum velocity (default: `-vmax`)
+- `amin`: Minimum acceleration (default: `-amax`)
 """
 struct JerkLimiter{T}
     vmax::T
@@ -142,13 +155,10 @@ struct JerkLimiter{T}
     roots::Roots{Float64}  # Always Float64 since polynomial roots are floating-point
 end
 
-function JerkLimiter(vmax, vmin, amax, amin, jmax)
+function JerkLimiter(; vmax, amax, jmax, vmin=-vmax, amin=-amax)
     T = promote_type(typeof(vmax), typeof(vmin), typeof(amax), typeof(amin), typeof(jmax))
-    # Roots are always Float64 since polynomial solving produces floating-point results
     JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}())
 end
-
-JerkLimiter(vmax, amax, jmax) = JerkLimiter(vmax, -vmax, amax, -amax, jmax)
 
 #=============================================================================
  Polynomial Root Finding (matching reference implementation)
@@ -1125,16 +1135,63 @@ function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
     return p, v, a, jk
 end
 
+"""
+    evaluate_at(profile, ts::AbstractVector)
+
+Evaluate the trajectory at multiple time points.
+
+Returns a tuple of vectors `(positions, velocities, accelerations, jerks)`.
+"""
+function evaluate_at(profile::RuckigProfile{T}, ts::AbstractVector) where T
+    n = length(ts)
+    positions = Vector{T}(undef, n)
+    velocities = Vector{T}(undef, n)
+    accelerations = Vector{T}(undef, n)
+    jerks = Vector{T}(undef, n)
+
+    @inbounds for i in eachindex(ts)
+        p, v, a, j = evaluate_at(profile, ts[i])
+        positions[i] = p
+        velocities[i] = v
+        accelerations[i] = a
+        jerks[i] = j
+    end
+
+    return positions, velocities, accelerations, jerks
+end
+
+"""
+    evaluate_dt(profile, Ts)
+
+Evaluate the trajectory at regular time intervals from 0 to the total duration.
+
+Returns `(positions, velocities, accelerations, jerks, ts)` where `ts` is the time vector.
+"""
+function evaluate_dt(profile::RuckigProfile, Ts)
+    T = profile.t_sum[7]
+    ts = 0:Ts:T
+    pos, vel, acc, jerk = evaluate_at(profile, ts)
+    pos, vel, acc, jerk, ts
+end
+
 #=============================================================================
  High-Level API
 =============================================================================#
 
 """
-    calculate_trajectory(lim::JerkLimiter, p0, v0, a0, pf, vf=0)
+    calculate_trajectory(lim::JerkLimiter; pf, p0=0, v0=0, a0=0, vf=0)
 
 Calculate time-optimal trajectory from (p0, v0, a0) to (pf, vf, 0).
+
+# Arguments
+- `lim`: JerkLimiter with velocity, acceleration, and jerk constraints
+- `pf`: Target position (required)
+- `p0`: Initial position (default: 0)
+- `v0`: Initial velocity (default: 0)
+- `a0`: Initial acceleration (default: 0)
+- `vf`: Target velocity (default: 0)
 """
-function calculate_trajectory(lim::JerkLimiter{T}, p0, v0, a0, pf, vf=zero(T)) where T
+function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a0=zero(T), vf=zero(T)) where T
     profile = find_profile(lim, p0, v0, a0, pf, vf)
 
     if profile === nothing
