@@ -958,16 +958,109 @@ function time_vel_two_step!(profile::RuckigProfile{T}, p0, v0, a0, pf, vf, af,
     return false
 end
 
+
 #=============================================================================
- Main Profile Search
+ State Evaluation
 =============================================================================#
 
 """
-    find_profile(lim, p0, v0, a0, pf, vf, af) -> RuckigProfile or nothing
+    evaluate_at(profile::RuckigProfile, t) -> (p, v, a, j)
 
-Find a valid time-optimal profile. Tries profiles in order of complexity.
+Evaluate profile at time t.
 """
-function find_profile(lim::JerkLimiter{T}, p0, v0, a0, pf, vf, af=zero(T)) where T
+function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
+    T_total = profile.t_sum[7]
+
+    if t <= 0
+        return profile.p[1], profile.v[1], profile.a[1], profile.j[1]
+    end
+
+    if t >= T_total
+        return profile.p[8], profile.v[8], profile.a[8], zero(T)
+    end
+
+    # Find phase
+    phase = 1
+    @inbounds for k in 1:7
+        if t <= profile.t_sum[k]
+            phase = k
+            break
+        end
+    end
+
+    t_start = phase == 1 ? zero(T) : profile.t_sum[phase-1]
+    dt = t - t_start
+
+    pk = profile.p[phase]
+    vk = profile.v[phase]
+    ak = profile.a[phase]
+    jk = profile.j[phase]
+
+    p = pk + dt * (vk + dt * (ak / 2 + dt * jk / 6))
+    v = vk + dt * (ak + dt * jk / 2)
+    a = ak + dt * jk
+
+    return p, v, a, jk
+end
+
+"""
+    evaluate_at(profile, ts::AbstractVector)
+
+Evaluate the trajectory at multiple time points.
+
+Returns a tuple of vectors `(positions, velocities, accelerations, jerks)`.
+"""
+function evaluate_at(profile::RuckigProfile{T}, ts::AbstractVector) where T
+    n = length(ts)
+    positions = Vector{T}(undef, n)
+    velocities = Vector{T}(undef, n)
+    accelerations = Vector{T}(undef, n)
+    jerks = Vector{T}(undef, n)
+
+    @inbounds for i in eachindex(ts)
+        p, v, a, j = evaluate_at(profile, ts[i])
+        positions[i] = p
+        velocities[i] = v
+        accelerations[i] = a
+        jerks[i] = j
+    end
+
+    return positions, velocities, accelerations, jerks
+end
+
+"""
+    evaluate_dt(profile, Ts)
+
+Evaluate the trajectory at regular time intervals from 0 to the total duration.
+
+Returns `(positions, velocities, accelerations, jerks, ts)` where `ts` is the time vector.
+"""
+function evaluate_dt(profile::RuckigProfile, Ts)
+    T = profile.t_sum[7]
+    ts = 0:Ts:T
+    pos, vel, acc, jerk = evaluate_at(profile, ts)
+    pos, vel, acc, jerk, ts
+end
+
+#=============================================================================
+ High-Level API
+=============================================================================#
+
+"""
+    calculate_trajectory(lim::JerkLimiter; pf, p0=0, v0=0, a0=0, vf=0)
+
+Calculate time-optimal trajectory from (p0, v0, a0) to (pf, vf, 0).
+
+# Arguments
+- `lim`: JerkLimiter with velocity, acceleration, and jerk constraints
+- `p0`: Initial position (default: 0)
+- `v0`: Initial velocity (default: 0)
+- `a0`: Initial acceleration (default: 0)
+- `pf`: Target position (required)
+- `vf`: Target velocity (default: 0)
+"""
+function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a0=zero(T), vf=zero(T), af=zero(T)) where T
+
     (; vmax, vmin, amax, amin, jmax) = lim
 
     # Try UP direction first (positive jerk starts the motion)
@@ -1088,115 +1181,6 @@ function find_profile(lim::JerkLimiter{T}, p0, v0, a0, pf, vf, af=zero(T)) where
         end
     end
 
-    return nothing
-end
+    error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, 0)")
 
-#=============================================================================
- State Evaluation
-=============================================================================#
-
-"""
-    evaluate_at(profile::RuckigProfile, t) -> (p, v, a, j)
-
-Evaluate profile at time t.
-"""
-function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
-    T_total = profile.t_sum[7]
-
-    if t <= 0
-        return profile.p[1], profile.v[1], profile.a[1], profile.j[1]
-    end
-
-    if t >= T_total
-        return profile.p[8], profile.v[8], profile.a[8], zero(T)
-    end
-
-    # Find phase
-    phase = 1
-    @inbounds for k in 1:7
-        if t <= profile.t_sum[k]
-            phase = k
-            break
-        end
-    end
-
-    t_start = phase == 1 ? zero(T) : profile.t_sum[phase-1]
-    dt = t - t_start
-
-    pk = profile.p[phase]
-    vk = profile.v[phase]
-    ak = profile.a[phase]
-    jk = profile.j[phase]
-
-    p = pk + dt * (vk + dt * (ak / 2 + dt * jk / 6))
-    v = vk + dt * (ak + dt * jk / 2)
-    a = ak + dt * jk
-
-    return p, v, a, jk
-end
-
-"""
-    evaluate_at(profile, ts::AbstractVector)
-
-Evaluate the trajectory at multiple time points.
-
-Returns a tuple of vectors `(positions, velocities, accelerations, jerks)`.
-"""
-function evaluate_at(profile::RuckigProfile{T}, ts::AbstractVector) where T
-    n = length(ts)
-    positions = Vector{T}(undef, n)
-    velocities = Vector{T}(undef, n)
-    accelerations = Vector{T}(undef, n)
-    jerks = Vector{T}(undef, n)
-
-    @inbounds for i in eachindex(ts)
-        p, v, a, j = evaluate_at(profile, ts[i])
-        positions[i] = p
-        velocities[i] = v
-        accelerations[i] = a
-        jerks[i] = j
-    end
-
-    return positions, velocities, accelerations, jerks
-end
-
-"""
-    evaluate_dt(profile, Ts)
-
-Evaluate the trajectory at regular time intervals from 0 to the total duration.
-
-Returns `(positions, velocities, accelerations, jerks, ts)` where `ts` is the time vector.
-"""
-function evaluate_dt(profile::RuckigProfile, Ts)
-    T = profile.t_sum[7]
-    ts = 0:Ts:T
-    pos, vel, acc, jerk = evaluate_at(profile, ts)
-    pos, vel, acc, jerk, ts
-end
-
-#=============================================================================
- High-Level API
-=============================================================================#
-
-"""
-    calculate_trajectory(lim::JerkLimiter; pf, p0=0, v0=0, a0=0, vf=0)
-
-Calculate time-optimal trajectory from (p0, v0, a0) to (pf, vf, 0).
-
-# Arguments
-- `lim`: JerkLimiter with velocity, acceleration, and jerk constraints
-- `pf`: Target position (required)
-- `p0`: Initial position (default: 0)
-- `v0`: Initial velocity (default: 0)
-- `a0`: Initial acceleration (default: 0)
-- `vf`: Target velocity (default: 0)
-"""
-function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a0=zero(T), vf=zero(T)) where T
-    profile = find_profile(lim, p0, v0, a0, pf, vf)
-
-    if profile === nothing
-        error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, 0)")
-    end
-
-    return profile
 end
