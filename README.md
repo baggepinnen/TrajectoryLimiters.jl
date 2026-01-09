@@ -90,3 +90,159 @@ Taking a single step takes
 julia> @btime $limiter(TrajectoryLimiters.State(0.0), 0.0);
   17.372 ns (0 allocations: 0 bytes)
   ```
+
+## Jerk-Limited Trajectory Generation
+
+This package also includes a `JerkLimiter` for generating time-optimal jerk-limited trajectories. This is based on the Ruckig algorithm:
+
+> Berscheid & Kröger, "Jerk-limited Real-time Trajectory Generation with Arbitrary Target States", pedestrians 2021
+
+Unlike the `TrajectoryLimiter` which filters an existing reference signal, `JerkLimiter` plans point-to-point trajectories that are time-optimal while respecting constraints on:
+- **Velocity**: $v_{\min} \leq v(t) \leq v_{\max}$
+- **Acceleration**: $a_{\min} \leq a(t) \leq a_{\max}$
+- **Jerk** (rate of change of acceleration): $|j(t)| \leq j_{\max}$
+
+### Features
+
+- **Time-optimal**: Generates the fastest possible trajectory within the given constraints
+- **Jerk-limited**: Ensures smooth acceleration profiles (no discontinuities in acceleration)
+- **Arbitrary initial state**: Supports starting from any position, velocity, and acceleration
+- **Non-zero target velocity**: Can plan trajectories that end at a specified velocity (not just rest-to-rest)
+- **Asymmetric limits**: Supports different limits for positive and negative directions
+
+### Basic Usage
+
+```julia
+using TrajectoryLimiters
+
+# Create a jerk limiter with symmetric limits
+vmax = 10.0   # Maximum velocity (±10)
+amax = 50.0   # Maximum acceleration (±50)
+jmax = 1000.0 # Maximum jerk (±1000)
+
+lim = JerkLimiter(vmax, amax, jmax)
+
+# Plan a trajectory from rest at position 0 to rest at position 1
+profile = calculate_trajectory(lim, 0.0, 0.0, 0.0, 1.0)
+
+# Evaluate the trajectory at any time
+t = 0.05
+p, v, a, j = evaluate_at(profile, t)
+```
+
+### Example: Comparing Different Constraint Levels
+
+The following example demonstrates how different jerk limits affect the trajectory smoothness:
+
+```julia
+using TrajectoryLimiters
+using Plots
+
+# Common velocity and acceleration limits
+vmax, amax = 10.0, 50.0
+
+# Three different jerk limits: high, medium, low
+jmax_high = 5000.0   # Sharp acceleration changes
+jmax_med  = 1000.0   # Moderate smoothness
+jmax_low  = 200.0    # Very smooth acceleration
+
+lim_high = JerkLimiter(vmax, amax, jmax_high)
+lim_med  = JerkLimiter(vmax, amax, jmax_med)
+lim_low  = JerkLimiter(vmax, amax, jmax_low)
+
+# Plan trajectories from (p=0, v=0, a=0) to (p=2, v=0)
+p0, v0, a0, pf = 0.0, 0.0, 0.0, 2.0
+
+prof_high = calculate_trajectory(lim_high, p0, v0, a0, pf)
+prof_med  = calculate_trajectory(lim_med, p0, v0, a0, pf)
+prof_low  = calculate_trajectory(lim_low, p0, v0, a0, pf)
+
+# Sample trajectories for plotting
+function sample_profile(prof, dt=0.001)
+    T = prof.t_sum[7]
+    ts = 0:dt:T
+    data = [evaluate_at(prof, t) for t in ts]
+    ts, [d[1] for d in data], [d[2] for d in data], [d[3] for d in data], [d[4] for d in data]
+end
+
+t1, p1, v1, a1, j1 = sample_profile(prof_high)
+t2, p2, v2, a2, j2 = sample_profile(prof_med)
+t3, p3, v3, a3, j3 = sample_profile(prof_low)
+
+plot(
+    plot(t1, p1, label="jmax=5000", ylabel="Position"),
+    plot(t1, v1, label="jmax=5000", ylabel="Velocity"),
+    plot(t1, a1, label="jmax=5000", ylabel="Acceleration"),
+    plot(t1, j1, label="jmax=5000", ylabel="Jerk"),
+    layout=(4,1), size=(600,600), legend=:right
+)
+plot!(t2, p2, label="jmax=1000", sp=1)
+plot!(t2, v2, label="jmax=1000", sp=2)
+plot!(t2, a2, label="jmax=1000", sp=3)
+plot!(t2, j2, label="jmax=1000", sp=4)
+plot!(t3, p3, label="jmax=200", sp=1)
+plot!(t3, v3, label="jmax=200", sp=2)
+plot!(t3, a3, label="jmax=200", sp=3)
+plot!(t3, j3, label="jmax=200", sp=4)
+```
+
+![jerk comparison](figs/jerk_comparison.png)
+
+Lower jerk limits produce smoother acceleration profiles at the cost of longer trajectory duration. The jerk (bottom plot) shows how the rate of acceleration change is bounded.
+
+### Example: Trajectory with Initial Velocity
+
+The algorithm handles arbitrary initial states, including non-zero velocity and acceleration:
+
+```julia
+using TrajectoryLimiters
+using Plots
+
+lim = JerkLimiter(10.0, 50.0, 1000.0)
+
+# Start with initial velocity v0=5, plan to rest at position 3
+p0, v0, a0, pf, vf = 0.0, 5.0, 0.0, 3.0, 0.0
+profile = calculate_trajectory(lim, p0, v0, a0, pf, vf)
+
+# Sample and plot
+T = profile.t_sum[7]
+ts = 0:0.001:T
+data = [evaluate_at(profile, t) for t in ts]
+
+plot(
+    plot(ts, [d[1] for d in data], ylabel="Position", label=""),
+    plot(ts, [d[2] for d in data], ylabel="Velocity", label=""),
+    plot(ts, [d[3] for d in data], ylabel="Acceleration", label=""),
+    layout=(3,1), xlabel="Time [s]", size=(600,450)
+)
+hline!([0], sp=2, ls=:dash, c=:gray, label="")
+hline!([0], sp=3, ls=:dash, c=:gray, label="")
+```
+
+![initial velocity](figs/initial_velocity.png)
+
+### Asymmetric Limits
+
+For applications where positive and negative motion have different constraints (e.g., gravity-affected systems), use the full constructor:
+
+```julia
+# Different limits for positive/negative directions
+vmax, vmin = 10.0, -5.0    # Can move faster in positive direction
+amax, amin = 50.0, -30.0   # Can accelerate faster than decelerate
+jmax = 1000.0
+
+lim = JerkLimiter(vmax, vmin, amax, amin, jmax)
+```
+
+### Profile Structure
+
+The algorithm generates a 7-phase trajectory where each phase has constant jerk. The phases are:
+1. Jerk to reach maximum acceleration
+2. Coast at maximum acceleration
+3. Jerk to reduce acceleration
+4. Coast at maximum velocity (if reached)
+5. Jerk to reach minimum acceleration
+6. Coast at minimum acceleration
+7. Jerk to reach target acceleration (zero)
+
+Not all phases are present in every trajectory—shorter moves may skip the coasting phases.
