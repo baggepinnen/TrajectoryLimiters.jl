@@ -319,27 +319,49 @@ We could try to optimize the waypoint velocities in order to minimize the total 
 ```julia
 using Optim
 
-function cost(velocities_and_accelerations)
-    waypoints = [
-        (p = [0.0, 0.0],),
-        (p = [2.0, 1.0], v = velocities_and_accelerations[1:2], a = velocities_and_accelerations[7:8]),
-        (p = [3.0, 3.0], v = velocities_and_accelerations[3:4], a = velocities_and_accelerations[9:10]),
-        (p = [-0.5, 2.0], v = velocities_and_accelerations[5:6], a = velocities_and_accelerations[11:12]),
-        (p = [0.0, 0.0],),
-    ]
+# Fixed waypoint positions (first and last have fixed v=0, a=0)
+positions = [
+    [0.0, 0.0],   # Start
+    [2.0, 1.0],   # Intermediate 1
+    [3.0, 3.0],   # Intermediate 2
+    [-0.5, 2.0],  # Intermediate 3
+    [0.0, 0.0],   # End
+]
+
+ndof = length(positions[1])
+n_intermediate = length(positions) - 2  # Exclude first and last
+
+# Build waypoints from optimization parameters
+# params layout: [v1..., v2..., ..., a1..., a2..., ...] for each intermediate waypoint
+function get_waypoints(params)
+    wps = [(p = positions[1], v=zeros(ndof), a=zeros(ndof))]  # First waypoint (fixed)
+    np = length(positions)
+    for i in 1:n_intermediate
+        push!(wps, (
+            p = positions[i + 1],
+            v = params[(i - 1) * ndof + 1 : i * ndof],
+            a = params[(n_intermediate * ndof) + (i - 1) * ndof + 1 : (n_intermediate * ndof) + i * ndof]
+        ))
+    end
+    push!(wps, (p = positions[end], v=zeros(ndof), a=zeros(ndof)))  # Last waypoint (fixed)
+    return wps
+end
+
+function cost(params)
     try
-        ts, _ = calculate_waypoint_trajectory(lims, waypoints, 0.001)
+        ts, _ = calculate_waypoint_trajectory(lims, get_waypoints(params), 0.001)
         return last(ts)  # Total trajectory time
     catch
         return Inf  # Infeasible trajectory
     end
 end
 
-initial_velocities = zeros(12)  # 3 waypoints * 2 DOF each
+n_params = n_intermediate * ndof * 2  # velocities + accelerations
+initial_params = zeros(n_params)
 
 res = Optim.optimize(
     cost,
-    initial_velocities,
+    initial_params,
     ParticleSwarm(),
     Optim.Options(
         store_trace       = true,
@@ -357,15 +379,7 @@ res = Optim.optimize(
 )
 
 opt = Optim.minimizer(res)
-
-optimal_waypoits = [
-    (p = [0.0, 0.0],),
-    (p = [2.0, 1.0], v = opt[1:2], a = opt[7:8]),
-    (p = [3.0, 3.0], v = opt[3:4], a = opt[9:10]),
-    (p = [-0.5, 2.0], v = opt[5:6], a = opt[11:12]),
-    (p = [0.0, 0.0],),
-]
-ts_opt, pos_opt, vel_opt, acc_opt, jerk_opt = calculate_waypoint_trajectory(lims, optimal_waypoits, 0.001)
+ts_opt, pos_opt, vel_opt, acc_opt, jerk_opt = calculate_waypoint_trajectory(lims, get_waypoints(opt), 0.001)
 plot!(pos_opt[:, 1], pos_opt[:, 2], label="Optimized Path")
 ```
 ![optimized trajectory](https://private-user-images.githubusercontent.com/3797491/533931993-02161a30-0a75-4471-8212-e8d9488192d0.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NjkxNTEsIm5iZiI6MTc2Nzk2ODg1MSwicGF0aCI6Ii8zNzk3NDkxLzUzMzkzMTk5My0wMjE2MWEzMC0wYTc1LTQ0NzEtODIxMi1lOGQ5NDg4MTkyZDAucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMTQyNzMxWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9ZGQ5NmZhODUzMzM1NjZhYWQ5YmQ0NDhkNDI2OTU5NTE5NWYyMDA4NDYwYTY1OWQyM2RjYTdmODIxZjBmMGYxYSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.usNMB6A5Fr1yJR8esDMdCtEvozr5-NBZA_t8Ne7GwkU)
