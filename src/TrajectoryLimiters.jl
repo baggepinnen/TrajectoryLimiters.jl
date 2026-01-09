@@ -31,6 +31,8 @@ module TrajectoryLimiters
 
 export TrajectoryLimiter
 
+include("ruckig.jl")
+
 sat(x) = clamp(x, -one(x), one(x))
 
 """
