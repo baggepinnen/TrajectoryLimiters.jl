@@ -272,11 +272,11 @@ plot(
     layout=(4,1), xlabel="Time [s]", size=(600,700)
 )
 hline!([10 5 8], sp=2, ls=:dash, label="", c=(1:3)')
-hline!([50 30 40], sp=3, ls=:dash, label="", c=(1:3)')
+hline!([50 40 30], sp=3, ls=:dash, label="", c=(1:3)')
 hline!([1000 500 800], sp=4, ls=:dash, label="", c=(1:3)')
 ```
 
-![multi DOF synch](https://private-user-images.githubusercontent.com/3797491/533882036-2afc3934-d2bd-4043-baeb-910ff08fd03f.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NjEzOTMsIm5iZiI6MTc2Nzk2MTA5MywicGF0aCI6Ii8zNzk3NDkxLzUzMzg4MjAzNi0yYWZjMzkzNC1kMmJkLTQwNDMtYmFlYi05MTBmZjA4ZmQwM2YucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMTIxODEzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9Y2FmZmVmZDA5ZTUzNWMxYTJhYTk4MjUyNTdhNWM4ZmE2ZDQ2NGI1MjQ5ZWEzNDNjNzIxNzkxOWFmYjkyNGFkOCZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.329-h_Jy3DHIrLbz3dC75bRFI4e95B7wfl4FfqNKjCs)
+![multi DOF synch](https://private-user-images.githubusercontent.com/3797491/533966423-4c2bf06e-d985-4aac-8286-bc517f72ef51.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3Njc5NzM0ODMsIm5iZiI6MTc2Nzk3MzE4MywicGF0aCI6Ii8zNzk3NDkxLzUzMzk2NjQyMy00YzJiZjA2ZS1kOTg1LTRhYWMtODI4Ni1iYzUxN2Y3MmVmNTEucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDEwOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAxMDlUMTUzOTQzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9YmJiMDVmMGQwMDY4YjJmODNmNGYxMzBkNjUxZTAxODcyOGFjZDU4MzY3NWVlZDJhZTU2ZmEwYTYzZDIxMjBkMyZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.jhKbOsmt6F6RVD2ph8f1lMSn4z7BMDOXlLoj-UBcjRw)
 
 The image shows how different parts of the trajectory is limited by different degrees of freedom, all three DOF start and reach the end at the same time.
 
