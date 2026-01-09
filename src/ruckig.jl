@@ -1600,6 +1600,197 @@ function time_acc0_acc1_vel_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
 end
 
 """
+    time_acc1_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with ACC1 and velocity limit.
+"""
+function time_acc1_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                              p0, v0, a0, pf, vf, af,
+                              vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+
+    # Profile UDDU
+    ph1 = a0_a0 + af_af - aMin*(a0 + 2*af - aMin) - 2*jMax*(vd - aMin*tf)
+    ph2 = 2*aMin*(jMax*g1 + af*vd) - aMin^2*vd + jMax*vd_vd
+    ph3 = af_af + aMin*(aMin - 2*af) - 2*jMax*(vd - aMin*tf)
+
+    polynom_0 = (2*(2*a0 - aMin))/jMax
+    polynom_1 = (4*a0_a0 + ph1 - 3*a0*aMin)/jMax_jMax
+    polynom_2 = (2*a0*ph1)/(jMax_jMax*jMax)
+    polynom_3 = (3*(a0_p4 + af_p4) - 4*(a0_p3 + 2*af_p3)*aMin + 6*af_af*(aMin^2 - 2*jMax*vd) +
+                 12*jMax*ph2 + 6*a0_a0*ph3)/(12*jMax_jMax*jMax_jMax)
+
+    t_min = -a0/jMax
+    t_max = min(tf + 2*aMin/jMax - (a0 + af)/jMax, 2*(aMax - a0)/jMax) / 2
+
+    for t in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+        (t < t_min || t > t_max) && continue
+
+        # Newton refinement
+        if abs(a0 + jMax*t) > 16*EPS
+            h0 = jMax*t*t
+            h1 = -((a0_a0 + af_af)/2 + jMax*(-vd + 2*a0*t + h0))/aMin
+            orig = -pd + (3*(a0_p4 + af_p4) - 8*af_p3*aMin - 4*a0_p3*aMin +
+                   6*af_af*(aMin^2 + 2*jMax*(h0 - vd)) +
+                   6*a0_a0*(af_af - 2*af*aMin + aMin^2 + 2*aMin*jMax*(-2*t + tf) + 2*jMax*(5*h0 - vd)) +
+                   24*a0*jMax*t*(a0_a0 + af_af - 2*af*aMin + aMin^2 + 2*jMax*(aMin*(-t + tf) + h0 - vd)) -
+                   24*af*aMin*jMax*(h0 - vd) +
+                   12*jMax*(aMin^2*(h0 - vd) + jMax*(h0 - vd)^2))/(24*aMin*jMax_jMax) +
+                   h0*(tf - t) + tf*v0
+            deriv = (a0 + jMax*t)*((a0_a0 + af_af)/(aMin*jMax) + (aMin - a0 - 2*af)/jMax +
+                    (4*a0*t + 2*h0 - 2*vd)/aMin + 2*tf - 3*t)
+            abs(deriv) > EPS && (t -= orig / deriv)
+        end
+
+        h1 = -((a0_a0 + af_af)/2 + jMax*(-vd + 2*a0*t + jMax*t*t))/aMin
+
+        buf.t[1] = t
+        buf.t[2] = 0
+        buf.t[3] = a0/jMax + t
+        buf.t[4] = tf - (h1 - aMin + a0 + af)/jMax - 2*t
+        buf.t[5] = -aMin/jMax
+        buf.t[6] = (h1 + aMin)/jMax
+        buf.t[7] = buf.t[5] + af/jMax
+
+        if check_step2!(buf, UDDU, LIMIT_ACC1_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # Profile UDUD
+    ph1 = a0_a0 - af_af + (2*af - a0)*aMax - aMax^2 - 2*jMax*(vd - aMax*tf)
+    ph2 = aMax^2 + 2*jMax*vd
+    ph3 = af_af + ph2 - 2*aMax*(af + jMax*tf)
+    ph4 = 2*aMax*jMax*g1 + aMax^2*vd + jMax*vd_vd
+
+    polynom_0 = (4*a0 - 2*aMax)/jMax
+    polynom_1 = (4*a0_a0 - 3*a0*aMax + ph1)/jMax_jMax
+    polynom_2 = (2*a0*ph1)/(jMax_jMax*jMax)
+    polynom_3 = (3*(a0_p4 + af_p4) - 4*(a0_p3 + 2*af_p3)*aMax - 24*af*aMax*jMax*vd +
+                 12*jMax*ph4 - 6*a0_a0*ph3 + 6*af_af*ph2)/(12*jMax_jMax*jMax_jMax)
+
+    t_min = -a0/jMax
+    t_max = min(tf + ad/jMax - 2*aMax/jMax, 2*(aMax - a0)/jMax) / 2
+
+    for t in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+        (t > t_max || t < t_min) && continue
+
+        h1 = ((a0_a0 - af_af)/2 + jMax_jMax*t*t - jMax*(vd - 2*a0*t))/aMax
+
+        buf.t[1] = t
+        buf.t[2] = 0
+        buf.t[3] = t + a0/jMax
+        buf.t[4] = tf + (h1 + ad - aMax)/jMax - 2*t
+        buf.t[5] = aMax/jMax
+        buf.t[6] = -(h1 + aMax)/jMax
+        buf.t[7] = buf.t[5] - af/jMax
+
+        if check_step2!(buf, UDUD, LIMIT_ACC1_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+    time_acc0_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with ACC0 and velocity limit.
+"""
+function time_acc0_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                              p0, v0, a0, pf, vf, af,
+                              vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+
+    # Early exit check
+    tf < max((-a0 + aMax)/jMax, 0.0) + max(aMax/jMax, 0.0) && return false
+    ph1 = 12*jMax*(-aMax^2*vd - jMax*vd_vd + 2*aMax*jMax*(-pd + tf*vf))
+
+    # Profile UDDU
+    polynom_0 = (2*aMax)/jMax
+    polynom_1 = (a0_a0 - af_af + 2*ad*aMax + aMax^2 + 2*jMax*(vd - aMax*tf))/jMax_jMax
+    polynom_2 = 0.0
+    polynom_3 = -(-3*(a0_p4 + af_p4) + 4*(af_p3 + 2*a0_p3)*aMax -
+                  12*a0*aMax*(af_af - 2*jMax*vd) + 6*a0_a0*(af_af - aMax^2 - 2*jMax*vd) +
+                  6*af_af*(aMax^2 - 2*aMax*jMax*tf + 2*jMax*vd) + ph1)/(12*jMax_jMax*jMax_jMax)
+
+    t_min = -af/jMax
+    t_max = min(tf - (2*aMax - a0)/jMax, -aMin/jMax)
+
+    for t in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+        (t < t_min || t > t_max) && continue
+
+        # Newton refinement
+        if t > EPS
+            h1 = jMax*t*t + vd
+            orig = (-3*(a0_p4 + af_p4) + 4*(af_p3 + 2*a0_p3)*aMax - 24*af*aMax*jMax_jMax*t*t -
+                    12*a0*aMax*(af_af - 2*jMax*h1) + 6*a0_a0*(af_af - aMax^2 - 2*jMax*h1) +
+                    6*af_af*(aMax^2 - 2*aMax*jMax*tf + 2*jMax*h1) -
+                    12*jMax*(aMax^2*h1 + jMax*h1^2 + 2*aMax*jMax*(pd + jMax*t*t*(t - tf) - tf*vf)))/(24*aMax*jMax_jMax)
+            deriv = -t*(a0_a0 - af_af + 2*aMax*(ad - jMax*tf) + aMax^2 + 3*aMax*jMax*t + 2*jMax*h1)/aMax
+            abs(deriv) > EPS && (t -= orig / deriv)
+        end
+
+        h1 = ((a0_a0 - af_af)/2 + jMax*(jMax*t*t + vd))/aMax
+
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = (h1 - aMax)/jMax
+        buf.t[3] = aMax/jMax
+        buf.t[4] = tf - (h1 + ad + aMax)/jMax - 2*t
+        buf.t[5] = t
+        buf.t[6] = 0
+        buf.t[7] = af/jMax + t
+
+        if check_step2!(buf, UDDU, LIMIT_ACC0_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # Profile UDUD
+    polynom_0 = (-2*aMax)/jMax
+    polynom_1 = -(a0_a0 + af_af - 2*(a0 + af)*aMax + aMax^2 + 2*jMax*(vd - aMax*tf))/jMax_jMax
+    polynom_2 = 0.0
+    polynom_3 = (3*(a0_p4 + af_p4) - 4*(af_p3 + 2*a0_p3)*aMax +
+                 6*a0_a0*(af_af + aMax^2 + 2*jMax*vd) - 12*a0*aMax*(af_af + 2*jMax*vd) +
+                 6*af_af*(aMax^2 - 2*aMax*jMax*tf + 2*jMax*vd) - ph1)/(12*jMax_jMax*jMax_jMax)
+
+    t_min = af/jMax
+    t_max = min(tf - aMax/jMax, aMax/jMax)
+
+    for t in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+        (t < t_min || t > t_max) && continue
+
+        # Newton refinement
+        h1 = jMax*t*t - vd
+        orig = -(3*(a0_p4 + af_p4) - 4*(2*a0_p3 + af_p3)*aMax + 24*af*aMax*jMax_jMax*t*t -
+                 12*a0*aMax*(af_af - 2*jMax*h1) + 6*a0_a0*(af_af + aMax^2 - 2*jMax*h1) +
+                 6*af_af*(aMax^2 - 2*jMax*(tf*aMax + h1)) +
+                 12*jMax*(-aMax^2*h1 + jMax*h1^2 - 2*aMax*jMax*(-pd + jMax*t*t*(t - tf) + tf*vf)))/(24*aMax*jMax_jMax)
+        deriv = t*(a0_a0 + af_af - 2*jMax*h1 - 2*(a0 + af + jMax*tf)*aMax + aMax^2 + 3*aMax*jMax*t)/aMax
+        abs(deriv) > EPS && (t -= orig / deriv)
+
+        h1 = ((a0_a0 + af_af)/2 + jMax*(vd - jMax*t*t))/aMax
+
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = (h1 - aMax)/jMax
+        buf.t[3] = aMax/jMax
+        buf.t[4] = tf - (h1 - a0 - af + aMax)/jMax - 2*t
+        buf.t[5] = t
+        buf.t[6] = 0
+        buf.t[7] = -(af/jMax) + t
+
+        if check_step2!(buf, UDUD, LIMIT_ACC0_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
     time_acc0_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
 
 Step2 profile reaching both acceleration limits (no velocity limit).
@@ -1671,37 +1862,529 @@ function time_acc0_acc1_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
 end
 
 """
-    time_none_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+    time_acc0_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
 
-Step2 profile with no limits reached.
+Step2 profile with only ACC0 limit reached.
 """
-function time_none_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
+function time_acc0_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
                           p0, v0, a0, pf, vf, af,
                           vMax, vMin, aMax, aMin, jMax) where T
-    (; pd, tf, tf_tf, tf_p3, tf_p4, vd, vd_vd, v0_v0, vf_vf, ad, ad_ad,
-       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+    (; pd, tf, tf_tf, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, jMax_jMax, g1, g2) = pc
 
-    # Special case: start from rest with zero acceleration
-    if abs(v0) < EPS && abs(a0) < EPS && abs(af) < EPS
-        h1_sq = tf_tf*vf_vf + (4*pd - tf*vf)^2
-        h1_sq >= 0 || return false
+    # UDUD case
+    h1_sq = ad_ad/(2*jMax_jMax) - ad*(aMax - a0)/jMax_jMax + (aMax*tf - vd)/jMax
+    if h1_sq >= 0
         h1 = sqrt(h1_sq)
-        jf = 4*(4*pd - 2*tf*vf + h1)/tf_p3
 
-        abs(jf) < EPS && return false
-
-        buf.t[1] = tf/4
-        buf.t[2] = 0
-        buf.t[3] = 2*buf.t[1]
+        buf.t[1] = (aMax - a0)/jMax
+        buf.t[2] = tf - ad/jMax - 2*h1
+        buf.t[3] = h1
         buf.t[4] = 0
-        buf.t[5] = 0
+        buf.t[5] = (af - aMax)/jMax + h1
         buf.t[6] = 0
-        buf.t[7] = buf.t[1]
+        buf.t[7] = 0
 
-        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
+        if check_step2!(buf, UDUD, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
         end
     end
+
+    # UDDU case with t[4] != 0
+    h0a = -a0_a0 + af_af - 2*ad*aMax + 2*jMax*(aMax*tf - vd)
+    h0b = a0_p3 + 2*af_p3 - 6*af_af*aMax - 3*a0_a0*(af - jMax*tf) -
+          3*a0*aMax*(aMax - 2*af + 2*jMax*tf) -
+          3*jMax*(jMax*(-2*pd + aMax*tf_tf + 2*tf*v0) + aMax*(aMax*tf - 2*vd)) +
+          3*af*(aMax^2 + 2*aMax*jMax*tf - 2*jMax*vd)
+    h0_sq = 4*h0b^2 - 18*h0a^3
+    if h0_sq >= 0
+        h0 = abs(jMax) * sqrt(h0_sq)
+        h1 = 3*jMax*h0a
+
+        abs(h1) < EPS && return false
+
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = (-a0_p3 + af_p3 + af_af*(-6*aMax + 3*jMax*tf) +
+                    a0_a0*(-3*af + 6*aMax + 3*jMax*tf) + 6*af*(aMax^2 - jMax*vd) +
+                    3*a0*(af_af - 2*(aMax^2 + jMax*vd)) -
+                    6*jMax*(aMax*(aMax*tf - 2*vd) + jMax*g2))/h1
+        buf.t[3] = -(ad + h0/h1)/(2*jMax) + tf/2 - buf.t[2]/2
+        buf.t[4] = h0/(jMax*h1)
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + buf.t[4])
+
+        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # UDDU Solution 1
+    h0b = a0_a0 + af_af + 2*(aMax^2 - (a0 + af)*aMax + jMax*(vd - aMax*tf))
+    h0a = a0_p3 + 2*af_p3 - 6*(af_af + aMax^2)*aMax - 6*(a0 + af)*aMax*jMax*tf +
+          9*aMax^2*(af + jMax*tf) + 3*a0*aMax*(-2*af + 3*aMax) +
+          3*a0_a0*(af - 2*aMax + jMax*tf) - 6*jMax_jMax*g1 +
+          6*(af - aMax)*jMax*vd - 3*aMax*jMax_jMax*tf_tf
+    h0_sq = 4*h0a^2 - 18*h0b^3
+    if h0_sq >= 0
+        h1 = (jMax > 0 ? 1 : -1) * sqrt(h0_sq)
+        h2 = 6*jMax*h0b
+
+        abs(h2) < EPS && return false
+
+        buf.t[1] = (-a0 + aMax)/jMax
+        buf.t[2] = ad/jMax - 2*buf.t[1] - (2*h0a - h1)/h2 + tf
+        buf.t[3] = -(2*h0a + h1)/h2
+        buf.t[4] = (2*h0a - h1)/h2
+        buf.t[5] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + buf.t[4])
+        buf.t[6] = 0
+        buf.t[7] = 0
+
+        if check_step2!(buf, UDDU, LIMIT_ACC0, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+    time_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with only ACC1 limit reached.
+"""
+function time_acc1_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                          p0, v0, a0, pf, vf, af,
+                          vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, jMax_jMax, g1, g2) = pc
+
+    # UDDU case
+    h0_sq = jMax_jMax*(a0_p4 + af_p4 - 4*af_p3*jMax*tf + 6*af_af*jMax_jMax*tf_tf -
+            4*a0_p3*(af - jMax*tf) + 6*a0_a0*(af - jMax*tf)^2 + 24*af*jMax_jMax*g1 -
+            4*a0*(af_p3 - 3*af_af*jMax*tf + 6*jMax_jMax*(-pd + tf*vf)) -
+            12*jMax_jMax*(-vd_vd + jMax*tf*g2))/3
+    if h0_sq >= 0
+        h0 = sqrt(h0_sq)/jMax
+        h1_sq = (a0_a0 + af_af - 2*a0*af - 2*ad*jMax*tf + 2*h0)/jMax_jMax + tf_tf
+        if h1_sq >= 0
+            h1 = sqrt(h1_sq)
+
+            denom = 2*jMax*(-ad + jMax*tf)
+            abs(denom) < EPS && return false
+
+            buf.t[1] = -(a0_a0 + af_af + 2*a0*(jMax*tf - af) - 2*jMax*vd + h0)/denom
+            buf.t[2] = 0
+            buf.t[3] = (tf - h1)/2 - ad/(2*jMax)
+            buf.t[4] = 0
+            buf.t[5] = 0
+            buf.t[6] = h1
+            buf.t[7] = tf - (buf.t[1] + buf.t[3] + buf.t[6])
+
+            if check_step2!(buf, UDDU, LIMIT_ACC1, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # UDUD case
+    h0_sq = jMax_jMax*(a0_p4 + af_p4 + 4*(af_p3 - a0_p3)*jMax*tf + 6*af_af*jMax_jMax*tf_tf +
+            6*a0_a0*(af + jMax*tf)^2 + 24*af*jMax_jMax*g1 -
+            4*a0*(a0_a0*af + af_p3 + 3*af_af*jMax*tf + 6*jMax_jMax*(-pd + tf*vf)) +
+            12*jMax_jMax*(vd_vd + jMax*tf*g2))/3
+    if h0_sq >= 0
+        h0 = sqrt(h0_sq)/jMax
+        h1_sq = (a0_a0 + af_af - 2*a0*af + 2*ad*jMax*tf + 2*h0)/jMax_jMax + tf_tf
+        if h1_sq >= 0
+            h1 = sqrt(h1_sq)
+
+            denom = 2*jMax*(ad + jMax*tf)
+            abs(denom) < EPS && return false
+
+            buf.t[1] = 0
+            buf.t[2] = 0
+            buf.t[3] = -(a0_a0 + af_af - 2*a0*af + 2*jMax*(vd - a0*tf) + h0)/denom
+            buf.t[4] = 0
+            buf.t[5] = ad/(2*jMax) + (tf - h1)/2
+            buf.t[6] = h1
+            buf.t[7] = tf - (buf.t[6] + buf.t[5] + buf.t[3])
+
+            if check_step2!(buf, UDUD, LIMIT_ACC1, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # UDDU Solution 2
+    h0b = a0_a0 + af_af - 2*(a0 + af)*aMin + 2*(aMin^2 - jMax*(-aMin*tf + vd))
+    h0a = a0_p3 - af_p3 - 3*a0_a0*aMin + 3*aMin^2*(a0 + jMax*tf) +
+          3*af*aMin*(-aMin - 2*jMax*tf) - 3*af_af*(-aMin - jMax*tf) -
+          3*jMax_jMax*(-2*pd - aMin*tf_tf + 2*tf*vf)
+    h0c = a0_p4 + 3*af_p4 - 4*(a0_p3 + 2*af_p3)*aMin + 6*a0_a0*aMin^2 +
+          6*af_af*(aMin^2 - 2*jMax*vd) + 12*jMax*(2*aMin*jMax*g1 - aMin^2*vd + jMax*vd_vd) +
+          24*af*aMin*jMax*vd -
+          4*a0*(af_p3 - 3*af*aMin*(-aMin - 2*jMax*tf) + 3*af_af*(-aMin - jMax*tf) +
+                3*jMax*(-aMin^2*tf + jMax*(-2*pd - aMin*tf_tf + 2*tf*vf)))
+    h0_sq = 4*h0a^2 - 6*h0b*h0c
+    if h0_sq >= 0
+        h1 = (jMax > 0 ? 1 : -1) * sqrt(h0_sq)
+        h2 = 6*jMax*h0b
+
+        abs(h2) < EPS && return false
+
+        buf.t[1] = 0
+        buf.t[2] = 0
+        buf.t[3] = (2*h0a + h1)/h2
+
+        denom = 2*jMax*(a0 - aMin - jMax*buf.t[3])
+        abs(denom) < EPS && return false
+
+        buf.t[4] = -(a0_a0 + af_af - 2*(a0 + af)*aMin + 2*(aMin^2 + aMin*jMax*tf - jMax*vd))/denom
+        buf.t[5] = (a0 - aMin)/jMax - buf.t[3]
+        buf.t[6] = tf - (buf.t[3] + buf.t[4] + buf.t[5] + (af - aMin)/jMax)
+        buf.t[7] = (af - aMin)/jMax
+
+        if check_step2!(buf, UDDU, LIMIT_ACC1, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # UDUD Solution 1
+    h0a = -a0_p3 + af_p3 + 3*(a0_a0 - af_af)*aMax - 3*ad*aMax^2 - 6*af*aMax*jMax*tf +
+          3*af_af*jMax*tf + 3*jMax*(aMax^2*tf + jMax*(-2*pd - aMax*tf_tf + 2*tf*vf))
+    h0b = a0_a0 - af_af + 2*ad*aMax + 2*jMax*(aMax*tf - vd)
+    h0c = a0_p4 + 3*af_p4 - 4*(a0_p3 + 2*af_p3)*aMax + 6*a0_a0*aMax^2 - 24*af*aMax*jMax*vd +
+          12*jMax*(2*aMax*jMax*g1 + jMax*vd_vd + aMax^2*vd) + 6*af_af*(aMax^2 + 2*jMax*vd) -
+          4*a0*(af_p3 + 3*af*aMax*(aMax - 2*jMax*tf) - 3*af_af*(aMax - jMax*tf) +
+                3*jMax*(aMax^2*tf + jMax*(-2*pd - aMax*tf_tf + 2*tf*vf)))
+    h0_sq = 4*h0a^2 - 6*h0b*h0c
+    if h0_sq >= 0
+        h1 = (jMax > 0 ? 1 : -1) * sqrt(h0_sq)
+        h2 = 6*jMax*h0b
+
+        abs(h2) < EPS && return false
+
+        buf.t[1] = 0
+        buf.t[2] = 0
+        buf.t[3] = -(2*h0a + h1)/h2
+        buf.t[4] = 2*h1/h2
+        buf.t[5] = (aMax - a0)/jMax + buf.t[3]
+        buf.t[6] = tf - (buf.t[3] + buf.t[4] + buf.t[5] + (-af + aMax)/jMax)
+        buf.t[7] = (-af + aMax)/jMax
+
+        if check_step2!(buf, UDUD, LIMIT_ACC1, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+    time_none_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with no limits reached.
+"""
+function time_none_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                          p0, v0, a0, pf, vf, af,
+                          vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, tf_p3, tf_p4, vd, vd_vd, v0_v0, vf_vf, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, a0_p5, af_p5, a0_p6, af_p6, jMax_jMax, g1, g2) = pc
+
+    # Special case: start from rest with zero acceleration (v0=a0=af=0)
+    if abs(v0) < EPS && abs(a0) < EPS && abs(af) < EPS
+        h1_sq = tf_tf*vf_vf + (4*pd - tf*vf)^2
+        if h1_sq >= 0
+            h1 = sqrt(h1_sq)
+            jf = 4*(4*pd - 2*tf*vf + h1)/tf_p3
+
+            if abs(jf) > EPS
+                buf.t[1] = tf/4
+                buf.t[2] = 0
+                buf.t[3] = 2*buf.t[1]
+                buf.t[4] = 0
+                buf.t[5] = 0
+                buf.t[6] = 0
+                buf.t[7] = buf.t[1]
+
+                if check_step2!(buf, UDDU, LIMIT_NONE, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
+                    return true
+                end
+            end
+        end
+    end
+
+    # Case a0=af=0: Profile with constant velocity phase (t[3] != 0)
+    if abs(a0) < EPS && abs(af) < EPS
+        # UDDU with constant phase - quartic polynomial
+        polynom_0 = -2*tf
+        polynom_1 = 2*vd/jMax + tf_tf
+        polynom_2 = 4*(pd - tf*vf)/jMax
+        polynom_3 = (vd_vd + jMax*tf*g2)/jMax_jMax
+
+        t_max = min(tf/2, (aMax - a0)/jMax)
+
+        for t_root in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+            (t_root > t_max || t_root < 0) && continue
+            t = t_root
+
+            # Newton refinement
+            denom = jMax*(2*t - tf)
+            if abs(denom) > EPS
+                h1 = (jMax*t*(t - tf) + vd)/denom
+                h2 = (2*jMax*t*(t - tf) + jMax*tf_tf - 2*vd)/(denom*(2*t - tf))
+                orig = (-2*pd + 2*tf*v0 + h1^2*jMax*(tf - 2*t) + jMax*tf*(2*h1*t - t*t - (h1 - t)*tf))/2
+                deriv = (jMax*tf*(2*t - tf)*(h2 - 1))/2 + h1*jMax*(tf - (2*t - tf)*h2 - h1)
+                abs(deriv) > EPS && (t -= orig / deriv)
+            end
+
+            denom = jMax*(2*t - tf)
+            abs(denom) < EPS && continue
+            h1 = (jMax*t*(t - tf) + vd)/denom
+
+            buf.t[1] = t
+            buf.t[2] = 0
+            buf.t[3] = h1
+            buf.t[4] = tf - 2*t
+            buf.t[5] = t - h1
+            buf.t[6] = 0
+            buf.t[7] = 0
+
+            if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # UDUD T 0246 - general case
+    h0_inner = 2*(a0_p3 - af_p3 - 3*af_af*jMax*tf + 9*af*jMax_jMax*tf_tf - 3*a0_a0*(af + jMax*tf) +
+                  3*a0*(af + jMax*tf)^2 + 3*jMax_jMax*(8*pd + jMax*tf_p3 - 8*tf*vf))^2 -
+               3*(a0_a0 + af_af - 2*af*jMax*tf - 2*a0*(af + jMax*tf) - jMax*(jMax*tf_tf + 4*v0 - 4*vf))*
+               (a0_p4 + af_p4 + 4*af_p3*jMax*tf + 6*af_af*jMax_jMax*tf_tf - 3*jMax_jMax*jMax_jMax*tf_p4 -
+                4*a0_p3*(af + jMax*tf) + 6*a0_a0*(af + jMax*tf)^2 -
+                12*af*jMax_jMax*(8*pd + jMax*tf_p3 - 8*tf*v0) + 48*jMax_jMax*vd_vd + 48*jMax_jMax*jMax*tf*g2 -
+                4*a0*(af_p3 + 3*af_af*jMax*tf - 9*af*jMax_jMax*tf_tf - 3*jMax_jMax*(8*pd + jMax*tf_p3 - 8*tf*vf)))
+    if h0_inner >= 0
+        h0 = sqrt(2*jMax_jMax*h0_inner)/jMax
+        h1 = 12*jMax*(-a0_a0 - af_af + 2*af*jMax*tf + 2*a0*(af + jMax*tf) + jMax*(jMax*tf_tf + 4*v0 - 4*vf))
+        h2 = -4*a0_p3 + 4*af_p3 + 12*a0_a0*af - 12*a0*af_af + 48*jMax_jMax*pd +
+             12*(a0_a0 - af_af)*jMax*tf - 24*jMax_jMax*tf*(v0 + vf) + 24*ad*jMax*vd
+        h3 = 2*a0_p3 - 2*af_p3 - 6*a0_a0*af + 6*a0*af_af
+
+        if abs(h1) > EPS
+            buf.t[1] = (h3 - 48*jMax_jMax*(tf*vf - pd) - 6*(a0_a0 + af_af)*jMax*tf +
+                        12*a0*af*jMax*tf + 6*(a0 + 3*af + jMax*tf)*tf_tf*jMax_jMax - h0)/h1
+            buf.t[2] = 0
+            buf.t[3] = (h2 + h0)/h1
+            buf.t[4] = 0
+            buf.t[5] = (-h2 + h0)/h1
+            buf.t[6] = 0
+            buf.t[7] = (-h3 + 48*jMax_jMax*(tf*v0 - pd) - 6*(a0_a0 + af_af)*jMax*tf +
+                        12*a0*af*jMax*tf + 6*(af + 3*a0 + jMax*tf)*tf_tf*jMax_jMax - h0)/h1
+
+            if check_step2!(buf, UDUD, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # UDDU T 0234 - profiles with a3 != 0
+    ph1 = af + jMax*tf
+
+    polynom_0 = -2*(ad + jMax*tf)/jMax
+    polynom_1 = 2*(a0_a0 + af_af + jMax*(af*tf + vd) - 2*a0*ph1)/jMax_jMax + tf_tf
+    polynom_2 = 2*(a0_p3 - af_p3 - 3*af_af*jMax*tf + 3*a0*ph1*(ph1 - a0) - 6*jMax_jMax*(-pd + tf*vf))/(3*jMax_jMax*jMax)
+    polynom_3 = (a0_p4 + af_p4 + 4*af_p3*jMax*tf - 4*a0_p3*ph1 + 6*a0_a0*ph1^2 + 24*jMax_jMax*af*g1 -
+                 4*a0*(af_p3 + 3*af_af*jMax*tf + 6*jMax_jMax*(-pd + tf*vf)) + 6*jMax_jMax*af_af*tf_tf +
+                 12*jMax_jMax*(vd_vd + jMax*tf*g2))/(12*jMax_jMax*jMax_jMax)
+
+    t_min = ad/jMax
+    t_max = min((aMax - a0)/jMax, (ad/jMax + tf) / 2)
+
+    for t_root in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+        (t_root < t_min || t_root > t_max) && continue
+        t = t_root
+
+        # Newton refinement
+        h0 = jMax*(2*t - tf) - ad
+        if abs(h0) > EPS
+            h1 = (ad_ad - 2*af*jMax*t + 2*a0*jMax*(t - tf) + 2*jMax*(jMax*t*(t - tf) + vd))/(2*jMax*h0)
+            h2 = (-ad_ad + 2*jMax_jMax*(tf_tf + t*(t - tf)) + (a0 + af)*jMax*tf - ad*h0 - 2*jMax*vd)/(h0*h0)
+            orig = (-a0_p3 + af_p3 + 3*ad_ad*jMax*(h1 - t) + 3*ad*jMax_jMax*(h1 - t)^2 - 3*a0*af*ad +
+                    3*jMax_jMax*(a0*tf_tf - 2*pd + 2*tf*v0 + h1^2*jMax*(tf - 2*t) + jMax*tf*(2*h1*t - t*t - (h1 - t)*tf)))/(6*jMax_jMax)
+            deriv = (h0*(-ad + jMax*tf)*(h2 - 1))/(2*jMax) + h1*(-ad + jMax*(tf - h1) - h0*h2)
+            abs(deriv) > EPS && (t -= orig / deriv)
+        end
+
+        h0 = jMax*(2*t - tf) - ad
+        abs(h0) < EPS && continue
+        h1 = (ad_ad + 2*jMax*(-a0*tf - ad*t + jMax*t*(t - tf) + vd))/(2*jMax*h0)
+
+        buf.t[1] = t
+        buf.t[2] = 0
+        buf.t[3] = h1
+        buf.t[4] = ad/jMax + tf - 2*t
+        buf.t[5] = tf - (t + h1 + buf.t[4])
+        buf.t[6] = 0
+        buf.t[7] = 0
+
+        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # UDDU T 3456
+    h1 = 3*jMax*(ad_ad + 2*jMax*(a0*tf - vd))
+    h2 = ad_ad + 2*jMax*(a0*tf - vd)
+    if abs(h1) > EPS && h2^3 >= 0
+        h0_inner = 4*(2*(a0_p3 - af_p3) - 6*a0_a0*(af - jMax*tf) + 6*jMax_jMax*g1 +
+                      3*a0*(2*af_af - 2*jMax*af*tf + jMax_jMax*tf_tf) + 6*ad*jMax*vd)^2 - 18*h2^3
+        if h0_inner >= 0
+            h0 = (jMax > 0 ? 1 : -1) * sqrt(h0_inner)/h1
+
+            buf.t[1] = 0
+            buf.t[2] = 0
+            buf.t[3] = 0
+            buf.t[4] = (af_p3 - a0_p3 + 3*(af_af - a0_a0)*jMax*tf - 3*ad*(a0*af + 2*jMax*vd) - 6*jMax_jMax*g2)/h1
+            buf.t[5] = (tf - buf.t[4] - h0)/2 - ad/(2*jMax)
+            buf.t[6] = h0
+            buf.t[7] = (tf - buf.t[4] + ad/jMax - h0)/2
+
+            if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # T 2346 - UDDU with constant phase
+    ph1 = ad_ad + 2*(af + a0)*jMax*tf - jMax*(jMax*tf_tf + 4*vd)
+    if abs(ph1) > EPS
+        ph2 = jMax*tf_tf*g1 - vd*(-2*pd - tf*v0 + 3*tf*vf)
+        ph3 = 5*af_af - 8*af*jMax*tf + 2*jMax*(2*jMax*tf_tf - vd)
+        ph4 = jMax_jMax*tf_p4 - 2*vd_vd + 8*jMax*tf*(-pd + tf*vf)
+        ph5 = 5*af_p4 - 8*af_p3*jMax*tf - 12*af_af*jMax*(jMax*tf_tf + vd) +
+              24*af*jMax_jMax*(-2*pd + jMax*tf_p3 + 2*tf*vf) - 6*jMax_jMax*ph4
+        ph6 = -vd_vd + jMax*tf*(-2*pd + 3*tf*v0 - tf*vf) - af*g2
+
+        polynom_0 = -(4*(a0_p3 - af_p3) - 12*a0_a0*(af - jMax*tf) +
+                      6*a0*(2*af_af - 2*af*jMax*tf + jMax*(jMax*tf_tf - 2*vd)) +
+                      6*af*jMax*(3*jMax*tf_tf + 2*vd) -
+                      6*jMax_jMax*(-4*pd + jMax*tf_p3 - 2*tf*v0 + 6*tf*vf))/(3*jMax*ph1)
+        polynom_1 = -(-a0_p4 - af_p4 + 4*a0_p3*(af - jMax*tf) +
+                      a0_a0*(-6*af_af + 8*af*jMax*tf - 4*jMax*(jMax*tf_tf - vd)) +
+                      2*af_af*jMax*(jMax*tf_tf + 2*vd) -
+                      4*af*jMax_jMax*(-3*pd + jMax*tf_p3 + 2*tf*v0 + tf*vf) +
+                      jMax_jMax*(jMax_jMax*tf_p4 - 8*vd_vd + 4*jMax*tf*(-3*pd + tf*v0 + 2*tf*vf)) +
+                      2*a0*(2*af_p3 - 2*af_af*jMax*tf + af*jMax*(-3*jMax*tf_tf - 4*vd) +
+                            jMax_jMax*(-6*pd + jMax*tf_p3 - 4*tf*v0 + 10*tf*vf)))/(jMax_jMax*ph1)
+        polynom_2 = -(a0_p5 - af_p5 + af_p4*jMax*tf - 5*a0_p4*(af - jMax*tf) + 2*a0_p3*ph3 +
+                      4*af_p3*jMax*(jMax*tf_tf + vd) + 12*jMax_jMax*af*ph6 -
+                      2*a0_a0*(5*af_p3 - 9*af_af*jMax*tf - 6*af*jMax*vd +
+                               6*jMax_jMax*(-2*pd - tf*v0 + 3*tf*vf)) -
+                      12*jMax_jMax*jMax*ph2 + a0*ph5)/(3*jMax_jMax*jMax*ph1)
+        polynom_3 = -(-a0_p6 - af_p6 + 6*a0_p5*(af - jMax*tf) - 48*af_p3*jMax_jMax*g1 +
+                      72*jMax_jMax*jMax*(jMax*g1*g1 + vd_vd*vd + 2*af*g1*vd) - 3*a0_p4*ph3 -
+                      36*af_af*jMax_jMax*vd_vd + 6*af_p4*jMax*vd +
+                      4*a0_p3*(5*af_p3 - 9*af_af*jMax*tf - 6*af*jMax*vd +
+                               6*jMax_jMax*(-2*pd - tf*v0 + 3*tf*vf)) - 3*a0_a0*ph5 +
+                      6*a0*(af_p5 - af_p4*jMax*tf - 4*af_p3*jMax*(jMax*tf_tf + vd) +
+                            12*jMax_jMax*(-af*ph6 + jMax*ph2)))/(18*jMax_jMax*jMax_jMax*ph1)
+
+        t_max = (a0 - aMin)/jMax
+
+        for t_root in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+            t_root > t_max && continue
+            t = t_root
+
+            # Newton refinement
+            h1_inner = ad_ad/2 + jMax*(af*t + (jMax*t - a0)*(t - tf) - vd)
+            if h1_inner >= 0
+                h2_tmp = -ad + jMax*(tf - 2*t)
+                h3 = sqrt(h1_inner)
+                orig = (af_p3 - a0_p3 + 3*af*jMax*t*(af + jMax*t) + 3*a0_a0*(af + jMax*t) -
+                        3*a0*(af_af + 2*af*jMax*t + jMax_jMax*(t*t - tf_tf)) +
+                        3*jMax_jMax*(-2*pd + jMax*t*(t - tf)*tf + 2*tf*v0))/(6*jMax_jMax) -
+                       h3^3/(jMax*abs(jMax)) + ((-ad - jMax*t)*h1_inner)/jMax_jMax
+                deriv = (6*jMax*h2_tmp*h3/abs(jMax) + 2*(-ad - jMax*tf)*h2_tmp -
+                         2*(3*ad_ad + af*jMax*(8*t - 2*tf) + 4*a0*jMax*(-2*t + tf) +
+                            2*jMax*(jMax*t*(3*t - 2*tf) - vd)))/(4*jMax)
+                abs(deriv) > EPS && (t -= orig / deriv)
+            end
+
+            h1_inner = 2*ad_ad + 4*jMax*(ad*t + a0*tf + jMax*t*(t - tf) - vd)
+            h1_inner < 0 && continue
+            h1_val = sqrt(h1_inner)/abs(jMax)
+
+            buf.t[1] = 0
+            buf.t[2] = 0
+            buf.t[3] = t
+            buf.t[4] = tf - 2*t - ad/jMax - h1_val
+            buf.t[5] = h1_val/2
+            buf.t[6] = 0
+            buf.t[7] = tf - (t + buf.t[4] + buf.t[5])
+
+            if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+
+    # T 0124 UDUD
+    ph1 = -ad + jMax*tf
+    if abs(ph1) > EPS
+        ph0 = -2*pd - tf*v0 + 3*tf*vf
+        ph2 = jMax*tf_tf*g1 - vd*ph0
+        ph3 = 5*af_af + 2*jMax*(2*jMax*tf_tf - vd - 4*af*tf)
+        ph4 = jMax_jMax*tf_p4 - 2*vd_vd + 8*jMax*tf*(-pd + tf*vf)
+        ph5 = 5*af_p4 - 8*af_p3*jMax*tf - 12*af_af*jMax*(jMax*tf_tf + vd) +
+              24*af*jMax_jMax*(-2*pd + jMax*tf_p3 + 2*tf*vf) - 6*jMax_jMax*ph4
+        ph6 = -vd_vd + jMax*tf*(-2*pd + 3*tf*v0 - tf*vf)
+        ph7 = 3*jMax_jMax*ph1^2
+
+        abs(ph7) < EPS && @goto skip_t0124
+
+        polynom_0 = (4*af*tf - 2*jMax*tf_tf - 4*vd)/ph1
+        polynom_1 = (-2*(a0_p4 + af_p4) + 8*af_p3*jMax*tf + 6*af_af*jMax_jMax*tf_tf +
+                     8*a0_p3*(af - jMax*tf) - 12*a0_a0*(af - jMax*tf)^2 -
+                     12*af*jMax_jMax*(-pd + jMax*tf_p3 - 2*tf*v0 + 3*tf*vf) +
+                     2*a0*(4*af_p3 - 12*af_af*jMax*tf + 9*af*jMax_jMax*tf_tf -
+                           3*jMax_jMax*(2*pd + jMax*tf_p3 - 2*tf*vf)) +
+                     3*jMax_jMax*(jMax_jMax*tf_p4 + 4*vd_vd - 4*jMax*tf*(pd + tf*v0 - 2*tf*vf)))/ph7
+        polynom_2 = (-a0_p5 + af_p5 - af_p4*jMax*tf + 5*a0_p4*(af - jMax*tf) - 2*a0_p3*ph3 -
+                     4*af_p3*jMax*(jMax*tf_tf + vd) + 12*af_af*jMax_jMax*g2 - 12*af*jMax_jMax*ph6 +
+                     2*a0_a0*(5*af_p3 - 9*af_af*jMax*tf - 6*af*jMax*vd + 6*jMax_jMax*ph0) +
+                     12*jMax_jMax*jMax*ph2 +
+                     a0*(-5*af_p4 + 8*af_p3*jMax*tf + 12*af_af*jMax*(jMax*tf_tf + vd) -
+                         24*af*jMax_jMax*(-2*pd + jMax*tf_p3 + 2*tf*vf) + 6*jMax_jMax*ph4))/(jMax*ph7)
+        polynom_3 = -(a0_p6 + af_p6 - 6*a0_p5*(af - jMax*tf) + 48*af_p3*jMax_jMax*g1 -
+                      72*jMax_jMax*jMax*(jMax*g1*g1 + vd_vd*vd + 2*af*g1*vd) + 3*a0_p4*ph3 -
+                      6*af_p4*jMax*vd + 36*af_af*jMax_jMax*vd_vd -
+                      4*a0_p3*(5*af_p3 - 9*af_af*jMax*tf - 6*af*jMax*vd + 6*jMax_jMax*ph0) + 3*a0_a0*ph5 -
+                      6*a0*(af_p5 - af_p4*jMax*tf - 4*af_p3*jMax*(jMax*tf_tf + vd) +
+                            12*jMax_jMax*(af_af*g2 - af*ph6 + jMax*ph2)))/(6*jMax_jMax*ph7)
+
+        for t_root in solve_quartic_real!(roots, 1.0, polynom_0, polynom_1, polynom_2, polynom_3)
+            (t_root > tf || t_root > (aMax - a0)/jMax) && continue
+            t = t_root
+
+            h1_inner = ad_ad/(2*jMax_jMax) + (a0*(t + tf) - af*t + jMax*t*tf - vd)/jMax
+            h1_inner < 0 && continue
+            h1_val = sqrt(h1_inner)
+
+            buf.t[1] = t
+            buf.t[2] = tf - ad/jMax - 2*h1_val
+            buf.t[3] = h1_val
+            buf.t[4] = 0
+            buf.t[5] = ad/jMax + h1_val - t
+            buf.t[6] = 0
+            buf.t[7] = 0
+
+            if check_step2!(buf, UDUD, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    end
+    @label skip_t0124
 
     # 3-step profile (UZD)
     h1_sq = -ad_ad + jMax*(2*(a0 + af)*tf - 4*vd + jMax*tf_tf)
@@ -1717,6 +2400,37 @@ function time_none_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
         buf.t[7] = 0
 
         if check_step2!(buf, UDDU, LIMIT_NONE, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            return true
+        end
+    end
+
+    # 3-step profile (UZU) - cubic polynomial
+    polynom_0 = ad_ad
+    polynom_1 = ad_ad*tf
+    polynom_2 = (a0_a0 + af_af + 10*a0*af)*tf_tf + 24*(tf*(af*v0 - a0*vf) - pd*ad) + 12*vd_vd
+    polynom_3 = -3*tf*((a0_a0 + af_af + 2*a0*af)*tf_tf - 4*vd*(a0 + af)*tf + 4*vd_vd)
+
+    for t_root in solve_cubic_real!(roots, polynom_0, polynom_1, polynom_2, polynom_3)
+        t_root > tf && continue
+        t = t_root
+
+        denom = tf - t
+        abs(denom) < EPS && continue
+        jf = ad/denom
+
+        abs(jf) < EPS && continue
+        denom2 = 2*jf*t
+        abs(denom2) < EPS && continue
+
+        buf.t[1] = (2*(vd - a0*tf) + ad*(t - tf))/denom2
+        buf.t[2] = t
+        buf.t[3] = 0
+        buf.t[4] = 0
+        buf.t[5] = 0
+        buf.t[6] = 0
+        buf.t[7] = tf - (buf.t[1] + buf.t[2])
+
+        if check_step2!(buf, UDDU, LIMIT_NONE, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
             return true
         end
     end
@@ -1741,14 +2455,337 @@ function time_none_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
 end
 
 """
-    calculate_profile_step2!(buf, tf, p0, v0, a0, pf, vf, af, jMax, vmax, vmin, amax, amin)
+    time_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+
+Step2 profile with velocity limit only (no ACC0 or ACC1).
+"""
+function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComputed,
+                         p0, v0, a0, pf, vf, af,
+                         vMax, vMin, aMax, aMin, jMax) where T
+    (; pd, tf, tf_tf, vd, vd_vd, ad, ad_ad,
+       a0_a0, af_af, a0_p3, af_p3, a0_p4, af_p4, a0_p6, af_p6, jMax_jMax, g1, g2) = pc
+
+    tz_min = max(0.0, -a0/jMax)
+    tz_max = min((tf - a0/jMax)/2, (aMax - a0)/jMax)
+
+    # Profile UDDU - simple case when v0=a0=vf=af=0
+    if abs(v0) < EPS && abs(a0) < EPS && abs(vf) < EPS && abs(af) < EPS
+        # Solve cubic: t³ - (tf/2)t² + pd/(2*jMax) = 0
+        for t_root in solve_cubic_real!(roots, 1.0, -tf/2, 0.0, pd/(2*jMax))
+            t_root > tf/4 && continue
+            t = t_root
+
+            # Newton refinement
+            if t > EPS
+                orig = -pd + jMax*t*t*(tf - 2*t)
+                deriv = 2*jMax*t*(tf - 3*t)
+                abs(deriv) > EPS && (t -= orig / deriv)
+            end
+
+            buf.t[1] = t
+            buf.t[2] = 0
+            buf.t[3] = t
+            buf.t[4] = tf - 4*t
+            buf.t[5] = t
+            buf.t[6] = 0
+            buf.t[7] = t
+
+            if check_step2!(buf, UDDU, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+        end
+    else
+        # UDDU - general case with 5th order polynomial
+        p1 = af_af - 2*jMax*(-2*af*tf + jMax*tf_tf + 3*vd)
+        ph1 = af_p3 - 3*jMax_jMax*g1 - 3*af*jMax*vd
+        ph2 = af_p4 + 8*af_p3*jMax*tf + 12*jMax*(3*jMax*vd_vd - af_af*vd + 2*af*jMax*(g1 - tf*vd) - 2*jMax_jMax*tf*g1)
+        ph3 = a0*(af - jMax*tf)
+        ph4 = jMax*(-ad + jMax*tf)
+
+        abs(ph4) < EPS && @goto udud_general
+
+        # 5th order polynomial coefficients
+        polynom_0 = (15*a0_a0 + af_af + 4*af*jMax*tf - 16*ph3 - 2*jMax*(jMax*tf_tf + 3*vd))/(4*ph4)
+        polynom_1 = (29*a0_p3 - 2*af_p3 - 33*a0*ph3 + 6*jMax_jMax*g1 + 6*af*jMax*vd + 6*a0*p1)/(6*jMax*ph4)
+        polynom_2 = (61*a0_p4 - 76*a0_a0*ph3 - 16*a0*ph1 + 30*a0_a0*p1 + ph2)/(24*jMax_jMax*ph4)
+        polynom_3 = (a0*(7*a0_p4 - 10*a0_a0*ph3 - 4*a0*ph1 + 6*a0_a0*p1 + ph2))/(12*jMax_jMax*jMax*ph4)
+        polynom_4 = (7*a0_p6 + af_p6 - 12*a0_p4*ph3 + 48*af_p3*jMax_jMax*g1 - 8*a0_p3*ph1 -
+                     72*jMax_jMax*jMax*(jMax*g1*g1 + vd_vd*vd + 2*af*g1*vd) - 6*af_p4*jMax*vd +
+                     36*af_af*jMax_jMax*vd_vd + 9*a0_p4*p1 + 3*a0_a0*ph2)/(144*jMax_jMax*jMax_jMax*ph4)
+
+        # Solve quintic using quartic derivative to find intervals
+        deriv_0 = 5.0
+        deriv_1 = 4*polynom_0
+        deriv_2 = 3*polynom_1
+        deriv_3 = 2*polynom_2
+        deriv_4 = polynom_3
+
+        tz_current = tz_min
+
+        for tz in solve_quartic_real!(roots, deriv_0, deriv_1, deriv_2, deriv_3, deriv_4)
+            tz >= tz_max && continue
+            tz < tz_min && continue
+
+            # Evaluate polynomial at tz and tz_current
+            val_current = polynom_4 + tz_current*(polynom_3 + tz_current*(polynom_2 + tz_current*(polynom_1 + tz_current*(polynom_0 + tz_current))))
+            val_new = polynom_4 + tz*(polynom_3 + tz*(polynom_2 + tz*(polynom_1 + tz*(polynom_0 + tz))))
+
+            if val_current * val_new < 0
+                # Root in interval - use bisection
+                t = shrink_interval_poly5(polynom_0, polynom_1, polynom_2, polynom_3, polynom_4, tz_current, tz)
+
+                # Newton refinement
+                h1_sq = (a0_a0 + af_af)/(2*jMax_jMax) + (2*a0*t + jMax*t*t - vd)/jMax
+                if h1_sq >= 0
+                    h1 = sqrt(h1_sq)
+                    orig = -pd - (2*a0_p3 + 4*af_p3 + 24*a0*jMax*t*(af + jMax*(h1 + t - tf)) +
+                           6*a0_a0*(af + jMax*(2*t - tf)) + 6*(a0_a0 + af_af)*jMax*h1 +
+                           12*af*jMax*(jMax*t*t - vd) +
+                           12*jMax_jMax*(jMax*t*t*(h1 + t - tf) - tf*v0 - h1*vd))/(12*jMax_jMax)
+                    deriv_newton = -(a0 + jMax*t)*(3*(h1 + t) - 2*tf + (a0 + 2*af)/jMax)
+                    if !isnan(orig) && !isnan(deriv_newton) && abs(deriv_newton) > EPS
+                        t -= orig / deriv_newton
+                    end
+                end
+
+                h1_sq = (a0_a0 + af_af)/(2*jMax_jMax) + (t*(2*a0 + jMax*t) - vd)/jMax
+                h1_sq < 0 && (tz_current = tz; continue)
+                h1 = sqrt(h1_sq)
+
+                buf.t[1] = t
+                buf.t[2] = 0
+                buf.t[3] = t + a0/jMax
+                buf.t[4] = tf - 2*(t + h1) - (a0 + af)/jMax
+                buf.t[5] = h1
+                buf.t[6] = 0
+                buf.t[7] = h1 + af/jMax
+
+                if check_step2!(buf, UDDU, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                    return true
+                end
+            end
+            tz_current = tz
+        end
+
+        # Check interval from last extrema to tz_max
+        val_current = polynom_4 + tz_current*(polynom_3 + tz_current*(polynom_2 + tz_current*(polynom_1 + tz_current*(polynom_0 + tz_current))))
+        val_max = polynom_4 + tz_max*(polynom_3 + tz_max*(polynom_2 + tz_max*(polynom_1 + tz_max*(polynom_0 + tz_max))))
+        if val_current * val_max < 0
+            t = shrink_interval_poly5(polynom_0, polynom_1, polynom_2, polynom_3, polynom_4, tz_current, tz_max)
+
+            h1_sq = (a0_a0 + af_af)/(2*jMax_jMax) + (t*(2*a0 + jMax*t) - vd)/jMax
+            if h1_sq >= 0
+                h1 = sqrt(h1_sq)
+
+                buf.t[1] = t
+                buf.t[2] = 0
+                buf.t[3] = t + a0/jMax
+                buf.t[4] = tf - 2*(t + h1) - (a0 + af)/jMax
+                buf.t[5] = h1
+                buf.t[6] = 0
+                buf.t[7] = h1 + af/jMax
+
+                if check_step2!(buf, UDDU, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                    return true
+                end
+            end
+        end
+    end
+
+    @label udud_general
+    # Profile UDUD - general case with 6th order polynomial
+    if !(abs(v0) < EPS && abs(a0) < EPS && abs(vf) < EPS && abs(af) < EPS)
+        ph1 = af_af - 2*jMax*(2*af*tf + jMax*tf_tf - 3*vd)
+        ph2 = af_p3 - 3*jMax_jMax*g1 + 3*af*jMax*vd
+        ph3 = 2*jMax*tf*g1 + 3*vd_vd
+        ph4 = af_p4 - 8*af_p3*jMax*tf + 12*jMax*(jMax*ph3 + af_af*vd + 2*af*jMax*(g1 - tf*vd))
+        ph5 = af + jMax*tf
+
+        # 6th order polynomial coefficients
+        polynom_0 = (5*a0 - ph5)/jMax
+        polynom_1 = (39*a0_a0 - ph1 - 16*a0*ph5)/(4*jMax_jMax)
+        polynom_2 = (55*a0_p3 - 33*a0_a0*ph5 - 6*a0*ph1 + 2*ph2)/(6*jMax_jMax*jMax)
+        polynom_3 = (101*a0_p4 + ph4 - 76*a0_p3*ph5 - 30*a0_a0*ph1 + 16*a0*ph2)/(24*jMax_jMax*jMax_jMax)
+        polynom_4 = (a0*(11*a0_p4 + ph4 - 10*a0_p3*ph5 - 6*a0_a0*ph1 + 4*a0*ph2))/(12*jMax_jMax*jMax_jMax*jMax)
+        polynom_5 = (11*a0_p6 - af_p6 - 12*a0_p4*(a0*ph5) - 48*af_p3*jMax_jMax*g1 - 9*a0_p4*ph1 +
+                     72*jMax_jMax*jMax*(jMax*g1*g1 - vd_vd*vd - 2*af*g1*vd) - 6*af_p4*jMax*vd -
+                     36*af_af*jMax_jMax*vd_vd + 8*a0_p3*ph2 + 3*a0_a0*ph4)/(144*jMax_jMax*jMax_jMax*jMax_jMax)
+
+        # Solve using quintic derivative to find intervals
+        deriv_0 = 6.0
+        deriv_1 = 5*polynom_0
+        deriv_2 = 4*polynom_1
+        deriv_3 = 3*polynom_2
+        deriv_4 = 2*polynom_3
+        deriv_5 = polynom_4
+
+        # Use quartic solution on 4th derivative to find extrema
+        dderiv_0 = 30.0
+        dderiv_1 = 20*polynom_0
+        dderiv_2 = 12*polynom_1
+        dderiv_3 = 6*polynom_2
+        dderiv_4 = 2*polynom_3
+
+        dd_tz_current = tz_min
+        intervals = NTuple{2,T}[]
+
+        for tz in solve_quartic_real!(roots, dderiv_0, dderiv_1, dderiv_2, dderiv_3, dderiv_4)
+            tz >= tz_max && continue
+            tz < tz_min && continue
+
+            # Check sign change in 1st derivative
+            val_current = deriv_5 + dd_tz_current*(deriv_4 + dd_tz_current*(deriv_3 + dd_tz_current*(deriv_2 + dd_tz_current*(deriv_1 + dd_tz_current*deriv_0))))
+            val_new = deriv_5 + tz*(deriv_4 + tz*(deriv_3 + tz*(deriv_2 + tz*(deriv_1 + tz*deriv_0))))
+
+            if val_current * val_new < 0
+                push!(intervals, (dd_tz_current, tz))
+            end
+            dd_tz_current = tz
+        end
+
+        # Check last interval
+        val_current = deriv_5 + dd_tz_current*(deriv_4 + dd_tz_current*(deriv_3 + dd_tz_current*(deriv_2 + dd_tz_current*(deriv_1 + dd_tz_current*deriv_0))))
+        val_max = deriv_5 + tz_max*(deriv_4 + tz_max*(deriv_3 + tz_max*(deriv_2 + tz_max*(deriv_1 + tz_max*deriv_0))))
+        if val_current * val_max < 0
+            push!(intervals, (dd_tz_current, tz_max))
+        end
+
+        tz_current = tz_min
+
+        for (int_lo, int_hi) in intervals
+            # Find root of derivative in interval (extremum of polynomial)
+            tz = shrink_interval_poly5(deriv_1/deriv_0, deriv_2/deriv_0, deriv_3/deriv_0, deriv_4/deriv_0, deriv_5/deriv_0, int_lo, int_hi)
+
+            tz >= tz_max && continue
+
+            # Evaluate polynomial at tz
+            p_val = polynom_5 + tz*(polynom_4 + tz*(polynom_3 + tz*(polynom_2 + tz*(polynom_1 + tz*(polynom_0 + tz)))))
+
+            # Check if extremum is close to zero (root)
+            ddval = dderiv_4 + tz*(dderiv_3 + tz*(dderiv_2 + tz*(dderiv_1 + tz*dderiv_0)))
+            if abs(p_val) < 64 * abs(ddval) * 1e-12
+                t = tz
+            else
+                # Check for sign change
+                p_val_current = polynom_5 + tz_current*(polynom_4 + tz_current*(polynom_3 + tz_current*(polynom_2 + tz_current*(polynom_1 + tz_current*(polynom_0 + tz_current)))))
+                if p_val_current * p_val < 0
+                    t = shrink_interval_poly6(polynom_0, polynom_1, polynom_2, polynom_3, polynom_4, polynom_5, tz_current, tz)
+                else
+                    tz_current = tz
+                    continue
+                end
+            end
+
+            # Double Newton step
+            h1_sq = (af_af - a0_a0)/(2*jMax_jMax) - ((2*a0 + jMax*t)*t - vd)/jMax
+            if h1_sq >= 0
+                h1 = sqrt(h1_sq)
+                orig = -pd + (af_p3 - a0_p3 + 3*a0_a0*jMax*(tf - 2*t))/(6*jMax_jMax) + (2*a0 + jMax*t)*t*(tf - t) + (jMax*h1 - af)*h1*h1 + tf*v0
+                deriv_newton = (a0 + jMax*t)*(2*(af + jMax*tf) - 3*jMax*(h1 + t) - a0)/jMax
+
+                if abs(deriv_newton) > EPS
+                    t -= orig / deriv_newton
+
+                    h1_sq = (af_af - a0_a0)/(2*jMax_jMax) - ((2*a0 + jMax*t)*t - vd)/jMax
+                    if h1_sq >= 0
+                        h1 = sqrt(h1_sq)
+                        orig = -pd + (af_p3 - a0_p3 + 3*a0_a0*jMax*(tf - 2*t))/(6*jMax_jMax) + (2*a0 + jMax*t)*t*(tf - t) + (jMax*h1 - af)*h1*h1 + tf*v0
+                        if abs(orig) > 1e-9
+                            deriv_newton = (a0 + jMax*t)*(2*(af + jMax*tf) - 3*jMax*(h1 + t) - a0)/jMax
+                            abs(deriv_newton) > EPS && (t -= orig / deriv_newton)
+                        end
+                    end
+                end
+            end
+
+            h1_sq = (af_af - a0_a0)/(2*jMax_jMax) - ((2*a0 + jMax*t)*t - vd)/jMax
+            h1_sq < 0 && (tz_current = tz; continue)
+            h1 = sqrt(h1_sq)
+
+            buf.t[1] = t
+            buf.t[2] = 0
+            buf.t[3] = t + a0/jMax
+            buf.t[4] = tf - 2*(t + h1) + ad/jMax
+            buf.t[5] = h1
+            buf.t[6] = 0
+            buf.t[7] = h1 - af/jMax
+
+            if check_step2!(buf, UDUD, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
+
+            tz_current = tz
+        end
+
+        # Check last interval to tz_max
+        p_val_current = polynom_5 + tz_current*(polynom_4 + tz_current*(polynom_3 + tz_current*(polynom_2 + tz_current*(polynom_1 + tz_current*(polynom_0 + tz_current)))))
+        p_val_max = polynom_5 + tz_max*(polynom_4 + tz_max*(polynom_3 + tz_max*(polynom_2 + tz_max*(polynom_1 + tz_max*(polynom_0 + tz_max)))))
+        if p_val_current * p_val_max < 0
+            t = shrink_interval_poly6(polynom_0, polynom_1, polynom_2, polynom_3, polynom_4, polynom_5, tz_current, tz_max)
+
+            h1_sq = (af_af - a0_a0)/(2*jMax_jMax) - ((2*a0 + jMax*t)*t - vd)/jMax
+            if h1_sq >= 0
+                h1 = sqrt(h1_sq)
+
+                buf.t[1] = t
+                buf.t[2] = 0
+                buf.t[3] = t + a0/jMax
+                buf.t[4] = tf - 2*(t + h1) + ad/jMax
+                buf.t[5] = h1
+                buf.t[6] = 0
+                buf.t[7] = h1 - af/jMax
+
+                if check_step2!(buf, UDUD, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+# Helper for bisection on 5th degree polynomial
+function shrink_interval_poly5(c0, c1, c2, c3, c4, lo, hi)
+    for _ in 1:64
+        mid = (lo + hi) / 2
+        val_mid = c4 + mid*(c3 + mid*(c2 + mid*(c1 + mid*(c0 + mid))))
+        val_lo = c4 + lo*(c3 + lo*(c2 + lo*(c1 + lo*(c0 + lo))))
+        if val_lo * val_mid < 0
+            hi = mid
+        else
+            lo = mid
+        end
+        abs(hi - lo) < 1e-14 && break
+    end
+    return (lo + hi) / 2
+end
+
+# Helper for bisection on 6th degree polynomial
+function shrink_interval_poly6(c0, c1, c2, c3, c4, c5, lo, hi)
+    for _ in 1:64
+        mid = (lo + hi) / 2
+        val_mid = c5 + mid*(c4 + mid*(c3 + mid*(c2 + mid*(c1 + mid*(c0 + mid)))))
+        val_lo = c5 + lo*(c4 + lo*(c3 + lo*(c2 + lo*(c1 + lo*(c0 + lo)))))
+        if val_lo * val_mid < 0
+            hi = mid
+        else
+            lo = mid
+        end
+        abs(hi - lo) < 1e-14 && break
+    end
+    return (lo + hi) / 2
+end
+
+"""
+    calculate_profile_step2!(roots, buf, tf, p0, v0, a0, pf, vf, af, jMax, vmax, vmin, amax, amin)
 
 Calculate a profile that achieves the target duration tf.
 This is Step 2 of the Ruckig algorithm - time synchronization.
 
 Returns true if a valid profile was found.
 """
-function calculate_profile_step2!(buf::ProfileBuffer{T}, tf, p0, v0, a0, pf, vf, af,
+function calculate_profile_step2!(roots::Roots, buf::ProfileBuffer{T}, tf, p0, v0, a0, pf, vf, af,
                                   jMax, vmax, vmin, amax, amin) where T
     pc = Step2PreComputed(tf, p0, v0, a0, pf, vf, af, jMax)
     pd = pf - p0
@@ -1766,23 +2803,29 @@ function calculate_profile_step2!(buf::ProfileBuffer{T}, tf, p0, v0, a0, pf, vf,
         jMax_dir = -jMax
     end
 
-    # Try velocity-limited profiles first (UP direction)
+    # Try velocity-limited profiles (UP direction)
     time_acc0_acc1_vel_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_acc0_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_acc1_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
 
-    # Try DOWN direction velocity-limited profiles
+    # Try velocity-limited profiles (DOWN direction)
     time_acc0_acc1_vel_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_acc0_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_acc1_vel_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
 
     # Try acceleration-limited profiles (UP direction)
     time_acc0_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_acc0_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
+    time_none_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
 
-    # Try DOWN direction
+    # Try acceleration-limited profiles (DOWN direction)
     time_acc0_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
-
-    # Try no-limits profiles (UP direction)
-    time_none_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax_dir) && return true
-
-    # Try DOWN direction
-    time_none_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_acc0_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
+    time_none_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMin, vMax, aMin, aMax, -jMax_dir) && return true
 
     return false
 end
@@ -1862,7 +2905,7 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
             buf = lims[i].buffer
             clear!(buf)
 
-            success = calculate_profile_step2!(buf, t_sync,
+            success = calculate_profile_step2!(lims[i].roots, buf, t_sync,
                 p0[i], v0[i], a0[i], pf[i], vf[i], af[i],
                 lims[i].jmax, lims[i].vmax, lims[i].vmin,
                 lims[i].amax, lims[i].amin)
