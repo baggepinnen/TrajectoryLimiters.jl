@@ -280,6 +280,39 @@ hline!([1000 500 800], sp=4, ls=:dash, label="", c=(1:3)')
 
 The image shows how different parts of the trajectory is limited by different degrees of freedom, all three DOF start and reach the end at the same time.
 
+### Multi-DOF Waypoint Trajectories
+
+For multi-DOF systems that need to pass through multiple waypoints, use `calculate_waypoint_trajectory` with an array of limiters. Each waypoint specifies arrays for position (and optionally velocity/acceleration) for all DOFs:
+
+```julia
+using TrajectoryLimiters
+using Plots
+
+# Two DOFs with different constraints
+lims = [
+    JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0),  # DOF 1 (e.g., X axis)
+    JerkLimiter(; vmax=8.0, amax=40.0, jmax=800.0),    # DOF 2 (e.g., Y axis)
+]
+
+# Define 4 waypoints - each with position arrays for both DOFs
+waypoints = [
+    (p = [0.0, 0.0],),                      # Start at origin
+    (p = [2.0, 1.0],),                      # First waypoint
+    (p = [3.0, 3.0],),                      # Second waypoint
+    (p = [-0.5, 2.0],), 
+    (p = [0.0, 0.0],),                      # Final position
+]
+
+# Calculate synchronized trajectory through all waypoints
+ts, pos, vel, acc, jerk = calculate_waypoint_trajectory(lims, waypoints, 0.001)
+
+# Plot the trajectory in XY space
+plot(pos[:, 1], pos[:, 2], label="Path", xlabel="X", ylabel="Y", aspect_ratio=:equal)
+scatter!([wp.p[1] for wp in waypoints], [wp.p[2] for wp in waypoints],
+         label="Waypoints", ms=8, c=:red)
+```
+
+Each segment between waypoints is time-synchronized across all DOFs, ensuring coordinated motion through the entire path.
 
 ### Profile Structure
 

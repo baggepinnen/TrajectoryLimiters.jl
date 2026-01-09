@@ -653,5 +653,5 @@ end
         JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand()) for i = 1:7
     ]
     waypoints = [(p = randn(7),) for i = 1:1000]
-    calculate_waypoint_trajectory(lims, waypoints, 0.001)
+    @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
 end

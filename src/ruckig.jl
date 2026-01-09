@@ -262,6 +262,15 @@ function JerkLimiter(; vmax, amax, jmax, vmin=-vmax, amin=-amax)
     JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}(), ProfileBuffer{Float64}())
 end
 
+function Base.show(io::IO, lim::JerkLimiter)
+    # Check if vmin/amin are at their default values
+    if lim.vmin == -lim.vmax && lim.amin == -lim.amax
+        print(io, "JerkLimiter(; vmax=$(lim.vmax), amax=$(lim.amax), jmax=$(lim.jmax))")
+    else
+        print(io, "JerkLimiter(; vmax=$(lim.vmax), vmin=$(lim.vmin), amax=$(lim.amax), amin=$(lim.amin), jmax=$(lim.jmax))")
+    end
+end
+
 #=============================================================================
  Polynomial Root Finding (matching reference implementation)
 =============================================================================#
@@ -532,14 +541,24 @@ function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::Reac
     abs(buf.v[8] - vf) > V_PRECISION && return false
     abs(buf.a[8] - af) > A_PRECISION && return false
 
+    # Determine direction and set limits accordingly (matching reference implementation)
+    # When vMax > 0, direction is UP; when vMax <= 0, direction is DOWN (limits swapped)
+    if vMax > 0
+        vUppLim, vLowLim = vMax + EPS, vMin - EPS
+        aUppLim, aLowLim = aMax + EPS, aMin - EPS
+    else
+        vUppLim, vLowLim = vMin + EPS, vMax - EPS
+        aUppLim, aLowLim = aMin + EPS, aMax - EPS
+    end
+
     # Check acceleration limits at critical points (indices 2, 4, 6 in 1-based = boundaries after phases 1, 3, 5)
     @inbounds for i in (2, 4, 6)
-        (buf.a[i] > aMax + EPS || buf.a[i] < aMin - EPS) && return false
+        (buf.a[i] > aUppLim || buf.a[i] < aLowLim) && return false
     end
 
     # Check velocity limits at critical points (indices 4-7 in 1-based)
     @inbounds for i in 4:7
-        (buf.v[i] > vMax + EPS || buf.v[i] < vMin - EPS) && return false
+        (buf.v[i] > vUppLim || buf.v[i] < vLowLim) && return false
     end
 
     # Check velocity at acceleration zero-crossings
@@ -553,7 +572,7 @@ function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::Reac
             t_zero = -ai / ji
             if 0 < t_zero < buf.t[i]
                 v_at_zero = buf.v[i] - ai^2 / (2ji)
-                (v_at_zero > vMax + EPS || v_at_zero < vMin - EPS) && return false
+                (v_at_zero > vUppLim || v_at_zero < vLowLim) && return false
             end
         end
     end
@@ -1164,104 +1183,72 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
     buf = buffer
     clear!(buf)
 
-    # For positive displacement, try UP direction profiles
-    if pf >= p0
-        # Try velocity-limited profiles first
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        # Try ACC0_ACC1 (reaches amax and amin)
-        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        # Try ACC0, ACC1, NONE
-        if time_all_none_acc0_acc1!(lim.roots, buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        # Try two-step fallback profiles
-        if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            return RuckigProfile(buf, pf, vf, af)
-        end
+    # Determine primary and secondary direction based on displacement
+    # For positive pd: primary uses standard limits
+    # For negative pd: primary uses swapped limits (to move in negative direction)
+    pd = pf - p0
+    if pd >= 0
+        jMax1, vMax1, vMin1, aMax1, aMin1 = jmax, vmax, vmin, amax, amin
+        jMax2, vMax2, vMin2, aMax2, aMin2 = -jmax, vmin, vmax, amin, amax
+    else
+        jMax1, vMax1, vMin1, aMax1, aMin1 = -jmax, vmin, vmax, amin, amax
+        jMax2, vMax2, vMin2, aMax2, aMin2 = jmax, vmax, vmin, amax, amin
     end
 
-    # Try DOWN direction (flip the problem)
+    # Try primary direction first
+    if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_all_none_acc0_acc1!(lim.roots, buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    # Try secondary direction (for complex cases like starting with velocity
+    # in the wrong direction)
     clear!(buf)
-    p0_flip, pf_flip = -p0, -pf
-    v0_flip, vf_flip = -v0, -vf
-    a0_flip, af_flip = -a0, -af
-    vmax_flip, vmin_flip = -vmin, -vmax
-    amax_flip, amin_flip = -amin, -amax
 
-    if pf_flip >= p0_flip
-        if time_all_vel!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                         jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            # Flip back
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        if time_acc0_acc1!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                           jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        if time_all_none_acc0_acc1!(lim.roots, buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                                    jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        # Try two-step fallback profiles for DOWN direction
-        if time_none_two_step!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                               jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        if time_acc0_two_step!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                               jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
-        end
-
-        if time_vel_two_step!(buf, p0_flip, v0_flip, a0_flip, pf_flip, vf_flip, af_flip,
-                              jmax, vmax_flip, vmin_flip, amax_flip, amin_flip)
-            buf.p .*= -1
-            buf.v .*= -1
-            buf.a .*= -1
-            buf.j .*= -1
-            return RuckigProfile(buf, pf, vf, af)
-        end
+    if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
     end
 
-    error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, 0)")
+    if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_all_none_acc0_acc1!(lim.roots, buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
 
 end
 
