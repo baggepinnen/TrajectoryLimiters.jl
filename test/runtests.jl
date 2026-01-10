@@ -22,13 +22,6 @@ X, Ẋ, Ẍ = limiter(R)
 X2, Ẋ2, Ẍ2 = limiter(X, Ẋ, Ẍ, R)
 @test X2 === X
 
-end
-
-@testset "ruckig" begin
-    @info "Testing ruckig"
-    include("test_ruckig.jl")
-end
-
 #=
 # plot(
 #     t,
@@ -43,4 +36,13 @@ end
 # )
 # plot!(r, extrema(t)..., sp = 1, lab = "Original reference", l = (:black, :dashdot))
 =#
+
+@testset "ruckig" begin
+    @info "Testing ruckig"
+    include("test_ruckig.jl")
+end
+
+end
+
+
 

@@ -652,8 +652,20 @@ end
     lims = [
         JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand()) for i = 1:7
     ]
-    waypoints = [(p = randn(7),) for i = 1:1000]
+    waypoints = [(p = randn(7),) for i = 1:10000]
     @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
+
+
+    lims = [
+        JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand(), vmin=-10.0*rand(), amin=-50.0*rand()) for i = 1:2
+    ]
+    waypoints = [(p = randn(2),) for i = 1:10000]
+    @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
+
+
+    lim = JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand())
+    waypoints = [(p = randn(),) for i = 1:10000]
+    @test_nowarn calculate_waypoint_trajectory(lim, waypoints, 0.001)
 end
 
 
@@ -662,4 +674,10 @@ end
     p0,v0,a0 = (0.48825150691793306, 0.0, 0.0)
     pf,vf,af = (-1.3966905677540724, 0.0, 0.0)
     calculate_trajectory(lim; p0, v0, a0, pf, vf, af)
+
+    # Asymmetric limits case
+    lim2 = JerkLimiter(; vmax=3.63206191841991, vmin=-8.818152052375963, amax=49.05606954525809, amin=-12.662503905178562, jmax=640.562496516735)
+    p0,v0,a0 = (-0.43474443878557517, 0.0, 0.0)
+    pf,vf,af = (-0.5629190782888567, 0.0, 0.0)
+    calculate_trajectory(lim2; p0, v0, a0, pf, vf, af)
 end

@@ -822,12 +822,15 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, p0, v0, a
     for t in solve_quartic_real!(roots, 1.0, polynom_acc0_0, polynom_acc0_1, polynom_acc0_2, polynom_acc0_3)
         (t < t_min_acc0 || t > t_max_acc0) && continue
 
-        # Single Newton step for refinement
+        # Newton iterations for refinement (multiple steps needed for numerical stability)
         if t > EPS
-            h1 = jMax*t
-            orig = h0_acc0/(12*jMax_jMax*t) + t*(h2_acc0 + h1*(h1 - 2*aMax))
-            deriv = 2*(h2_acc0 + h1*(2*h1 - 3*aMax))
-            t -= orig / deriv
+            for _ in 1:5
+                h1 = jMax*t
+                orig = h0_acc0/(12*jMax_jMax*t) + t*(h2_acc0 + h1*(h1 - 2*aMax))
+                abs(orig) < 1e-9 && break
+                deriv = 2*(h2_acc0 + h1*(2*h1 - 3*aMax))
+                t -= orig / deriv
+            end
         end
 
         buf.t[1] = (-a0 + aMax)/jMax
