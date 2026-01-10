@@ -735,4 +735,21 @@ end
     profiles = calculate_trajectory(lims_multi; p0=p0_multi, v0=v0_multi, a0=a0_multi, pf=pf_multi, vf=vf_multi, af=af_multi)
     @test duration(profiles[1]) ≈ duration(profiles[2])  # synchronized
     @test duration(profiles[1]) ≈ 0.315 rtol=0.01  # approximately C++ result
+
+    # Asymmetric limits case 7 - Multi-DOF synchronization, DOF 0 is limiting
+    # DOF 0 min duration: 0.782, DOF 1 min duration: 0.379
+    # C++ synchronizes both to 0.782 successfully
+    lims_multi7 = [
+        JerkLimiter(; vmax=9.893427138005233, vmin=-4.195612678348535, amax=12.078328237289949, amin=-39.36255340641591, jmax=507.34452830286716),
+        JerkLimiter(; vmax=13.291034736601903, vmin=-3.8842062448080252, amax=31.775176417549602, amin=-8.718562920546741, jmax=823.3195381668564),
+    ]
+    p0_multi7 = [-1.6478335226310068, -1.8288458926404993]
+    v0_multi7 = [-0.559765177860057, 0.28380553260563673]
+    a0_multi7 = [0.0, 0.0]
+    pf_multi7 = [0.5109185999108988, -1.1461809393561588]
+    vf_multi7 = [0.10670168637106899, 0.8160643008030284]
+    af_multi7 = [0.0, 0.0]
+    profiles7 = calculate_trajectory(lims_multi7; p0=p0_multi7, v0=v0_multi7, a0=a0_multi7, pf=pf_multi7, vf=vf_multi7, af=af_multi7)
+    @test duration(profiles7[1]) ≈ duration(profiles7[2])  # synchronized
+    @test duration(profiles7[1]) ≈ 0.78215181077265 rtol=1e-6  # C++ result
 end

@@ -539,42 +539,65 @@ function Base.show(io::IO, lim::VelocityLimiter)
 end
 
 """
-    calculate_trajectory(lim::VelocityLimiter; pf, p0=0)
+    calculate_trajectory(lim::VelocityLimiter; pf, p0=0, tf=nothing)
 
 Calculate first-order trajectory (constant velocity) from p0 to pf.
-The trajectory moves at maximum velocity in the appropriate direction.
+
+If `tf` is not specified, the trajectory moves at maximum velocity in the
+appropriate direction (time-optimal).
+
+If `tf` is specified, the velocity is computed as pd/tf and must be within limits.
 
 # Returns
 `RuckigProfile` with only phase 4 (coast) active.
 """
-function calculate_trajectory(lim::VelocityLimiter{T}; pf, p0=zero(T)) where T
+function calculate_trajectory(lim::VelocityLimiter{T}; pf, p0=zero(T), tf=nothing) where T
     (; vmax, vmin, buffer) = lim
     buf = buffer
     clear!(buf)
 
     pd = pf - p0
 
-    # Choose velocity direction
-    if pd >= 0
-        vf = vmax
-    else
-        vf = vmin
-    end
-
-    if abs(vf) < EPS
-        if abs(pd) < EPS
-            # Already at target
-            return RuckigProfile(buf, pf, zero(T), zero(T))
+    if isnothing(tf)
+        # Time-optimal: use max velocity
+        # Choose velocity direction
+        if pd >= 0
+            vf = vmax
         else
-            error("Cannot reach target position with zero velocity limit")
+            vf = vmin
         end
-    end
 
-    # Time to reach target at constant velocity
-    t_coast = pd / vf
+        if abs(vf) < EPS
+            if abs(pd) < EPS
+                # Already at target
+                return RuckigProfile(buf, pf, zero(T), zero(T))
+            else
+                error("Cannot reach target position with zero velocity limit")
+            end
+        end
 
-    if t_coast < 0
-        error("Invalid first-order trajectory: negative time")
+        # Time to reach target at constant velocity
+        t_coast = pd / vf
+
+        if t_coast < 0
+            error("Invalid first-order trajectory: negative time")
+        end
+
+        limits = LIMIT_VEL
+    else
+        # Specified duration: compute required velocity
+        vf = pd / tf
+
+        # Check velocity limits
+        if vf > vmax + V_PRECISION
+            error("Required velocity $vf exceeds vmax=$(lim.vmax)")
+        end
+        if vf < vmin - V_PRECISION
+            error("Required velocity $vf is below vmin=$(lim.vmin)")
+        end
+
+        t_coast = tf
+        limits = LIMIT_NONE
     end
 
     # Set profile: only coast phase (index 4)
@@ -583,62 +606,6 @@ function calculate_trajectory(lim::VelocityLimiter{T}; pf, p0=zero(T)) where T
         buf.j[i] = zero(Float64)
     end
     buf.t[4] = t_coast
-
-    # Set boundary states
-    buf.p[1] = p0
-    buf.v[1] = vf  # Constant velocity throughout
-    buf.a[1] = zero(Float64)
-
-    for i in 1:7
-        buf.p[i+1] = buf.p[i] + buf.t[i] * buf.v[i]
-        buf.v[i+1] = buf.v[i]
-        buf.a[i+1] = zero(Float64)
-    end
-
-    # Compute cumulative times
-    buf.t_sum[1] = buf.t[1]
-    for i in 2:7
-        buf.t_sum[i] = buf.t_sum[i-1] + buf.t[i]
-    end
-
-    buf.limits = LIMIT_VEL
-    buf.control_signs = UDDU
-    buf.direction = vf > 0 ? DIR_UP : DIR_DOWN
-
-    return RuckigProfile(buf, pf, zero(T), zero(T))
-end
-
-"""
-    calculate_trajectory(lim::VelocityLimiter; pf, p0=0, tf)
-
-Calculate first-order trajectory with specified duration tf.
-The velocity is computed as pd/tf and must be within limits.
-
-# Returns
-`RuckigProfile` with only phase 4 (coast) active.
-"""
-function calculate_trajectory(lim::VelocityLimiter{T}; pf, p0=zero(T), tf) where T
-    (; vmax, vmin, buffer) = lim
-    buf = buffer
-    clear!(buf)
-
-    pd = pf - p0
-    vf = pd / tf
-
-    # Check velocity limits
-    if vf > vmax + V_PRECISION
-        error("Required velocity $vf exceeds vmax=$(lim.vmax)")
-    end
-    if vf < vmin - V_PRECISION
-        error("Required velocity $vf is below vmin=$(lim.vmin)")
-    end
-
-    # Set profile: only coast phase (index 4)
-    for i in 1:7
-        buf.t[i] = zero(Float64)
-        buf.j[i] = zero(Float64)
-    end
-    buf.t[4] = tf
 
     # Set boundary states
     buf.p[1] = p0
@@ -657,7 +624,7 @@ function calculate_trajectory(lim::VelocityLimiter{T}; pf, p0=zero(T), tf) where
         buf.t_sum[i] = buf.t_sum[i-1] + buf.t[i]
     end
 
-    buf.limits = LIMIT_NONE
+    buf.limits = limits
     buf.control_signs = UDDU
     buf.direction = vf > 0 ? DIR_UP : DIR_DOWN
 
@@ -3712,20 +3679,17 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
         deriv_3 = 2*polynom_2
         deriv_4 = polynom_3
 
-        tz_current = tz_min
+        # Second derivative coefficients for tolerance check
+        dderiv_0 = 20.0
+        dderiv_1 = 12*polynom_0
+        dderiv_2 = 6*polynom_1
+        dderiv_3 = 2*polynom_2
 
-        for tz in solve_quartic_real!(roots, deriv_0, deriv_1, deriv_2, deriv_3, deriv_4)
-            tz >= tz_max && continue
-            tz < tz_min && continue
+        ROOTS_TOL = 1e-14
 
-            # Evaluate polynomial at tz and tz_current
-            val_current = polynom_4 + tz_current*(polynom_3 + tz_current*(polynom_2 + tz_current*(polynom_1 + tz_current*(polynom_0 + tz_current))))
-            val_new = polynom_4 + tz*(polynom_3 + tz*(polynom_2 + tz*(polynom_1 + tz*(polynom_0 + tz))))
-
-            if val_current * val_new < 0
-                # Root in interval - use bisection
-                t = shrink_interval_poly5(polynom_0, polynom_1, polynom_2, polynom_3, polynom_4, tz_current, tz)
-
+        # Helper lambda to check a root candidate
+        check_uddu_vel_root = let a0_a0=a0_a0, af_af=af_af, a0_p3=a0_p3, af_p3=af_p3, jMax_jMax=jMax_jMax, vd=vd, pd=pd, tf=tf, v0=v0, a0=a0, af=af, jMax=jMax
+            function(t::T)
                 # Newton refinement
                 h1_sq = (a0_a0 + af_af)/(2*jMax_jMax) + (2*a0*t + jMax*t*t - vd)/jMax
                 if h1_sq >= 0
@@ -3740,8 +3704,10 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
                     end
                 end
 
+                (t > tf || isnan(t)) && return (false, t)
+
                 h1_sq = (a0_a0 + af_af)/(2*jMax_jMax) + (t*(2*a0 + jMax*t) - vd)/jMax
-                h1_sq < 0 && (tz_current = tz; continue)
+                h1_sq < 0 && return (false, t)
                 h1 = sqrt(h1_sq)
 
                 buf.t[1] = t
@@ -3752,9 +3718,37 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
                 buf.t[6] = 0
                 buf.t[7] = h1 + af/jMax
 
-                if check_step2!(buf, UDDU, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-                    return true
-                end
+                return (check_step2!(buf, UDDU, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af), t)
+            end
+        end
+
+        tz_current = tz_min
+
+        for tz in solve_quartic_real!(roots, deriv_0, deriv_1, deriv_2, deriv_3, deriv_4)
+            tz >= tz_max && continue
+            tz < tz_min && continue
+
+            # Refine extremum with Newton step on derivative (matching C++)
+            deriv_val = deriv_4 + tz*(deriv_3 + tz*(deriv_2 + tz*(deriv_1 + tz*deriv_0)))
+            if abs(deriv_val) > ROOTS_TOL
+                dderiv_val = dderiv_3 + tz*(dderiv_2 + tz*(dderiv_1 + tz*dderiv_0))
+                tz -= deriv_val / dderiv_val
+            end
+
+            # Evaluate polynomial at tz and tz_current
+            val_current = polynom_4 + tz_current*(polynom_3 + tz_current*(polynom_2 + tz_current*(polynom_1 + tz_current*(polynom_0 + tz_current))))
+            val_new = polynom_4 + tz*(polynom_3 + tz*(polynom_2 + tz*(polynom_1 + tz*(polynom_0 + tz))))
+
+            # Check if polynomial is near zero at extremum (double root case)
+            dderiv_val = dderiv_3 + tz*(dderiv_2 + tz*(dderiv_1 + tz*dderiv_0))
+            if abs(val_new) < 64 * abs(dderiv_val) * ROOTS_TOL
+                success, _ = check_uddu_vel_root(tz)
+                success && return true
+            elseif val_current * val_new < 0
+                # Root in interval - use bisection
+                t = shrink_interval_poly5(polynom_0, polynom_1, polynom_2, polynom_3, polynom_4, tz_current, tz)
+                success, _ = check_uddu_vel_root(t)
+                success && return true
             end
             tz_current = tz
         end
@@ -3764,23 +3758,12 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
         val_max = polynom_4 + tz_max*(polynom_3 + tz_max*(polynom_2 + tz_max*(polynom_1 + tz_max*(polynom_0 + tz_max))))
         if val_current * val_max < 0
             t = shrink_interval_poly5(polynom_0, polynom_1, polynom_2, polynom_3, polynom_4, tz_current, tz_max)
-
-            h1_sq = (a0_a0 + af_af)/(2*jMax_jMax) + (t*(2*a0 + jMax*t) - vd)/jMax
-            if h1_sq >= 0
-                h1 = sqrt(h1_sq)
-
-                buf.t[1] = t
-                buf.t[2] = 0
-                buf.t[3] = t + a0/jMax
-                buf.t[4] = tf - 2*(t + h1) - (a0 + af)/jMax
-                buf.t[5] = h1
-                buf.t[6] = 0
-                buf.t[7] = h1 + af/jMax
-
-                if check_step2!(buf, UDDU, LIMIT_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-                    return true
-                end
-            end
+            success, _ = check_uddu_vel_root(t)
+            success && return true
+        elseif abs(val_max) < 8 * eps(T)
+            # Polynomial is near zero at tz_max boundary
+            success, _ = check_uddu_vel_root(tz_max)
+            success && return true
         end
     end
 
@@ -3855,7 +3838,7 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
 
             # Check if extremum is close to zero (root)
             ddval = dderiv_4 + tz*(dderiv_3 + tz*(dderiv_2 + tz*(dderiv_1 + tz*dderiv_0)))
-            if abs(p_val) < 64 * abs(ddval) * 1e-12
+            if abs(p_val) < 64 * abs(ddval) * 1e-14
                 t = tz
             else
                 # Check for sign change
