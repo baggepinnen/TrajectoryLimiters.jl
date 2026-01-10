@@ -630,19 +630,20 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
     end
 
     # Strategy 2: ACC1_VEL (reach vMax and aMin, not aMax)
+    # Reference: position_third_step1.cpp lines 40-53
     begin
         t_acc0 = sqrt(max(0.0, a0_a0/(2*jMax_jMax) + (vMax - v0)/jMax))
         buf.t[1] = t_acc0 - a0/jMax
         buf.t[2] = 0
         buf.t[3] = t_acc0
+        # Cruise time formula from reference (line 46)
+        buf.t[4] = -(3*af_p4 - 8*aMin*(af_p3 - a0_p3) - 24*aMin*jMax*(a0*v0 - af*vf) +
+                     6*af_af*(aMin^2 - 2*jMax*vf) -
+                     12*jMax*(2*aMin*jMax*pd + aMin^2*(vf + vMax) + jMax*(vMax^2 - vf_vf) +
+                              aMin*t_acc0*(a0_a0 - 2*jMax*(v0 + vMax))))/(24*aMin*jMax_jMax*vMax)
         buf.t[5] = -aMin / jMax
         buf.t[6] = -(af_af/2 - aMin^2 - jMax*(vf - vMax)) / (aMin * jMax)
         buf.t[7] = buf.t[5] + af / jMax
-
-        t_acc1 = buf.t[7]
-        buf.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
-                       (a0*v0 - af*vf + (af_af*t_acc1 + a0_a0*t_acc0)/2)/(jMax*vMax) -
-                       (v0/vMax + 1.0)*t_acc0 - (vf/vMax + 1.0)*t_acc1 + pd/vMax
 
         if check!(buf, UDDU, LIMIT_ACC1_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
@@ -650,20 +651,21 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
     end
 
     # Strategy 3: ACC0_VEL (reach aMax and vMax, not aMin)
+    # Reference: position_third_step1.cpp lines 56-67
     begin
+        t_acc1 = sqrt(max(0.0, af_af/(2*jMax_jMax) + (vMax - vf)/jMax))
+
         buf.t[1] = (-a0 + aMax) / jMax
         buf.t[2] = (a0_a0/2 - aMax^2 - jMax*(v0 - vMax)) / (aMax * jMax)
         buf.t[3] = aMax / jMax
-
-        t_acc1 = sqrt(max(0.0, af_af/(2*jMax_jMax) + (vMax - vf)/jMax))
+        # Cruise time formula from reference (line 62)
+        buf.t[4] = (3*a0_p4 + 8*aMax*(af_p3 - a0_p3) + 24*aMax*jMax*(a0*v0 - af*vf) +
+                    6*a0_a0*(aMax^2 - 2*jMax*v0) -
+                    12*jMax*(-2*aMax*jMax*pd + aMax^2*(v0 + vMax) + jMax*(vMax^2 - v0_v0) +
+                             aMax*t_acc1*(-af_af + 2*(vf + vMax)*jMax)))/(24*aMax*jMax_jMax*vMax)
         buf.t[5] = t_acc1
         buf.t[6] = 0
         buf.t[7] = t_acc1 + af/jMax
-
-        t_acc0 = buf.t[1]
-        buf.t[4] = (af_p3 - a0_p3)/(3*jMax_jMax*vMax) +
-                       (a0*v0 - af*vf + (af_af*t_acc1 + a0_a0*t_acc0)/2)/(jMax*vMax) -
-                       (v0/vMax + 1.0)*t_acc0 - (vf/vMax + 1.0)*t_acc1 + pd/vMax
 
         if check!(buf, UDDU, LIMIT_ACC0_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
             return true
