@@ -504,6 +504,444 @@ function Base.show(io::IO, lim::JerkLimiter)
 end
 
 #=============================================================================
+ VelocityLimiter: First-Order Profiles (velocity-limited only)
+=============================================================================#
+
+"""
+    VelocityLimiter{T}
+
+Limiter for first-order profiles (constant velocity only).
+Use when acceleration and jerk limits don't apply.
+
+# Fields
+- `vmax`: Maximum velocity
+- `vmin`: Minimum velocity (default: `-vmax`)
+"""
+struct VelocityLimiter{T}
+    vmax::T
+    vmin::T
+    buffer::ProfileBuffer{Float64}
+end
+
+function VelocityLimiter(; vmax, vmin=-vmax)
+    T = promote_type(typeof(vmax), typeof(vmin))
+    VelocityLimiter(T(vmax), T(vmin), ProfileBuffer{Float64}())
+end
+
+function Base.show(io::IO, lim::VelocityLimiter)
+    if lim.vmin == -lim.vmax
+        print(io, "VelocityLimiter(; vmax=$(lim.vmax))")
+    else
+        print(io, "VelocityLimiter(; vmax=$(lim.vmax), vmin=$(lim.vmin))")
+    end
+end
+
+"""
+    calculate_trajectory(lim::VelocityLimiter; pf, p0=0)
+
+Calculate first-order trajectory (constant velocity) from p0 to pf.
+The trajectory moves at maximum velocity in the appropriate direction.
+
+# Returns
+`RuckigProfile` with only phase 4 (coast) active.
+"""
+function calculate_trajectory(lim::VelocityLimiter{T}; pf, p0=zero(T)) where T
+    (; vmax, vmin, buffer) = lim
+    buf = buffer
+    clear!(buf)
+
+    pd = pf - p0
+
+    # Choose velocity direction
+    if pd >= 0
+        vf = vmax
+    else
+        vf = vmin
+    end
+
+    if abs(vf) < EPS
+        if abs(pd) < EPS
+            # Already at target
+            return RuckigProfile(buf, pf, zero(T), zero(T))
+        else
+            error("Cannot reach target position with zero velocity limit")
+        end
+    end
+
+    # Time to reach target at constant velocity
+    t_coast = pd / vf
+
+    if t_coast < 0
+        error("Invalid first-order trajectory: negative time")
+    end
+
+    # Set profile: only coast phase (index 4)
+    for i in 1:7
+        buf.t[i] = zero(Float64)
+        buf.j[i] = zero(Float64)
+    end
+    buf.t[4] = t_coast
+
+    # Set boundary states
+    buf.p[1] = p0
+    buf.v[1] = vf  # Constant velocity throughout
+    buf.a[1] = zero(Float64)
+
+    for i in 1:7
+        buf.p[i+1] = buf.p[i] + buf.t[i] * buf.v[i]
+        buf.v[i+1] = buf.v[i]
+        buf.a[i+1] = zero(Float64)
+    end
+
+    # Compute cumulative times
+    buf.t_sum[1] = buf.t[1]
+    for i in 2:7
+        buf.t_sum[i] = buf.t_sum[i-1] + buf.t[i]
+    end
+
+    buf.limits = LIMIT_VEL
+    buf.control_signs = UDDU
+    buf.direction = vf > 0 ? DIR_UP : DIR_DOWN
+
+    return RuckigProfile(buf, pf, zero(T), zero(T))
+end
+
+"""
+    calculate_trajectory(lim::VelocityLimiter; pf, p0=0, tf)
+
+Calculate first-order trajectory with specified duration tf.
+The velocity is computed as pd/tf and must be within limits.
+
+# Returns
+`RuckigProfile` with only phase 4 (coast) active.
+"""
+function calculate_trajectory(lim::VelocityLimiter{T}; pf, p0=zero(T), tf) where T
+    (; vmax, vmin, buffer) = lim
+    buf = buffer
+    clear!(buf)
+
+    pd = pf - p0
+    vf = pd / tf
+
+    # Check velocity limits
+    if vf > vmax + V_PRECISION
+        error("Required velocity $vf exceeds vmax=$(lim.vmax)")
+    end
+    if vf < vmin - V_PRECISION
+        error("Required velocity $vf is below vmin=$(lim.vmin)")
+    end
+
+    # Set profile: only coast phase (index 4)
+    for i in 1:7
+        buf.t[i] = zero(Float64)
+        buf.j[i] = zero(Float64)
+    end
+    buf.t[4] = tf
+
+    # Set boundary states
+    buf.p[1] = p0
+    buf.v[1] = vf
+    buf.a[1] = zero(Float64)
+
+    for i in 1:7
+        buf.p[i+1] = buf.p[i] + buf.t[i] * buf.v[i]
+        buf.v[i+1] = buf.v[i]
+        buf.a[i+1] = zero(Float64)
+    end
+
+    # Compute cumulative times
+    buf.t_sum[1] = buf.t[1]
+    for i in 2:7
+        buf.t_sum[i] = buf.t_sum[i-1] + buf.t[i]
+    end
+
+    buf.limits = LIMIT_NONE
+    buf.control_signs = UDDU
+    buf.direction = vf > 0 ? DIR_UP : DIR_DOWN
+
+    return RuckigProfile(buf, pf, zero(T), zero(T))
+end
+
+export VelocityLimiter
+
+#=============================================================================
+ AccelerationLimiter: Second-Order Profiles (acceleration-limited, no jerk)
+=============================================================================#
+
+"""
+    AccelerationLimiter{T}
+
+Limiter for second-order profiles (acceleration-limited, no jerk limit).
+Use when jerk limits don't apply but acceleration limits do.
+
+# Fields
+- `vmax`: Maximum velocity
+- `vmin`: Minimum velocity (default: `-vmax`)
+- `amax`: Maximum acceleration
+- `amin`: Minimum acceleration (default: `-amax`)
+"""
+struct AccelerationLimiter{T}
+    vmax::T
+    vmin::T
+    amax::T
+    amin::T
+    buffer::ProfileBuffer{Float64}
+    candidate::ProfileBuffer{Float64}
+    brake::BrakeProfile{Float64}
+end
+
+function AccelerationLimiter(; vmax, amax, vmin=-vmax, amin=-amax)
+    T = promote_type(typeof(vmax), typeof(vmin), typeof(amax), typeof(amin))
+    AccelerationLimiter(T(vmax), T(vmin), T(amax), T(amin), ProfileBuffer{Float64}(), ProfileBuffer{Float64}(), BrakeProfile{Float64}())
+end
+
+function Base.show(io::IO, lim::AccelerationLimiter)
+    if lim.vmin == -lim.vmax && lim.amin == -lim.amax
+        print(io, "AccelerationLimiter(; vmax=$(lim.vmax), amax=$(lim.amax))")
+    else
+        print(io, "AccelerationLimiter(; vmax=$(lim.vmax), vmin=$(lim.vmin), amax=$(lim.amax), amin=$(lim.amin))")
+    end
+end
+
+"""
+Second-order ACC0 profile: accelerate to vMax, coast, decelerate to vf.
+"""
+function time_acc0_second_order!(buf::ProfileBuffer{T}, p0, v0, pf, vf, vMax, vMin, aMax, aMin) where T
+    pd = pf - p0
+
+    # t[1] = time to accelerate from v0 to vMax
+    # t[2] = coast time at vMax
+    # t[3] = time to decelerate from vMax to vf
+    t1 = (vMax - v0) / aMax
+    t3 = (vf - vMax) / aMin
+
+    if t1 < -EPS || t3 < -EPS
+        return false
+    end
+
+    # Coast distance: total distance - acceleration distance - deceleration distance
+    # d_accel = v0*t1 + 0.5*aMax*t1²
+    # d_decel = vMax*t3 + 0.5*aMin*t3²
+    d_accel = v0 * t1 + 0.5 * aMax * t1^2
+    d_decel = vMax * t3 + 0.5 * aMin * t3^2
+    d_coast = pd - d_accel - d_decel
+
+    if abs(vMax) < EPS
+        return false
+    end
+
+    t2 = d_coast / vMax
+
+    if t2 < -EPS
+        return false
+    end
+
+    # Set profile times (using phases 1, 2, 3 for accel, coast, decel)
+    buf.t[1] = max(t1, zero(T))
+    buf.t[2] = max(t2, zero(T))
+    buf.t[3] = max(t3, zero(T))
+    for i in 4:7
+        buf.t[i] = zero(T)
+    end
+
+    # Check profile validity
+    check_for_second_order!(buf, p0, v0, pf, vf, aMax, aMin, vMax, vMin, LIMIT_ACC0, UDDU)
+end
+
+"""
+Second-order NONE profile: direct acceleration/deceleration (no coast).
+"""
+function time_none_second_order!(buf::ProfileBuffer{T}, p0, v0, pf, vf, vMax, vMin, aMax, aMin) where T
+    pd = pf - p0
+
+    # Solve for peak velocity: v_peak² = (aMax*vf² - aMin*v0² - 2*aMax*aMin*pd) / (aMax - aMin)
+    denom = aMax - aMin
+    if abs(denom) < EPS
+        return false
+    end
+
+    h1_sq = (aMax * vf^2 - aMin * v0^2 - 2 * aMax * aMin * pd) / denom
+    if h1_sq < 0
+        return false
+    end
+
+    h1 = sqrt(h1_sq)
+
+    # Solution 1: peak velocity = -h1
+    t1_s1 = -(v0 + h1) / aMax
+    t3_s1 = (vf + h1) / aMin
+
+    if t1_s1 >= -EPS && t3_s1 >= -EPS
+        buf.t[1] = max(t1_s1, zero(T))
+        buf.t[2] = zero(T)
+        buf.t[3] = max(t3_s1, zero(T))
+        for i in 4:7
+            buf.t[i] = zero(T)
+        end
+
+        if check_for_second_order!(buf, p0, v0, pf, vf, aMax, aMin, vMax, vMin, LIMIT_NONE, UDDU)
+            return true
+        end
+    end
+
+    # Solution 2: peak velocity = +h1
+    t1_s2 = (-v0 + h1) / aMax
+    t3_s2 = (vf - h1) / aMin
+
+    if t1_s2 >= -EPS && t3_s2 >= -EPS
+        buf.t[1] = max(t1_s2, zero(T))
+        buf.t[2] = zero(T)
+        buf.t[3] = max(t3_s2, zero(T))
+        for i in 4:7
+            buf.t[i] = zero(T)
+        end
+
+        if check_for_second_order!(buf, p0, v0, pf, vf, aMax, aMin, vMax, vMin, LIMIT_NONE, UDDU)
+            return true
+        end
+    end
+
+    return false
+end
+
+"""
+Check and finalize a second-order profile.
+"""
+function check_for_second_order!(buf::ProfileBuffer{T}, p0, v0, pf, vf, aMax, aMin, vMax, vMin, limits, control_signs) where T
+    # Set all jerks to zero (second-order profile)
+    for i in 1:7
+        buf.j[i] = zero(T)
+    end
+
+    # Compute cumulative times
+    buf.t_sum[1] = buf.t[1]
+    for i in 2:7
+        buf.t_sum[i] = buf.t_sum[i-1] + buf.t[i]
+    end
+
+    # Check for negative times
+    for i in 1:7
+        if buf.t[i] < -EPS
+            return false
+        end
+    end
+
+    # Set accelerations for each phase
+    # Phase 1: accelerate at aMax
+    # Phase 2: coast (a=0)
+    # Phase 3: decelerate at aMin
+    buf.a[1] = aMax
+    buf.a[2] = aMax  # End of phase 1
+    buf.a[3] = zero(T)  # Coast
+    buf.a[4] = aMin  # Deceleration
+    for i in 5:8
+        buf.a[i] = zero(T)
+    end
+
+    # Set initial state
+    buf.p[1] = p0
+    buf.v[1] = v0
+
+    # Integrate through phases (second-order: v' = a, no jerk)
+    for i in 1:7
+        ai = i == 1 ? aMax : (i == 3 ? aMin : zero(T))
+        if i == 2  # Coast
+            ai = zero(T)
+        elseif i == 1  # Accelerate
+            ai = aMax
+        elseif i == 3  # Decelerate
+            ai = aMin
+        end
+
+        buf.v[i+1] = buf.v[i] + buf.t[i] * ai
+        buf.p[i+1] = buf.p[i] + buf.t[i] * (buf.v[i] + buf.t[i] * ai / 2)
+    end
+
+    # Check final position and velocity
+    if abs(buf.p[8] - pf) > P_PRECISION
+        return false
+    end
+    if abs(buf.v[8] - vf) > V_PRECISION
+        return false
+    end
+
+    # Check velocity limits
+    for i in 1:8
+        if buf.v[i] > vMax + V_PRECISION || buf.v[i] < vMin - V_PRECISION
+            return false
+        end
+    end
+
+    buf.limits = limits
+    buf.control_signs = control_signs
+    buf.direction = vMax > 0 ? DIR_UP : DIR_DOWN
+
+    return true
+end
+
+"""
+    calculate_trajectory(lim::AccelerationLimiter; pf, p0=0, v0=0, vf=0)
+
+Calculate second-order trajectory (acceleration-limited, no jerk) from (p0, v0) to (pf, vf).
+
+# Returns
+`RuckigProfile` with phases 1-3 active (accelerate, coast, decelerate).
+"""
+function calculate_trajectory(lim::AccelerationLimiter{T}; pf, p0=zero(T), v0=zero(T), vf=zero(T)) where T
+    (; vmax, vmin, amax, amin, buffer, brake) = lim
+    buf = buffer
+    clear!(buf)
+
+    # Compute brake profile if initial velocity is outside limits
+    get_second_order_position_brake_trajectory!(brake, v0, vmax, vmin, amax, amin)
+    ps, vs, as = finalize_second_order_brake!(brake, p0, v0, zero(T))
+    brake_duration = brake.duration
+    brake_copy = brake_duration > 0 ? deepcopy(brake) : nothing
+
+    p0_eff, v0_eff = ps, vs
+    pd = pf - p0_eff
+
+    # Determine direction
+    if pd >= 0
+        vMax, vMin, aMax, aMin = vmax, vmin, amax, amin
+    else
+        vMax, vMin, aMax, aMin = vmin, vmax, amin, amax
+    end
+
+    # Try ACC0 profile (accelerate to vMax, coast, decelerate)
+    if time_acc0_second_order!(buf, p0_eff, v0_eff, pf, vf, vMax, vMin, aMax, aMin)
+        return RuckigProfile(buf, pf, vf, zero(T); brake_duration, brake=brake_copy)
+    end
+
+    # Try NONE profile (direct acceleration/deceleration)
+    clear!(buf)
+    if time_none_second_order!(buf, p0_eff, v0_eff, pf, vf, vMax, vMin, aMax, aMin)
+        return RuckigProfile(buf, pf, vf, zero(T); brake_duration, brake=brake_copy)
+    end
+
+    # Try opposite direction
+    if pd >= 0
+        vMax, vMin, aMax, aMin = vmin, vmax, amin, amax
+    else
+        vMax, vMin, aMax, aMin = vmax, vmin, amax, amin
+    end
+
+    clear!(buf)
+    if time_acc0_second_order!(buf, p0_eff, v0_eff, pf, vf, vMax, vMin, aMax, aMin)
+        return RuckigProfile(buf, pf, vf, zero(T); brake_duration, brake=brake_copy)
+    end
+
+    clear!(buf)
+    if time_none_second_order!(buf, p0_eff, v0_eff, pf, vf, vMax, vMin, aMax, aMin)
+        return RuckigProfile(buf, pf, vf, zero(T); brake_duration, brake=brake_copy)
+    end
+
+    error("No valid second-order trajectory found from ($p0, $v0) to ($pf, $vf), limiter: ", lim)
+end
+
+export AccelerationLimiter
+
+#=============================================================================
  Polynomial Root Finding (matching reference implementation)
 =============================================================================#
 
@@ -3554,6 +3992,273 @@ function calculate_profile_step2!(roots::Roots, buf::ProfileBuffer{T}, tf, p0, v
     return false
 end
 
+
+#=============================================================================
+ Position Extrema Functions
+=============================================================================#
+
+"""
+    PositionBound{T}
+
+Stores minimum and maximum position along a trajectory and the times at which they occur.
+"""
+struct PositionBound{T}
+    min::T
+    max::T
+    t_min::T
+    t_max::T
+end
+
+"""
+    check_position_extremum!(t_ext, t_sum, t, p, v, a, j, ext_min, ext_max, t_min, t_max)
+
+Check if position at time t_ext (within phase) is an extremum.
+Updates extremum values if a new min/max is found.
+Returns (new_min, new_max, new_t_min, new_t_max).
+"""
+function check_position_extremum(t_ext, t_sum, t, p, v, a, j, ext_min, ext_max, t_min, t_max)
+    if 0 < t_ext < t
+        # Integrate to t_ext
+        p_ext = p + t_ext * (v + t_ext * (a / 2 + t_ext * j / 6))
+        a_ext = a + t_ext * j
+
+        if a_ext > 0 && p_ext < ext_min
+            ext_min = p_ext
+            t_min = t_sum + t_ext
+        elseif a_ext < 0 && p_ext > ext_max
+            ext_max = p_ext
+            t_max = t_sum + t_ext
+        end
+    end
+    return ext_min, ext_max, t_min, t_max
+end
+
+"""
+    check_step_for_position_extremum(t_sum, t, p, v, a, j, ext_min, ext_max, t_min, t_max)
+
+Check phase boundary and find velocity zeros within phase for position extrema.
+"""
+function check_step_for_position_extremum(t_sum, t, p, v, a, j, ext_min, ext_max, t_min, t_max)
+    # Check boundary position
+    if p < ext_min
+        ext_min = p
+        t_min = t_sum
+    end
+    if p > ext_max
+        ext_max = p
+        t_max = t_sum
+    end
+
+    # Find velocity zeros within phase (where position extrema can occur)
+    if j != 0
+        # Velocity: v(t) = v + a*t + j*t²/2 = 0
+        # Quadratic: j/2 * t² + a*t + v = 0
+        # t = (-a ± sqrt(a² - 2*j*v)) / j
+        D = a^2 - 2 * j * v
+
+        if abs(D) < eps(Float64)
+            # Single root: t = -a/j
+            t_ext = -a / j
+            ext_min, ext_max, t_min, t_max = check_position_extremum(t_ext, t_sum, t, p, v, a, j, ext_min, ext_max, t_min, t_max)
+
+        elseif D > 0
+            D_sqrt = sqrt(D)
+            t_ext1 = (-a - D_sqrt) / j
+            t_ext2 = (-a + D_sqrt) / j
+            ext_min, ext_max, t_min, t_max = check_position_extremum(t_ext1, t_sum, t, p, v, a, j, ext_min, ext_max, t_min, t_max)
+            ext_min, ext_max, t_min, t_max = check_position_extremum(t_ext2, t_sum, t, p, v, a, j, ext_min, ext_max, t_min, t_max)
+        end
+    end
+
+    return ext_min, ext_max, t_min, t_max
+end
+
+"""
+    get_position_extrema(profile::RuckigProfile) -> PositionBound
+
+Find the minimum and maximum positions along the trajectory.
+Useful for collision checking.
+
+# Returns
+`PositionBound{T}` with fields: `min`, `max`, `t_min`, `t_max`
+"""
+function get_position_extrema(profile::RuckigProfile{T}) where T
+    ext_min = T(Inf)
+    ext_max = T(-Inf)
+    t_min = zero(T)
+    t_max = zero(T)
+
+    # Check brake profile phases if present
+    if profile.brake !== nothing && profile.brake_duration > 0
+        bp = profile.brake
+        if bp.t[1] > 0
+            ext_min, ext_max, t_min, t_max = check_step_for_position_extremum(
+                zero(T), bp.t[1], bp.p[1], bp.v[1], bp.a[1], bp.j[1],
+                ext_min, ext_max, t_min, t_max)
+
+            if bp.t[2] > 0
+                ext_min, ext_max, t_min, t_max = check_step_for_position_extremum(
+                    bp.t[1], bp.t[2], bp.p[2], bp.v[2], bp.a[2], bp.j[2],
+                    ext_min, ext_max, t_min, t_max)
+            end
+        end
+    end
+
+    # Check main profile phases
+    t_current_sum = profile.brake_duration
+    for i in 1:7
+        ext_min, ext_max, t_min, t_max = check_step_for_position_extremum(
+            t_current_sum, profile.t[i], profile.p[i], profile.v[i], profile.a[i], profile.j[i],
+            ext_min, ext_max, t_min, t_max)
+        t_current_sum += profile.t[i]
+    end
+
+    # Check final position
+    pf = profile.pf
+    total_duration = duration(profile)
+    if pf < ext_min
+        ext_min = pf
+        t_min = total_duration
+    end
+    if pf > ext_max
+        ext_max = pf
+        t_max = total_duration
+    end
+
+    return PositionBound{T}(ext_min, ext_max, t_min, t_max)
+end
+
+"""
+    get_first_state_at_position(profile::RuckigProfile, pt; time_after=0.0) -> (found::Bool, time::Float64)
+
+Find the first time at which the trajectory reaches position `pt`.
+Optionally search only after `time_after`.
+
+# Returns
+- `(true, time)` if position is reached
+- `(false, NaN)` if position is never reached
+"""
+function get_first_state_at_position(profile::RuckigProfile{T}, pt::Real; time_after::Real=0.0) where T
+    t_cum = profile.brake_duration  # Start after brake
+
+    for i in 1:7
+        if profile.t[i] == 0
+            continue
+        end
+
+        # Check if we're at the position at phase start
+        if abs(profile.p[i] - pt) < EPS && t_cum >= time_after
+            return (true, t_cum)
+        end
+
+        # Solve cubic: p + v*t + a*t²/2 + j*t³/6 = pt
+        # j/6 * t³ + a/2 * t² + v*t + (p - pt) = 0
+        j, a, v, p = profile.j[i], profile.a[i], profile.v[i], profile.p[i]
+
+        if abs(j) > EPS
+            # Full cubic
+            roots = solve_cubic_real(j/6, a/2, v, p - pt)
+            for t_root in roots
+                if 0 < t_root <= profile.t[i] && (time_after - t_cum) <= t_root
+                    return (true, t_root + t_cum)
+                end
+            end
+        elseif abs(a) > EPS
+            # Quadratic: a/2 * t² + v*t + (p - pt) = 0
+            disc = v^2 - 2*a*(p - pt)
+            if disc >= 0
+                disc_sqrt = sqrt(disc)
+                for t_root in ((-v - disc_sqrt) / a, (-v + disc_sqrt) / a)
+                    if 0 < t_root <= profile.t[i] && (time_after - t_cum) <= t_root
+                        return (true, t_root + t_cum)
+                    end
+                end
+            end
+        elseif abs(v) > EPS
+            # Linear: v*t + (p - pt) = 0
+            t_root = (pt - p) / v
+            if 0 < t_root <= profile.t[i] && (time_after - t_cum) <= t_root
+                return (true, t_root + t_cum)
+            end
+        end
+
+        t_cum += profile.t[i]
+    end
+
+    # Check final position
+    total_dur = duration(profile)
+    if (profile.t[7] > 0 || main_duration(profile) == 0) && abs(profile.pf - pt) < NEWTON_TOL && total_dur >= time_after
+        return (true, total_dur)
+    end
+
+    return (false, T(NaN))
+end
+
+"""
+Helper to solve cubic equation: a*x³ + b*x² + c*x + d = 0
+Returns real roots only.
+"""
+function solve_cubic_real(a, b, c, d)
+    roots = Float64[]
+
+    if abs(a) < EPS
+        # Quadratic or lower
+        if abs(b) < EPS
+            # Linear
+            if abs(c) > EPS
+                push!(roots, -d / c)
+            end
+        else
+            # Quadratic
+            disc = c^2 - 4*b*d
+            if disc >= 0
+                disc_sqrt = sqrt(disc)
+                push!(roots, (-c - disc_sqrt) / (2*b))
+                push!(roots, (-c + disc_sqrt) / (2*b))
+            end
+        end
+        return roots
+    end
+
+    # Normalize to monic: x³ + p*x² + q*x + r = 0
+    p, q, r = b/a, c/a, d/a
+
+    # Cardano's formula with Vieta's substitution: x = t - p/3
+    # t³ + pt + q = 0 where p = q - p²/3, q = r - pq/3 + 2p³/27
+    p2 = p^2
+    Q = (3*q - p2) / 9
+    R = (9*p*q - 27*r - 2*p2*p) / 54
+
+    D = Q^3 + R^2  # Discriminant
+
+    if D > 0
+        # One real root
+        D_sqrt = sqrt(D)
+        S = cbrt(R + D_sqrt)
+        T_val = cbrt(R - D_sqrt)
+        push!(roots, S + T_val - p/3)
+    elseif abs(D) < EPS
+        # Three real roots, at least two equal
+        if abs(R) < EPS
+            push!(roots, -p/3)
+        else
+            S = cbrt(R)
+            push!(roots, 2*S - p/3)
+            push!(roots, -S - p/3)
+        end
+    else
+        # Three distinct real roots
+        theta = acos(R / sqrt(-Q^3))
+        sqrt_neg_Q = sqrt(-Q)
+        push!(roots, 2*sqrt_neg_Q*cos(theta/3) - p/3)
+        push!(roots, 2*sqrt_neg_Q*cos((theta + 2π)/3) - p/3)
+        push!(roots, 2*sqrt_neg_Q*cos((theta + 4π)/3) - p/3)
+    end
+
+    return roots
+end
+
+export PositionBound, get_position_extrema, get_first_state_at_position
 
 #=============================================================================
  Multi-DOF Trajectory Calculation
