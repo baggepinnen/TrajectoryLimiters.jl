@@ -3726,7 +3726,7 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
 
         for tz in solve_quartic_real!(roots, deriv_0, deriv_1, deriv_2, deriv_3, deriv_4)
             tz >= tz_max && continue
-            tz < tz_min && continue
+            tz <= tz_current && continue  # Skip extrema that would create backwards intervals
 
             # Refine extremum with Newton step on derivative (matching C++)
             deriv_val = deriv_4 + tz*(deriv_3 + tz*(deriv_2 + tz*(deriv_1 + tz*deriv_0)))
@@ -3806,7 +3806,7 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
 
         for tz in solve_quartic_real!(roots, dderiv_0, dderiv_1, dderiv_2, dderiv_3, dderiv_4)
             tz >= tz_max && continue
-            tz < tz_min && continue
+            tz <= dd_tz_current && continue  # Skip extrema that would create backwards intervals
 
             # Check sign change in 1st derivative
             val_current = deriv_5 + dd_tz_current*(deriv_4 + dd_tz_current*(deriv_3 + dd_tz_current*(deriv_2 + dd_tz_current*(deriv_1 + dd_tz_current*deriv_0))))
