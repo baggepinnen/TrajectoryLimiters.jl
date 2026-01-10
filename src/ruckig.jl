@@ -37,6 +37,11 @@ end
     UDUD  # ↑↓↑↓
 end
 
+@enum Direction begin
+    DIR_UP    # Positive jMax direction
+    DIR_DOWN  # Negative jMax direction
+end
+
 #=============================================================================
  Data Structures
 =============================================================================#
@@ -56,13 +61,14 @@ mutable struct ProfileBuffer{T}
     p::Memory{T}       # Position at boundaries (length 8)
     limits::ReachedLimits
     control_signs::ControlSigns
+    direction::Direction
 end
 
 function ProfileBuffer{T}() where T
     ProfileBuffer{T}(
         Memory{T}(undef, 7), Memory{T}(undef, 7), Memory{T}(undef, 7),
         Memory{T}(undef, 8), Memory{T}(undef, 8), Memory{T}(undef, 8),
-        LIMIT_NONE, UDDU
+        LIMIT_NONE, UDDU, DIR_UP
     )
 end
 
@@ -75,6 +81,7 @@ function clear!(buf::ProfileBuffer{T}) where T
     fill!(buf.p, zero(T))
     buf.limits = LIMIT_NONE
     buf.control_signs = UDDU
+    buf.direction = DIR_UP
     buf
 end
 
@@ -92,6 +99,7 @@ function copy_buffer!(dst::ProfileBuffer{T}, src::ProfileBuffer{T}) where T
     end
     dst.limits = src.limits
     dst.control_signs = src.control_signs
+    dst.direction = src.direction
     dst
 end
 
@@ -112,6 +120,7 @@ struct RuckigProfile{T}
     af::T                 # Target acceleration
     limits::ReachedLimits
     control_signs::ControlSigns
+    direction::Direction
 end
 
 """
@@ -126,7 +135,7 @@ function RuckigProfile(buf::ProfileBuffer{T}, pf, vf, af) where T
         NTuple{8,T}(buf.v),
         NTuple{8,T}(buf.p),
         pf, vf, af,
-        buf.limits, buf.control_signs
+        buf.limits, buf.control_signs, buf.direction
     )
 end
 
@@ -149,6 +158,21 @@ struct BlockInterval{T}
     left::T
     right::T
     profile::RuckigProfile{T}
+end
+
+"""
+Create a BlockInterval from two profiles.
+Automatically determines left/right based on durations (matching C++ Interval constructor).
+The profile stored is the one with the longer duration (corresponding to `right`).
+"""
+function BlockInterval(profile_left::RuckigProfile{T}, profile_right::RuckigProfile{T}) where T
+    left_duration = profile_left.t_sum[end]
+    right_duration = profile_right.t_sum[end]
+    if left_duration < right_duration
+        BlockInterval{T}(left_duration, right_duration, profile_right)
+    else
+        BlockInterval{T}(right_duration, left_duration, profile_left)
+    end
 end
 
 """
@@ -193,6 +217,168 @@ function get_profile(block::Block, t)
     return block.p_min
 end
 
+"""String representation of Block (matches C++ Block::to_string)."""
+function Base.show(io::IO, block::Block)
+    print(io, "[", block.t_min, " ")
+    if !isnothing(block.a)
+        print(io, block.a.left, "] [", block.a.right, " ")
+    end
+    if !isnothing(block.b)
+        print(io, block.b.left, "] [", block.b.right, " ")
+    end
+    print(io, "-")
+end
+
+#=============================================================================
+ ValidProfileCollection: Collects valid profiles during Step 1 for Block calculation
+=============================================================================#
+
+"""
+    ValidProfileCollection{T}
+
+Mutable storage for collecting valid profiles during Step 1.
+Used to compute blocked intervals. C++ uses at most 5 valid profiles.
+"""
+mutable struct ValidProfileCollection{T}
+    profiles::Vector{RuckigProfile{T}}
+    count::Int
+end
+
+ValidProfileCollection{T}() where T = ValidProfileCollection{T}(Vector{RuckigProfile{T}}(undef, 5), 0)
+
+function clear!(vpc::ValidProfileCollection)
+    vpc.count = 0
+    vpc
+end
+
+function add_profile!(vpc::ValidProfileCollection{T}, profile::RuckigProfile{T}) where T
+    vpc.count += 1
+    if vpc.count <= length(vpc.profiles)
+        vpc.profiles[vpc.count] = profile
+    else
+        push!(vpc.profiles, profile)
+    end
+    vpc
+end
+
+"""
+    calculate_block!(vpc::ValidProfileCollection{T}) -> Block{T}
+
+Compute a Block from a collection of valid profiles, determining blocked intervals.
+This mirrors the C++ Block::calculate_block function (block.hpp lines 59-132).
+
+Logic:
+- 1 profile: Just the minimum, no blocked intervals
+- 2 profiles: One blocked interval between them (if durations differ significantly)
+- 3 profiles: Find minimum, create one blocked interval from the other two
+- 4 profiles: Handle as numerical degenerate case (remove near-duplicates)
+- 5 profiles: Find minimum, create two blocked intervals
+"""
+function calculate_block!(vpc::ValidProfileCollection{T}) where T
+    count = vpc.count
+
+    if count == 0
+        error("No valid profiles found")
+    end
+
+    # Work with a copy of the profiles array to allow modification
+    profiles = vpc.profiles
+    valid_count = count
+
+    if valid_count == 1
+        return Block(profiles[1])
+    end
+
+    if valid_count == 2
+        # Check if durations are essentially equal (numerical tolerance)
+        # C++ block.hpp line 71
+        if abs(profiles[1].t_sum[end] - profiles[2].t_sum[end]) < 8 * eps(Float64)
+            return Block(profiles[1])
+        end
+
+        # C++ block.hpp lines 76-83 (numerical_robust = true)
+        idx_min = profiles[1].t_sum[end] < profiles[2].t_sum[end] ? 1 : 2
+        idx_other = 3 - idx_min
+
+        p_min = profiles[idx_min]
+        t_min = p_min.t_sum[end]
+        interval_a = BlockInterval(profiles[idx_min], profiles[idx_other])
+        return Block{T}(p_min, t_min, interval_a, nothing)
+    end
+
+    # For 4 profiles, try to remove near-duplicates (numerical issue handling)
+    # C++ block.hpp lines 86-100
+    if valid_count == 4
+        # Check specific pairs for near-identical durations with opposite directions
+        # C++ checks (0,1), (2,3), (0,3) in 0-based indexing
+        if abs(profiles[1].t_sum[end] - profiles[2].t_sum[end]) < 32 * eps(Float64) &&
+           profiles[1].direction != profiles[2].direction
+            # Remove profile 2 by shifting
+            profiles[2] = profiles[valid_count]
+            valid_count -= 1
+        elseif abs(profiles[3].t_sum[end] - profiles[4].t_sum[end]) < 256 * eps(Float64) &&
+               profiles[3].direction != profiles[4].direction
+            # Remove profile 4
+            valid_count -= 1
+        elseif abs(profiles[1].t_sum[end] - profiles[4].t_sum[end]) < 256 * eps(Float64) &&
+               profiles[1].direction != profiles[4].direction
+            # Remove profile 4
+            valid_count -= 1
+        else
+            error("Invalid state: 4 valid profiles with no near-duplicates to remove")
+        end
+    end
+
+    # Check for valid odd count (C++ block.hpp lines 98-100)
+    if valid_count % 2 == 0
+        error("Invalid state: even number of valid profiles ($valid_count)")
+    end
+
+    # Find index of minimum duration profile (C++ block.hpp lines 103-106)
+    idx_min = 1
+    for i in 2:valid_count
+        if profiles[i].t_sum[end] < profiles[idx_min].t_sum[end]
+            idx_min = i
+        end
+    end
+
+    p_min = profiles[idx_min]
+    t_min = p_min.t_sum[end]
+
+    if valid_count == 3
+        # C++ block.hpp lines 108-113
+        # C++ uses (idx_min + 1) % 3 and (idx_min + 2) % 3 with 0-based indexing
+        # For Julia 1-based: if idx_min=1, others are 2,3; if idx_min=2, others are 3,1; if idx_min=3, others are 1,2
+        idx_else_1 = mod1(idx_min, 3) == idx_min ? mod1(idx_min + 1, 3) : mod1(idx_min + 1, 3)
+        idx_else_2 = mod1(idx_min + 2, 3)
+        # Simpler: get the two indices that aren't idx_min
+        others = filter(i -> i != idx_min, 1:3)
+        idx_else_1, idx_else_2 = others[1], others[2]
+
+        interval_a = BlockInterval(profiles[idx_else_1], profiles[idx_else_2])
+        return Block{T}(p_min, t_min, interval_a, nothing)
+
+    elseif valid_count == 5
+        # C++ block.hpp lines 115-128
+        # Get the 4 indices that aren't idx_min, in order
+        others = filter(i -> i != idx_min, 1:5)
+        idx_else_1, idx_else_2, idx_else_3, idx_else_4 = others[1], others[2], others[3], others[4]
+
+        # Check direction pairing (C++ line 121)
+        if profiles[idx_else_1].direction == profiles[idx_else_2].direction
+            interval_a = BlockInterval(profiles[idx_else_1], profiles[idx_else_2])
+            interval_b = BlockInterval(profiles[idx_else_3], profiles[idx_else_4])
+        else
+            interval_a = BlockInterval(profiles[idx_else_1], profiles[idx_else_4])
+            interval_b = BlockInterval(profiles[idx_else_2], profiles[idx_else_3])
+        end
+        return Block{T}(p_min, t_min, interval_a, interval_b)
+    end
+
+    # Fallback: just use minimum profile
+    return Block(p_min)
+end
+
 #=============================================================================
  Roots: Storage for polynomial roots
 =============================================================================#
@@ -235,17 +421,30 @@ end
 
 Base.length(r::Roots) = r.count
 
+# Helper to get root by index (1-based)
+@inline function _get_root(r::Roots, i)
+    i == 1 && return r.r1
+    i == 2 && return r.r2
+    i == 3 && return r.r3
+    return r.r4
+end
+
 # Iterator interface for for-loop consumption
-Base.iterate(r::Roots) = r.count >= 1 ? (r.r1, 2) : nothing
-function Base.iterate(r::Roots, i)
-    i > r.count && return nothing
-    if i == 2
-        return (r.r2, 3)
-    elseif i == 3
-        return (r.r3, 4)
-    else
-        return (r.r4, 5)
+# Matches C++ PositiveSet behavior: only iterate over non-negative roots
+function Base.iterate(r::Roots)
+    for i in 1:r.count
+        val = _get_root(r, i)
+        val >= 0 && return (val, i + 1)
     end
+    return nothing
+end
+
+function Base.iterate(r::Roots, state)
+    for i in state:r.count
+        val = _get_root(r, i)
+        val >= 0 && return (val, i + 1)
+    end
+    return nothing
 end
 
 
@@ -273,11 +472,12 @@ struct JerkLimiter{T}
     roots::Roots{Float64}           # Always Float64 since polynomial roots are floating-point
     buffer::ProfileBuffer{Float64}  # Always Float64 for computation (stores best profile)
     candidate::ProfileBuffer{Float64}  # Candidate buffer for profile search
+    valid_profiles::ValidProfileCollection{Float64}  # Collects valid profiles for blocked intervals
 end
 
 function JerkLimiter(; vmax, amax, jmax, vmin=-vmax, amin=-amax)
     T = promote_type(typeof(vmax), typeof(vmin), typeof(amax), typeof(amin), typeof(jmax))
-    JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}(), ProfileBuffer{Float64}(), ProfileBuffer{Float64}())
+    JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}(), ProfileBuffer{Float64}(), ProfileBuffer{Float64}(), ValidProfileCollection{Float64}())
 end
 
 function Base.show(io::IO, lim::JerkLimiter)
@@ -651,6 +851,8 @@ function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::Reac
 
     buf.limits = limits
     buf.control_signs = control_signs
+    # Direction is UP when vMax > 0, DOWN when vMax <= 0 (matching C++ profile.hpp line 216)
+    buf.direction = vMax > 0 ? DIR_UP : DIR_DOWN
 
     return true
 end
@@ -1488,6 +1690,152 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
 
     error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
 
+end
+
+"""
+    calculate_trajectory_with_block(lim; pf, p0=0, v0=0, a0=0, vf=0, af=0) -> Block{Float64}
+
+Calculate a time-optimal trajectory and return a Block struct containing:
+- The minimum-time profile
+- Any blocked time intervals (for multi-DOF synchronization)
+
+This function collects ALL valid profiles during Step 1 calculation,
+matching the C++ reference implementation behavior for computing blocked intervals.
+"""
+function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a0=zero(T), vf=zero(T), af=zero(T)) where T
+
+    (; vmax, vmin, amax, amin, jmax, buffer, candidate, valid_profiles) = lim
+    buf = buffer
+    clear!(buf)
+    clear!(valid_profiles)
+
+    # Validate input constraints
+    if vf < vmin || vf > vmax
+        error("Target velocity vf=$vf is outside allowed range [$vmin, $vmax]")
+    end
+    if af < amin || af > amax
+        error("Target acceleration af=$af is outside allowed range [$amin, $amax]")
+    end
+
+    pd = pf - p0
+
+    # Reference implementation behavior (position_third_step1.cpp lines 531-585):
+    # - When vf == 0 && af == 0: return first valid profile (no blocked intervals possible)
+    # - When vf != 0 || af != 0: collect ALL profiles for blocked interval computation
+    # See C++ comment at line 542: "There is no blocked interval when vf==0 && af==0"
+
+    if abs(vf) < EPS && abs(af) < EPS
+        # Fast path: no blocked intervals when vf==0 && af==0
+        # Return first valid profile found as the block
+        if pd >= 0
+            jMax1, vMax1, vMin1, aMax1, aMin1 = jmax, vmax, vmin, amax, amin
+            jMax2, vMax2, vMin2, aMax2, aMin2 = -jmax, vmin, vmax, amin, amax
+        else
+            jMax1, vMax1, vMin1, aMax1, aMin1 = -jmax, vmin, vmax, amin, amax
+            jMax2, vMax2, vMin2, aMax2, aMin2 = jmax, vmax, vmin, amax, amin
+        end
+
+        # Try primary direction
+        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return Block(RuckigProfile(buf, pf, vf, af))
+        end
+        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return Block(RuckigProfile(buf, pf, vf, af))
+        end
+        if time_acc0_acc1!(buf, candidate, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return Block(RuckigProfile(buf, pf, vf, af))
+        end
+
+        # Try secondary direction
+        clear!(buf)
+        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return Block(RuckigProfile(buf, pf, vf, af))
+        end
+        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return Block(RuckigProfile(buf, pf, vf, af))
+        end
+        if time_acc0_acc1!(buf, candidate, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return Block(RuckigProfile(buf, pf, vf, af))
+        end
+    else
+        # Full collection mode: collect ALL valid profiles for blocked interval computation
+        # C++ uses original limits (NOT pd-swapped), see position_third_step1.cpp lines 558-563
+        # All profile functions are called with return_after_found = false
+
+        # Collect from time_all_none_acc0_acc1 (both directions)
+        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        end
+        clear!(buf)
+        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        end
+
+        # Collect from time_acc0_acc1 (both directions)
+        clear!(buf)
+        if time_acc0_acc1!(buf, candidate, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        end
+        clear!(buf)
+        if time_acc0_acc1!(buf, candidate, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        end
+
+        # Collect from time_all_vel (both directions)
+        clear!(buf)
+        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        end
+        clear!(buf)
+        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        end
+
+        # If valid profiles found, compute block with blocked intervals
+        if valid_profiles.count > 0
+            return calculate_block!(valid_profiles)
+        end
+    end
+
+    # Two-step profiles (fallback) - these don't contribute to blocked intervals
+    # (they're only used when no regular profile is found)
+    clear!(buf)
+    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return Block(RuckigProfile(buf, pf, vf, af))
+    end
+    clear!(buf)
+    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return Block(RuckigProfile(buf, pf, vf, af))
+    end
+
+    clear!(buf)
+    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return Block(RuckigProfile(buf, pf, vf, af))
+    end
+    clear!(buf)
+    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return Block(RuckigProfile(buf, pf, vf, af))
+    end
+
+    clear!(buf)
+    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return Block(RuckigProfile(buf, pf, vf, af))
+    end
+    clear!(buf)
+    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return Block(RuckigProfile(buf, pf, vf, af))
+    end
+
+    clear!(buf)
+    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return Block(RuckigProfile(buf, pf, vf, af))
+    end
+    clear!(buf)
+    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return Block(RuckigProfile(buf, pf, vf, af))
+    end
+
+    error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
 end
 
 #=============================================================================
@@ -3094,37 +3442,81 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
     length(vf) == ndof || throw(ArgumentError("vf must have length $ndof"))
     length(af) == ndof || throw(ArgumentError("af must have length $ndof"))
 
-    # Step 1: Calculate minimum-time profile for each DOF independently
+    # Step 1: Calculate minimum-time profile for each DOF with blocked intervals
     blocks = Vector{Block{Float64}}(undef, ndof)
     for i in 1:ndof
-        profile = calculate_trajectory(lims[i];
+        blocks[i] = calculate_trajectory_with_block(lims[i];
             p0=p0[i], v0=v0[i], a0=a0[i],
             pf=pf[i], vf=vf[i], af=af[i])
-        blocks[i] = Block(profile)
     end
 
-    # Find synchronization time (maximum of all minimum times)
-    t_sync = maximum(block.t_min for block in blocks)
-    limiting_dof = argmax([block.t_min for block in blocks])
+    # Synchronization: find valid t_sync that isn't blocked for any DOF
+    # Candidate times are: t_min for each DOF, a.right, b.right for each DOF
+    # See C++ calculator_target.hpp lines 123-200
 
-    # Check if t_sync is blocked for any DOF
+    # Build list of candidate synchronization times
+    # Format: (time, dof_index, source) where source: 0=t_min, 1=a.right, 2=b.right
+    candidates = Tuple{Float64, Int, Int}[]
+
     for i in 1:ndof
-        if is_blocked(blocks[i], t_sync)
-            # TODO: Try next candidate time from block intervals
-            error("Synchronization time $t_sync is blocked for DOF $i")
+        push!(candidates, (blocks[i].t_min, i, 0))
+        if !isnothing(blocks[i].a)
+            push!(candidates, (blocks[i].a.right, i, 1))
         end
+        if !isnothing(blocks[i].b)
+            push!(candidates, (blocks[i].b.right, i, 2))
+        end
+    end
+
+    # Sort candidates by time
+    sort!(candidates, by=first)
+
+    # Find minimum of all t_min values - can't synchronize faster than the slowest minimum
+    min_t_min = maximum(block.t_min for block in blocks)
+
+    # Find valid t_sync: first candidate >= min_t_min that isn't blocked for any DOF
+    t_sync = NaN
+    limiting_dof = 0
+    limiting_source = 0
+
+    for (candidate_time, dof, source) in candidates
+        # Skip candidates faster than the slowest minimum-time profile
+        candidate_time < min_t_min - T_PRECISION && continue
+        isinf(candidate_time) && continue
+
+        # Check if this time is blocked for any DOF
+        is_any_blocked = false
+        for j in 1:ndof
+            if is_blocked(blocks[j], candidate_time)
+                is_any_blocked = true
+                break
+            end
+        end
+
+        if !is_any_blocked
+            t_sync = candidate_time
+            limiting_dof = dof
+            limiting_source = source
+            break
+        end
+    end
+
+    if isnan(t_sync)
+        error("Failed to find valid synchronization time. Blocks: ", blocks)
     end
 
     # Step 2: Recalculate non-limiting DOFs for synchronized duration
     profiles = Vector{RuckigProfile{Float64}}(undef, ndof)
 
     for i in 1:ndof
-        if i == limiting_dof
-            # Limiting DOF uses its minimum-time profile
+        # Check if this DOF can use an existing profile (from Step 1 or blocked interval)
+        # Use 2*eps tolerance for numerical robustness (matching C++ line 480)
+        if abs(t_sync - blocks[i].t_min) < 2 * T_PRECISION
             profiles[i] = blocks[i].p_min
-        elseif abs(t_sync - blocks[i].t_min) < T_PRECISION
-            # Duration matches, use existing profile
-            profiles[i] = blocks[i].p_min
+        elseif !isnothing(blocks[i].a) && abs(t_sync - blocks[i].a.right) < 2 * T_PRECISION
+            profiles[i] = blocks[i].a.profile
+        elseif !isnothing(blocks[i].b) && abs(t_sync - blocks[i].b.right) < 2 * T_PRECISION
+            profiles[i] = blocks[i].b.profile
         else
             # Need to recalculate for synchronized duration (Step 2)
             buf = lims[i].buffer
@@ -3136,7 +3528,7 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
                 lims[i].amax, lims[i].amin)
 
             if !success
-                error("Failed to find synchronized profile for DOF $i at duration $t_sync. lims = ", lims, ", p0 = ", p0, ", v0 = ", v0, ", a0 = ", a0, ", pf = ", pf, ", vf = ", vf, ", af = ", af)
+                error("Failed to find synchronized profile for DOF $i at duration $t_sync. Blocks: $blocks, lims = $lims, p0 = $p0, v0 = $v0, a0 = $a0, pf = $pf, vf = $vf, af = $af")
             end
 
             profiles[i] = RuckigProfile(buf, pf[i], vf[i], af[i])
