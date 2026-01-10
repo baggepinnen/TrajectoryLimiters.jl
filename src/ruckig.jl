@@ -1232,6 +1232,20 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
     buf = buffer
     clear!(buf)
 
+    # Validate input constraints
+    # if v0 < vmin || v0 > vmax
+    #     error("Initial velocity v0=$v0 is outside allowed range [$vmin, $vmax]")
+    # end
+    if vf < vmin || vf > vmax
+        error("Target velocity vf=$vf is outside allowed range [$vmin, $vmax]")
+    end
+    # if a0 < amin || a0 > amax
+    #     error("Initial acceleration a0=$a0 is outside allowed range [$amin, $amax]")
+    # end
+    if af < amin || af > amax
+        error("Target acceleration af=$af is outside allowed range [$amin, $amax]")
+    end
+
     # Determine primary and secondary direction based on displacement
     # For positive pd: primary uses standard limits
     # For negative pd: primary uses swapped limits (to move in negative direction)
@@ -2955,7 +2969,7 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
                 lims[i].amax, lims[i].amin)
 
             if !success
-                error("Failed to find synchronized profile for DOF $i at duration $t_sync")
+                error("Failed to find synchronized profile for DOF $i at duration $t_sync. lims = ", lims, ", p0 = ", p0, ", v0 = ", v0, ", a0 = ", a0, ", pf = ", pf, ", vf = ", vf, ", af = ", af)
             end
 
             profiles[i] = RuckigProfile(buf, pf[i], vf[i], af[i])
