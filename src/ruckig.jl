@@ -4,8 +4,9 @@
 # Reference implementation: https://github.com/pantor/ruckig
 # License of reference: MIT License https://github.com/pantor/ruckig/blob/main/LICENSE
 
-export JerkLimiter, RuckigProfile, BrakeProfile
+export JerkLimiter, RuckigProfile, BrakeProfile, Block, BlockInterval
 export calculate_trajectory, calculate_waypoint_trajectory, calculate_velocity_trajectory
+export calculate_block_with_collection
 export evaluate_at, evaluate_dt, duration, main_duration
 
 #=============================================================================
@@ -4444,3 +4445,6 @@ end
 
 # Include velocity control interface
 include("ruckig_velocity.jl")
+
+# Include enhanced block interval collection
+include("ruckig_block.jl")
