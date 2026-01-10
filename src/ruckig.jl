@@ -974,9 +974,36 @@ end
 
 """
 Solve ax³ + bx² + cx + d = 0 for real roots using Cardano's formula.
+Matches C++ reference implementation in roots.hpp.
 """
 function solve_cubic_real!(roots::Roots, a, b, c, d)
     clear!(roots)
+
+    # Special case: d ≈ 0 means x = 0 is a root (matching C++ roots.hpp lines 63-72)
+    # Factor out x: x(ax² + bx + c) = 0, so solve the quadratic for remaining roots
+    if abs(d) < EPS
+        push!(roots, 0.0)
+        # Solve ax² + bx + c = 0 for remaining roots
+        if abs(a) < EPS
+            # Linear: bx + c = 0
+            if abs(b) > EPS
+                push!(roots, -c/b)
+            end
+        else
+            disc = b^2 - 4a*c
+            if disc >= 0
+                if disc < EPS
+                    push!(roots, -b / (2a))
+                else
+                    sqrt_disc = sqrt(disc)
+                    push!(roots, (-b - sqrt_disc) / (2a))
+                    push!(roots, (-b + sqrt_disc) / (2a))
+                end
+            end
+        end
+        return roots
+    end
+
     if abs(a) < EPS
         return solve_quadratic_real!(roots, b, c, d)
     end
