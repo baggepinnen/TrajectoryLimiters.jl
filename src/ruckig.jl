@@ -5,7 +5,8 @@
 # License of reference: MIT License https://github.com/pantor/ruckig/blob/main/LICENSE
 
 export JerkLimiter, RuckigProfile, BrakeProfile
-export calculate_trajectory, calculate_waypoint_trajectory, evaluate_at, evaluate_dt, duration, main_duration
+export calculate_trajectory, calculate_waypoint_trajectory, calculate_velocity_trajectory
+export evaluate_at, evaluate_dt, duration, main_duration
 
 #=============================================================================
  Constants (matching reference implementation)
@@ -4440,3 +4441,6 @@ function evaluate_dt(profiles::AbstractVector{<:RuckigProfile{T}}, Ts) where T
 
     return pos, vel, acc, jerk, ts
 end
+
+# Include velocity control interface
+include("ruckig_velocity.jl")
