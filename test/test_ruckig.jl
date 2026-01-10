@@ -668,6 +668,16 @@ end
         waypoints = [(p = randn(),) for i = 1:100]
         @test_nowarn calculate_waypoint_trajectory(lim, waypoints, 0.001)
 
+
+        lims = [
+            JerkLimiter(; vmax=10.0*rand()+5, amax=50.0*rand()+5, jmax=1000.0*rand(), vmin=-10.0*rand()-5, amin=-50.0*rand()-5) for i = 1:2
+        ]
+        waypoints = [(p = randn(2), v = randn(2)) for i = 1:100]
+        @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
+
+        waypoints = [(p = randn(2), v = randn(2), a = randn(2)) for i = 1:100]
+        @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
+
         GC.gc(true); sleep(0.1)
     end
 end
@@ -696,4 +706,50 @@ end
     p0,v0,a0 = (-0.5315788502269256, 0.0, 0.0)
     pf,vf,af = (0.6323634408240384, 0.0, 0.0)
     calculate_trajectory(lim4; p0, v0, a0, pf, vf, af)
+
+    # Asymmetric limits case 4 - invalid target velocity (outside allowed range)
+    # vf=-0.938 < vmin=-0.887, so this should error
+    lim5 = JerkLimiter(; vmax=7.179733007056405, vmin=-0.8871410693710302, amax=33.08407145600285, amin=-6.791789891210365, jmax=563.0719879954868)
+    p0,v0,a0 = (-0.22161140141696192, -0.29449744543659623, 0.0)
+    pf,vf,af = (-0.2962092284890949, -0.9377700029012783, 0.0)
+    @test_throws ErrorException calculate_trajectory(lim5; p0, v0, a0, pf, vf, af)
+
+    # Asymmetric limits case 5 - single DOF with non-zero velocities (C++ gets 0.086s)
+    lim6 = JerkLimiter(; vmax=9.893427138005233, vmin=-4.195612678348535, amax=12.078328237289949, amin=-39.36255340641591, jmax=507.34452830286716)
+    p0,v0,a0 = (1.1027816486815265, -1.5479008715462181, 0.5968646706547006)
+    pf,vf,af = (0.9930833291182205, -0.8985940436554194, 1.4276116384379833)
+    prof = calculate_trajectory(lim6; p0, v0, a0, pf, vf, af)
+    @test duration(prof) ≈ 0.0859329038189459 rtol=1e-6
+
+    # Asymmetric limits case 6 - Multi-DOF synchronization
+    lims_multi = [
+        JerkLimiter(; vmax=9.893427138005233, vmin=-4.195612678348535, amax=12.078328237289949, amin=-39.36255340641591, jmax=507.34452830286716),
+        JerkLimiter(; vmax=1.1765171949042518, vmin=-0.9686298251680693, amax=47.31266645698063, amin=-8.68587820773526, jmax=927.2892655068578),
+    ]
+    p0_multi = [1.1027816486815265, -0.24704027944893318]
+    v0_multi = [-1.5479008715462181, -0.5009063759259685]
+    a0_multi = [0.5968646706547006, -1.2339254009498102]
+    pf_multi = [0.9930833291182205, -0.4813668823155839]
+    vf_multi = [-0.8985940436554194, -0.06858932645285804]
+    af_multi = [1.4276116384379833, 3.7285908168024676]
+    profiles = calculate_trajectory(lims_multi; p0=p0_multi, v0=v0_multi, a0=a0_multi, pf=pf_multi, vf=vf_multi, af=af_multi)
+    @test duration(profiles[1]) ≈ duration(profiles[2])  # synchronized
+    @test duration(profiles[1]) ≈ 0.315 rtol=0.01  # approximately C++ result
+
+    # Asymmetric limits case 7 - Multi-DOF synchronization, DOF 0 is limiting
+    # DOF 0 min duration: 0.782, DOF 1 min duration: 0.379
+    # C++ synchronizes both to 0.782 successfully
+    lims_multi7 = [
+        JerkLimiter(; vmax=9.893427138005233, vmin=-4.195612678348535, amax=12.078328237289949, amin=-39.36255340641591, jmax=507.34452830286716),
+        JerkLimiter(; vmax=13.291034736601903, vmin=-3.8842062448080252, amax=31.775176417549602, amin=-8.718562920546741, jmax=823.3195381668564),
+    ]
+    p0_multi7 = [-1.6478335226310068, -1.8288458926404993]
+    v0_multi7 = [-0.559765177860057, 0.28380553260563673]
+    a0_multi7 = [0.0, 0.0]
+    pf_multi7 = [0.5109185999108988, -1.1461809393561588]
+    vf_multi7 = [0.10670168637106899, 0.8160643008030284]
+    af_multi7 = [0.0, 0.0]
+    profiles7 = calculate_trajectory(lims_multi7; p0=p0_multi7, v0=v0_multi7, a0=a0_multi7, pf=pf_multi7, vf=vf_multi7, af=af_multi7)
+    @test duration(profiles7[1]) ≈ duration(profiles7[2])  # synchronized
+    @test duration(profiles7[1]) ≈ 0.78215181077265 rtol=1e-6  # C++ result
 end
