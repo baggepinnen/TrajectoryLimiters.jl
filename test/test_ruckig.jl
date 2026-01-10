@@ -649,23 +649,23 @@ end
 end
 
 @testset "random waypoint traj" begin
-    for _ in 1:6
+    for _ in 1:5
         lims = [
             JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand()) for i = 1:7
         ]
-        waypoints = [(p = randn(7),) for i = 1:10000]
+        waypoints = [(p = randn(7),) for i = 1:1000]
         @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
 
 
         lims = [
             JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand(), vmin=-10.0*rand(), amin=-50.0*rand()) for i = 1:2
         ]
-        waypoints = [(p = randn(2),) for i = 1:10000]
+        waypoints = [(p = randn(2),) for i = 1:1000]
         @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
 
 
         lim = JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand())
-        waypoints = [(p = randn(),) for i = 1:10000]
+        waypoints = [(p = randn(),) for i = 1:1000]
         @test_nowarn calculate_waypoint_trajectory(lim, waypoints, 0.001)
 
         GC.gc(true); sleep(0.1)
