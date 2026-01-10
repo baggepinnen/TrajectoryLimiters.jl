@@ -522,16 +522,47 @@ function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::Reac
                 jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af=zero(T)) where T
 
     # Set jerk pattern based on control signs
-    if control_signs == UDDU
-        buf.j[1], buf.j[2], buf.j[3], buf.j[4], buf.j[5], buf.j[6], buf.j[7] = jf, 0, -jf, 0, -jf, 0, jf
-    else  # UDUD
-        buf.j[1], buf.j[2], buf.j[3], buf.j[4], buf.j[5], buf.j[6], buf.j[7] = jf, 0, -jf, 0, jf, 0, -jf
-    end
+    # Note: jerk is set after times are clamped below (C++ sets jerk based on t > 0)
 
     # Check all times non-negative (NaN < x is false, so check explicitly)
     @inbounds for i in 1:7
         (isnan(buf.t[i]) || buf.t[i] < -T_PRECISION) && return false
         buf.t[i] = max(buf.t[i], zero(T))
+    end
+
+    # Reference implementation (profile.hpp lines 188-204):
+    # Check that certain phase times are strictly positive for specific profile types
+    # For velocity profiles: t[4] (Julia 1-based) must be > epsilon
+    if limits in (LIMIT_ACC0_ACC1_VEL, LIMIT_ACC0_VEL, LIMIT_ACC1_VEL, LIMIT_VEL)
+        buf.t[4] < EPS && return false
+    end
+    # For ACC0/ACC0_ACC1: t[2] must be > epsilon (cruise time at aMax)
+    if limits in (LIMIT_ACC0, LIMIT_ACC0_ACC1)
+        buf.t[2] < EPS && return false
+    end
+    # For ACC1/ACC0_ACC1: t[6] must be > epsilon (cruise time at aMin)
+    if limits in (LIMIT_ACC1, LIMIT_ACC0_ACC1)
+        buf.t[6] < EPS && return false
+    end
+
+    # Set jerk pattern based on control signs (matching C++ profile.hpp lines 210-214)
+    # Jerk is 0 if corresponding phase time is 0
+    if control_signs == UDDU
+        buf.j[1] = buf.t[1] > 0 ? jf : zero(T)
+        buf.j[2] = zero(T)
+        buf.j[3] = buf.t[3] > 0 ? -jf : zero(T)
+        buf.j[4] = zero(T)
+        buf.j[5] = buf.t[5] > 0 ? -jf : zero(T)
+        buf.j[6] = zero(T)
+        buf.j[7] = buf.t[7] > 0 ? jf : zero(T)
+    else  # UDUD
+        buf.j[1] = buf.t[1] > 0 ? jf : zero(T)
+        buf.j[2] = zero(T)
+        buf.j[3] = buf.t[3] > 0 ? -jf : zero(T)
+        buf.j[4] = zero(T)
+        buf.j[5] = buf.t[5] > 0 ? jf : zero(T)
+        buf.j[6] = zero(T)
+        buf.j[7] = buf.t[7] > 0 ? -jf : zero(T)
     end
 
     # Integrate profile (Eq. 2-4 from paper)
@@ -550,6 +581,27 @@ function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::Reac
         buf.a[i+1] = ai + ti * ji
         buf.v[i+1] = vi + ti * (ai + ti * ji / 2)
         buf.p[i+1] = pi + ti * (vi + ti * (ai / 2 + ti * ji / 6))
+
+        # Reference implementation (profile.hpp lines 225-246):
+        # For velocity-limited profiles, explicitly set a[4] = 0 after phase 3
+        # This is done ALWAYS for velocity profiles (not inside set_limits block)
+        if limits in (LIMIT_ACC0_ACC1_VEL, LIMIT_ACC0_VEL, LIMIT_ACC1_VEL, LIMIT_VEL) && i == 3
+            buf.a[4] = zero(T)
+        end
+
+        # For ACC1 profiles, set a[4] = aMin (C++ uses set_limits=true for ACC1)
+        if limits == LIMIT_ACC1 && i == 3
+            buf.a[4] = aMin
+        end
+
+        # For ACC0_ACC1 profiles, set a[2] = aMax and a[6] = aMin
+        if limits == LIMIT_ACC0_ACC1
+            if i == 1
+                buf.a[2] = aMax
+            elseif i == 5
+                buf.a[6] = aMin
+            end
+        end
 
         cumtime += ti
         buf.t_sum[i] = cumtime
@@ -581,7 +633,8 @@ function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::Reac
     end
 
     # Check velocity at acceleration zero-crossings
-    @inbounds for i in 3:6
+    # C++ checks for i > 1 in 0-based indexing (i=2,3,4,5,6), which is Julia i=3,4,5,6,7
+    @inbounds for i in 3:7
         buf.t[i] < EPS && continue
         ai, ji = buf.a[i], buf.j[i]
         abs(ji) < EPS && continue
@@ -717,7 +770,7 @@ end
 """
 Try ACC0_ACC1 profile (reach both aMax and aMin, but not vMax).
 """
-function time_acc0_acc1!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
+function time_acc0_acc1!(buf::ProfileBuffer{T}, candidate::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                          jMax, vMax, vMin, aMax, aMin) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
@@ -744,6 +797,10 @@ function time_acc0_acc1!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
     h2 = a0_a0/(2*aMax*jMax) + (aMin - 2*aMax)/(2*jMax) - v0/aMax
     h3 = -af_af/(2*aMin*jMax) - (aMax - 2*aMin)/(2*jMax) + vf/aMin
 
+    # Track the best (shortest duration) profile found
+    best_duration = T(Inf)
+    found_valid = false
+
     # Try two solutions (from reference implementation)
     # Solution 2: h2 > h1/aMax, h3 > -h1/aMin => t[2] = h2 - h1/aMax, t[6] = h3 + h1/aMin
     # Solution 1: h2 > -h1/aMax, h3 > h1/aMin => t[2] = h2 + h1/aMax, t[6] = h3 - h1/aMin
@@ -753,20 +810,25 @@ function time_acc0_acc1!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
 
         t1_cond && t5_cond || continue
 
-        buf.t[1] = (-a0 + aMax) / jMax
-        buf.t[2] = h2 - h1_sign * h1 / aMax
-        buf.t[3] = aMax / jMax
-        buf.t[4] = 0
-        buf.t[5] = -aMin / jMax
-        buf.t[6] = h3 + h1_sign * h1 / aMin
-        buf.t[7] = buf.t[5] + af / jMax
+        candidate.t[1] = (-a0 + aMax) / jMax
+        candidate.t[2] = h2 - h1_sign * h1 / aMax
+        candidate.t[3] = aMax / jMax
+        candidate.t[4] = 0
+        candidate.t[5] = -aMin / jMax
+        candidate.t[6] = h3 + h1_sign * h1 / aMin
+        candidate.t[7] = candidate.t[5] + af / jMax
 
-        if check!(buf, UDDU, LIMIT_ACC0_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            return true
+        if check!(candidate, UDDU, LIMIT_ACC0_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            dur = sum(candidate.t)
+            if dur < best_duration
+                best_duration = dur
+                found_valid = true
+                copy_buffer!(buf, candidate)
+            end
         end
     end
 
-    return false
+    return found_valid
 end
 
 """
@@ -1314,7 +1376,7 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
             return RuckigProfile(buf, pf, vf, af)
         end
 
-        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        if time_acc0_acc1!(buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
             return RuckigProfile(buf, pf, vf, af)
         end
 
@@ -1328,7 +1390,7 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
             return RuckigProfile(buf, pf, vf, af)
         end
 
-        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        if time_acc0_acc1!(buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
             return RuckigProfile(buf, pf, vf, af)
         end
 
@@ -1361,11 +1423,11 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
 
         # Collect from time_acc0_acc1 (both directions) - using ORIGINAL limits
         clear!(buf)
-        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        if time_acc0_acc1!(buf, lim.candidate, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
             try_save_best!()
         end
         clear!(buf)
-        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        if time_acc0_acc1!(buf, lim.candidate, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
             try_save_best!()
         end
 
