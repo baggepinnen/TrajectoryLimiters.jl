@@ -1313,20 +1313,17 @@ function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::Reac
         (buf.v[i] > vUppLim || buf.v[i] < vLowLim) && return false
     end
 
-    # Check velocity at acceleration zero-crossings
+    # Check velocity at acceleration zero-crossings (matching C++ profile.hpp lines 249-254)
     # C++ checks for i > 1 in 0-based indexing (i=2,3,4,5,6), which is Julia i=3,4,5,6,7
+    # When acceleration changes sign within a phase, check that velocity at the zero-crossing
+    # doesn't violate limits. Formula: v_at_zero = v[i] - a[i]²/(2*j[i])
     @inbounds for i in 3:7
-        buf.t[i] < EPS && continue
-        ai, ji = buf.a[i], buf.j[i]
-        abs(ji) < EPS && continue
-
-        # Time when acceleration crosses zero within this phase
+        ai = buf.a[i]
+        # Check if acceleration changes sign between start and end of phase
         if ai * buf.a[i+1] < -EPS
-            t_zero = -ai / ji
-            if 0 < t_zero < buf.t[i]
-                v_at_zero = buf.v[i] - ai^2 / (2ji)
-                (v_at_zero > vUppLim || v_at_zero < vLowLim) && return false
-            end
+            ji = buf.j[i]
+            v_at_zero = buf.v[i] - ai^2 / (2ji)
+            (v_at_zero > vUppLim || v_at_zero < vLowLim) && return false
         end
     end
 

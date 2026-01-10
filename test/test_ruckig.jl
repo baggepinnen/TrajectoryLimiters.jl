@@ -722,8 +722,6 @@ end
     @test duration(prof) ≈ 0.0859329038189459 rtol=1e-6
 
     # Asymmetric limits case 6 - Multi-DOF synchronization
-    # DOF 0 has 0.086s optimal (ACC1 profile), DOF 1 has 0.280s optimal
-    # C++ synchronizes at 0.315s
     lims_multi = [
         JerkLimiter(; vmax=9.893427138005233, vmin=-4.195612678348535, amax=12.078328237289949, amin=-39.36255340641591, jmax=507.34452830286716),
         JerkLimiter(; vmax=1.1765171949042518, vmin=-0.9686298251680693, amax=47.31266645698063, amin=-8.68587820773526, jmax=927.2892655068578),
