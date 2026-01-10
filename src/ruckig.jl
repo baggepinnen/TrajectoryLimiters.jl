@@ -4,8 +4,8 @@
 # Reference implementation: https://github.com/pantor/ruckig
 # License of reference: MIT License https://github.com/pantor/ruckig/blob/main/LICENSE
 
-export JerkLimiter, RuckigProfile
-export calculate_trajectory, calculate_waypoint_trajectory, evaluate_at, evaluate_dt, duration
+export JerkLimiter, RuckigProfile, BrakeProfile
+export calculate_trajectory, calculate_waypoint_trajectory, evaluate_at, evaluate_dt, duration, main_duration
 
 #=============================================================================
  Constants (matching reference implementation)
@@ -16,6 +16,10 @@ const P_PRECISION = 1e-8
 const V_PRECISION = 1e-8
 const A_PRECISION = 1e-10
 const T_PRECISION = 1e-12
+const NEWTON_TOL = 1e-9  # Newton refinement tolerance (C++ uses 1e-9 for profile refinement)
+
+# Include brake profile implementation
+include("ruckig_brake.jl")
 
 #=============================================================================
  Enums
@@ -107,6 +111,7 @@ end
     RuckigProfile{T}
 
 A 7-phase jerk-limited trajectory profile (immutable result).
+Optionally includes a pre-pended brake profile if initial state was outside limits.
 """
 struct RuckigProfile{T}
     t::NTuple{7,T}        # Phase durations
@@ -121,12 +126,14 @@ struct RuckigProfile{T}
     limits::ReachedLimits
     control_signs::ControlSigns
     direction::Direction
+    brake_duration::T     # Duration of pre-pended brake profile (0 if no braking)
+    brake::Union{Nothing, BrakeProfile{T}}  # Brake profile for initial states outside limits
 end
 
 """
 Create RuckigProfile from ProfileBuffer.
 """
-function RuckigProfile(buf::ProfileBuffer{T}, pf, vf, af) where T
+function RuckigProfile(buf::ProfileBuffer{T}, pf, vf, af; brake_duration=zero(T), brake::Union{Nothing, BrakeProfile{T}}=nothing) where T
     RuckigProfile{T}(
         NTuple{7,T}(buf.t),
         NTuple{7,T}(buf.t_sum),
@@ -135,14 +142,20 @@ function RuckigProfile(buf::ProfileBuffer{T}, pf, vf, af) where T
         NTuple{8,T}(buf.v),
         NTuple{8,T}(buf.p),
         pf, vf, af,
-        buf.limits, buf.control_signs, buf.direction
+        buf.limits, buf.control_signs, buf.direction,
+        T(brake_duration),
+        brake
     )
 end
 
 # Allow RuckigProfile to broadcast as a scalar
 Base.Broadcast.broadcastable(p::RuckigProfile) = Ref(p)
 
-duration(p::RuckigProfile) = p.t_sum[end]
+"""Total duration including any brake profile."""
+duration(p::RuckigProfile) = p.brake_duration + p.t_sum[end]
+
+"""Duration of just the main profile (excluding brake)."""
+main_duration(p::RuckigProfile) = p.t_sum[end]
 
 #=============================================================================
  Block: Stores profile and blocked time intervals for synchronization
@@ -473,11 +486,12 @@ struct JerkLimiter{T}
     buffer::ProfileBuffer{Float64}  # Always Float64 for computation (stores best profile)
     candidate::ProfileBuffer{Float64}  # Candidate buffer for profile search
     valid_profiles::ValidProfileCollection{Float64}  # Collects valid profiles for blocked intervals
+    brake::BrakeProfile{Float64}    # Brake profile for initial states outside limits
 end
 
 function JerkLimiter(; vmax, amax, jmax, vmin=-vmax, amin=-amax)
     T = promote_type(typeof(vmax), typeof(vmin), typeof(amax), typeof(amin), typeof(jmax))
-    JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}(), ProfileBuffer{Float64}(), ProfileBuffer{Float64}(), ValidProfileCollection{Float64}())
+    JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}(), ProfileBuffer{Float64}(), ProfileBuffer{Float64}(), ValidProfileCollection{Float64}(), BrakeProfile{Float64}())
 end
 
 function Base.show(io::IO, lim::JerkLimiter)
@@ -858,6 +872,79 @@ function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::Reac
 end
 
 #=============================================================================
+ Profile Time Calculations - Zero-Limits Special Case
+=============================================================================#
+
+"""
+    time_all_single_step!(buf, p0, v0, a0, pf, vf, af, jMax, vMax, vMin, aMax, aMin) -> Bool
+
+Handle zero-limits special case when jMax=0, aMax=0, or aMin=0.
+This computes a single-phase trajectory with constant acceleration.
+
+C++ Reference: position_third_step1.cpp lines 467-508
+"""
+function time_all_single_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
+                               jMax, vMax, vMin, aMax, aMin) where T
+    pd = pf - p0
+
+    # Acceleration must be constant (a0 = af)
+    if abs(af - a0) > EPS
+        return false
+    end
+
+    # All phase times are zero except t[4] (coast phase, 1-indexed)
+    for i in 1:7
+        buf.t[i] = zero(T)
+        buf.j[i] = zero(T)
+    end
+
+    if abs(a0) > EPS
+        # Constant acceleration case: solve p = p0 + v0*t + 0.5*a0*t² for t
+        # Quadratic: 0.5*a0*t² + v0*t - pd = 0
+        # t = (-v0 ± sqrt(v0² + 2*a0*pd)) / a0
+        disc = v0^2 + 2 * a0 * pd
+        if disc < 0
+            return false
+        end
+        q = sqrt(disc)
+
+        # Solution 1: (-v0 + q) / a0
+        t_coast = (-v0 + q) / a0
+        if t_coast >= 0
+            buf.t[4] = t_coast
+            if check_for_profile!(buf, p0, v0, a0, pf, vf, af, zero(T), vMax, vMin, aMax, aMin, LIMIT_NONE, UDDU)
+                return true
+            end
+        end
+
+        # Solution 2: -(v0 + q) / a0
+        t_coast = -(v0 + q) / a0
+        if t_coast >= 0
+            buf.t[4] = t_coast
+            if check_for_profile!(buf, p0, v0, a0, pf, vf, af, zero(T), vMax, vMin, aMax, aMin, LIMIT_NONE, UDDU)
+                return true
+            end
+        end
+
+    elseif abs(v0) > EPS
+        # Constant velocity case: t = pd / v0
+        t_coast = pd / v0
+        buf.t[4] = t_coast
+        if check_for_profile!(buf, p0, v0, a0, pf, vf, af, zero(T), vMax, vMin, aMax, aMin, LIMIT_NONE, UDDU)
+            return true
+        end
+
+    elseif abs(pd) < EPS
+        # Already at target
+        if check_for_profile!(buf, p0, v0, a0, pf, vf, af, zero(T), vMax, vMin, aMax, aMin, LIMIT_NONE, UDDU)
+            return true
+        end
+    end
+
+    return false
+end
+
+#=============================================================================
  Profile Time Calculations - UDDU (matching reference implementation)
 =============================================================================#
 
@@ -1173,14 +1260,14 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, candidate
             h1 = jMax*t
             orig = -(h0_acc1/2 + h1*(h5 + a0*(aMin - 2*h1)*(aMin - h1) + a0_a0*(5*h1/2 - 2*aMin) + aMin^2*h1/2 + jMax*(h1/2 - aMin)*(h1*t + 2*v0)))/jMax
 
-            if abs(orig) > 1e-9
+            if abs(orig) > NEWTON_TOL
                 deriv = (aMin - a0 - h1)*(h2_acc1 + h1*(4*a0 - aMin + 2*h1))
                 t -= orig / deriv  # Second step: no min
 
                 h1 = jMax*t
                 orig = -(h0_acc1/2 + h1*(h5 + a0*(aMin - 2*h1)*(aMin - h1) + a0_a0*(5*h1/2 - 2*aMin) + aMin^2*h1/2 + jMax*(h1/2 - aMin)*(h1*t + 2*v0)))/jMax
 
-                if abs(orig) > 1e-9
+                if abs(orig) > NEWTON_TOL
                     deriv = (aMin - a0 - h1)*(h2_acc1 + h1*(4*a0 - aMin + 2*h1))
                     t -= orig / deriv  # Third step: no min
                 end
@@ -1440,26 +1527,57 @@ Evaluate profile at time t.
 """
 function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
     T_total = duration(profile)
+    brake_dur = profile.brake_duration
 
     if t <= 0
-        return profile.p[1], profile.v[1], profile.a[1], profile.j[1]
+        # Return initial state (before brake if any)
+        if profile.brake !== nothing && brake_dur > 0
+            bp = profile.brake
+            return bp.p[1], bp.v[1], bp.a[1], bp.j[1]
+        else
+            return profile.p[1], profile.v[1], profile.a[1], profile.j[1]
+        end
     end
 
     if t >= T_total
         return profile.p[8], profile.v[8], profile.a[8], zero(T)
     end
 
-    # Find phase
+    # Handle brake phase if present
+    if profile.brake !== nothing && brake_dur > 0 && t < brake_dur
+        bp = profile.brake
+        # Find which brake phase we're in
+        if t <= bp.t[1]
+            # First brake phase
+            dt = t
+            pk, vk, ak, jk = bp.p[1], bp.v[1], bp.a[1], bp.j[1]
+        else
+            # Second brake phase
+            dt = t - bp.t[1]
+            pk, vk, ak, jk = bp.p[2], bp.v[2], bp.a[2], bp.j[2]
+        end
+
+        p = pk + dt * (vk + dt * (ak / 2 + dt * jk / 6))
+        v = vk + dt * (ak + dt * jk / 2)
+        a = ak + dt * jk
+
+        return p, v, a, jk
+    end
+
+    # Main profile evaluation (subtract brake duration)
+    t_main = t - brake_dur
+
+    # Find phase in main profile
     phase = 1
     @inbounds for k in 1:7
-        if t <= profile.t_sum[k]
+        if t_main <= profile.t_sum[k]
             phase = k
             break
         end
     end
 
     t_start = phase == 1 ? zero(T) : profile.t_sum[phase-1]
-    dt = t - t_start
+    dt = t_main - t_start
 
     pk = profile.p[phase]
     vk = profile.v[phase]
@@ -1532,34 +1650,49 @@ Calculate time-optimal trajectory from (p0, v0, a0) to (pf, vf, af).
 """
 function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a0=zero(T), vf=zero(T), af=zero(T)) where T
 
-    (; vmax, vmin, amax, amin, jmax, buffer) = lim
+    (; vmax, vmin, amax, amin, jmax, buffer, brake) = lim
     buf = buffer
     clear!(buf)
 
-    # Validate input constraints
-    # if v0 < vmin || v0 > vmax
-    #     error("Initial velocity v0=$v0 is outside allowed range [$vmin, $vmax]")
-    # end
+    # Validate target constraints (initial state can be outside limits - handled by brake)
     if vf < vmin || vf > vmax
         error("Target velocity vf=$vf is outside allowed range [$vmin, $vmax]")
     end
-    # if a0 < amin || a0 > amax
-    #     error("Initial acceleration a0=$a0 is outside allowed range [$amin, $amax]")
-    # end
     if af < amin || af > amax
         error("Target acceleration af=$af is outside allowed range [$amin, $amax]")
     end
 
+    # Compute brake profile if initial state is outside limits
+    # This handles a0 > amax, a0 < amin, v0 > vmax, or v0 < vmin
+    get_position_brake_trajectory!(brake, v0, a0, vmax, vmin, amax, amin, jmax)
+    ps, vs, as = finalize_brake!(brake, p0, v0, a0)
+    brake_duration = brake.duration
+
+    # Create a copy of the brake profile to store in the result (if braking occurred)
+    brake_copy = brake_duration > 0 ? deepcopy(brake) : nothing
+
+    # Use post-brake state as effective initial state
+    p0_eff, v0_eff, a0_eff = ps, vs, as
+
     # Determine primary and secondary direction based on displacement
     # For positive pd: primary uses standard limits
     # For negative pd: primary uses swapped limits (to move in negative direction)
-    pd = pf - p0
+    pd = pf - p0_eff
     if pd >= 0
         jMax1, vMax1, vMin1, aMax1, aMin1 = jmax, vmax, vmin, amax, amin
         jMax2, vMax2, vMin2, aMax2, aMin2 = -jmax, vmin, vmax, amin, amax
     else
         jMax1, vMax1, vMin1, aMax1, aMin1 = -jmax, vmin, vmax, amin, amax
         jMax2, vMax2, vMin2, aMax2, aMin2 = jmax, vmax, vmin, amax, amin
+    end
+
+    # Zero-limits special case: jMax=0, aMax=0, or aMin=0
+    # C++ Reference: position_third_step1.cpp lines 511-525
+    if jmax == 0 || amax == 0 || amin == 0
+        if time_all_single_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
+        end
+        error("No valid trajectory found for zero-limits case from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
     end
 
     # Reference implementation behavior:
@@ -1570,30 +1703,30 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
     if abs(vf) < EPS && abs(af) < EPS
         # Fast path: return first valid profile found
         # Try primary direction first
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-            return RuckigProfile(buf, pf, vf, af)
+        if time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
         end
 
-        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-            return RuckigProfile(buf, pf, vf, af)
+        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
         end
 
-        if time_acc0_acc1!(buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-            return RuckigProfile(buf, pf, vf, af)
+        if time_acc0_acc1!(buf, lim.candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
         end
 
         # Try secondary direction
         clear!(buf)
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
-            return RuckigProfile(buf, pf, vf, af)
+        if time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
         end
 
-        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
-            return RuckigProfile(buf, pf, vf, af)
+        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
         end
 
-        if time_acc0_acc1!(buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
-            return RuckigProfile(buf, pf, vf, af)
+        if time_acc0_acc1!(buf, lim.candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
         end
 
         # Fall through to two-step profiles
@@ -1610,36 +1743,36 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
             dur = sum(buf.t)
             if dur < best_duration
                 best_duration = dur
-                best_profile = RuckigProfile(buf, pf, vf, af)
+                best_profile = RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
             end
         end
 
         # Collect from time_all_none_acc0_acc1 (both directions) - using ORIGINAL limits
-        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
             try_save_best!()
         end
         clear!(buf)
-        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
             try_save_best!()
         end
 
         # Collect from time_acc0_acc1 (both directions) - using ORIGINAL limits
         clear!(buf)
-        if time_acc0_acc1!(buf, lim.candidate, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        if time_acc0_acc1!(buf, lim.candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
             try_save_best!()
         end
         clear!(buf)
-        if time_acc0_acc1!(buf, lim.candidate, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        if time_acc0_acc1!(buf, lim.candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
             try_save_best!()
         end
 
         # Collect from time_all_vel (both directions) - using ORIGINAL limits
         clear!(buf)
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        if time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
             try_save_best!()
         end
         clear!(buf)
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        if time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
             try_save_best!()
         end
 
@@ -1653,39 +1786,39 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
     # Two-step profiles (fallback, only if no regular profile found)
     # C++ uses original limits for two-step profiles (lines 567-581)
     clear!(buf)
-    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-        return RuckigProfile(buf, pf, vf, af)
+    if time_none_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
     end
     clear!(buf)
-    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-
-    clear!(buf)
-    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-    clear!(buf)
-    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-        return RuckigProfile(buf, pf, vf, af)
+    if time_none_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
     end
 
     clear!(buf)
-    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-        return RuckigProfile(buf, pf, vf, af)
+    if time_acc0_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
     end
     clear!(buf)
-    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-        return RuckigProfile(buf, pf, vf, af)
+    if time_acc0_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
     end
 
     clear!(buf)
-    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-        return RuckigProfile(buf, pf, vf, af)
+    if time_vel_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
     end
     clear!(buf)
-    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-        return RuckigProfile(buf, pf, vf, af)
+    if time_vel_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
+    end
+
+    clear!(buf)
+    if time_acc1_vel_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
+    end
+    clear!(buf)
+    if time_acc1_vel_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
     end
 
     error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
@@ -1704,12 +1837,12 @@ matching the C++ reference implementation behavior for computing blocked interva
 """
 function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a0=zero(T), vf=zero(T), af=zero(T)) where T
 
-    (; vmax, vmin, amax, amin, jmax, buffer, candidate, valid_profiles) = lim
+    (; vmax, vmin, amax, amin, jmax, buffer, candidate, valid_profiles, brake) = lim
     buf = buffer
     clear!(buf)
     clear!(valid_profiles)
 
-    # Validate input constraints
+    # Validate target constraints (initial state can be outside limits - handled by brake)
     if vf < vmin || vf > vmax
         error("Target velocity vf=$vf is outside allowed range [$vmin, $vmax]")
     end
@@ -1717,7 +1850,32 @@ function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0
         error("Target acceleration af=$af is outside allowed range [$amin, $amax]")
     end
 
-    pd = pf - p0
+    # Compute brake profile if initial state is outside limits
+    get_position_brake_trajectory!(brake, v0, a0, vmax, vmin, amax, amin, jmax)
+    ps, vs, as = finalize_brake!(brake, p0, v0, a0)
+    brake_duration = brake.duration
+    brake_copy = brake_duration > 0 ? deepcopy(brake) : nothing
+
+    # Use post-brake state as effective initial state
+    p0_eff, v0_eff, a0_eff = ps, vs, as
+    pd = pf - p0_eff
+
+    # Set direction-dependent limits
+    if pd >= 0
+        jMax1, vMax1, vMin1, aMax1, aMin1 = jmax, vmax, vmin, amax, amin
+        jMax2, vMax2, vMin2, aMax2, aMin2 = -jmax, vmin, vmax, amin, amax
+    else
+        jMax1, vMax1, vMin1, aMax1, aMin1 = -jmax, vmin, vmax, amin, amax
+        jMax2, vMax2, vMin2, aMax2, aMin2 = jmax, vmax, vmin, amax, amin
+    end
+
+    # Zero-limits special case: jMax=0, aMax=0, or aMin=0
+    if jmax == 0 || amax == 0 || amin == 0
+        if time_all_single_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
+        end
+        error("No valid trajectory found for zero-limits case from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
+    end
 
     # Reference implementation behavior (position_third_step1.cpp lines 531-585):
     # - When vf == 0 && af == 0: return first valid profile (no blocked intervals possible)
@@ -1727,35 +1885,28 @@ function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0
     if abs(vf) < EPS && abs(af) < EPS
         # Fast path: no blocked intervals when vf==0 && af==0
         # Return first valid profile found as the block
-        if pd >= 0
-            jMax1, vMax1, vMin1, aMax1, aMin1 = jmax, vmax, vmin, amax, amin
-            jMax2, vMax2, vMin2, aMax2, aMin2 = -jmax, vmin, vmax, amin, amax
-        else
-            jMax1, vMax1, vMin1, aMax1, aMin1 = -jmax, vmin, vmax, amin, amax
-            jMax2, vMax2, vMin2, aMax2, aMin2 = jmax, vmax, vmin, amax, amin
-        end
 
         # Try primary direction
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-            return Block(RuckigProfile(buf, pf, vf, af))
+        if time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
-        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-            return Block(RuckigProfile(buf, pf, vf, af))
+        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
-        if time_acc0_acc1!(buf, candidate, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-            return Block(RuckigProfile(buf, pf, vf, af))
+        if time_acc0_acc1!(buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
 
         # Try secondary direction
         clear!(buf)
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
-            return Block(RuckigProfile(buf, pf, vf, af))
+        if time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
-        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
-            return Block(RuckigProfile(buf, pf, vf, af))
+        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
-        if time_acc0_acc1!(buf, candidate, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
-            return Block(RuckigProfile(buf, pf, vf, af))
+        if time_acc0_acc1!(buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
     else
         # Full collection mode: collect ALL valid profiles for blocked interval computation
@@ -1763,32 +1914,32 @@ function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0
         # All profile functions are called with return_after_found = false
 
         # Collect from time_all_none_acc0_acc1 (both directions)
-        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
         clear!(buf)
-        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
 
         # Collect from time_acc0_acc1 (both directions)
         clear!(buf)
-        if time_acc0_acc1!(buf, candidate, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        if time_acc0_acc1!(buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
         clear!(buf)
-        if time_acc0_acc1!(buf, candidate, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        if time_acc0_acc1!(buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
 
         # Collect from time_all_vel (both directions)
         clear!(buf)
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        if time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
         clear!(buf)
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af))
+        if time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
 
         # If valid profiles found, compute block with blocked intervals
@@ -1800,39 +1951,39 @@ function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0
     # Two-step profiles (fallback) - these don't contribute to blocked intervals
     # (they're only used when no regular profile is found)
     clear!(buf)
-    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-        return Block(RuckigProfile(buf, pf, vf, af))
+    if time_none_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
     end
     clear!(buf)
-    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-        return Block(RuckigProfile(buf, pf, vf, af))
-    end
-
-    clear!(buf)
-    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-        return Block(RuckigProfile(buf, pf, vf, af))
-    end
-    clear!(buf)
-    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-        return Block(RuckigProfile(buf, pf, vf, af))
+    if time_none_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
     end
 
     clear!(buf)
-    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-        return Block(RuckigProfile(buf, pf, vf, af))
+    if time_acc0_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
     end
     clear!(buf)
-    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-        return Block(RuckigProfile(buf, pf, vf, af))
+    if time_acc0_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
     end
 
     clear!(buf)
-    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
-        return Block(RuckigProfile(buf, pf, vf, af))
+    if time_vel_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
     end
     clear!(buf)
-    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-        return Block(RuckigProfile(buf, pf, vf, af))
+    if time_vel_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
+    end
+
+    clear!(buf)
+    if time_acc1_vel_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
+    end
+    clear!(buf)
+    if time_acc1_vel_two_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
     end
 
     error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
@@ -3263,7 +3414,7 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
                     if h1_sq >= 0
                         h1 = sqrt(h1_sq)
                         orig = -pd + (af_p3 - a0_p3 + 3*a0_a0*jMax*(tf - 2*t))/(6*jMax_jMax) + (2*a0 + jMax*t)*t*(tf - t) + (jMax*h1 - af)*h1*h1 + tf*v0
-                        if abs(orig) > 1e-9
+                        if abs(orig) > NEWTON_TOL
                             deriv_newton = (a0 + jMax*t)*(2*(af + jMax*tf) - 3*jMax*(h1 + t) - a0)/jMax
                             abs(deriv_newton) > EPS && (t -= orig / deriv_newton)
                         end
