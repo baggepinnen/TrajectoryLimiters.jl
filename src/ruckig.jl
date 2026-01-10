@@ -2375,36 +2375,40 @@ function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0
     else
         # Full collection mode: collect ALL valid profiles for blocked interval computation
         # C++ uses original limits (NOT pd-swapped), see position_third_step1.cpp lines 558-563
-        # All profile functions are called with return_after_found = false
+        # Use the _collect functions which add ALL valid profiles (not just the shortest)
 
         # Collect from time_all_none_acc0_acc1 (both directions)
-        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
-        end
-        clear!(buf)
-        if time_all_none_acc0_acc1!(lim.roots, buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
-        end
+        time_all_none_acc0_acc1_collect!(valid_profiles, lim.roots, buf, candidate,
+                                         p0_eff, v0_eff, a0_eff, pf, vf, af,
+                                         jmax, vmax, vmin, amax, amin;
+                                         brake_duration, brake=brake_copy)
+
+        time_all_none_acc0_acc1_collect!(valid_profiles, lim.roots, buf, candidate,
+                                         p0_eff, v0_eff, a0_eff, pf, vf, af,
+                                         -jmax, vmin, vmax, amin, amax;
+                                         brake_duration, brake=brake_copy)
 
         # Collect from time_acc0_acc1 (both directions)
-        clear!(buf)
-        if time_acc0_acc1!(buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
-        end
-        clear!(buf)
-        if time_acc0_acc1!(buf, candidate, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
-        end
+        time_acc0_acc1_collect!(valid_profiles, buf, candidate,
+                               p0_eff, v0_eff, a0_eff, pf, vf, af,
+                               jmax, vmax, vmin, amax, amin;
+                               brake_duration, brake=brake_copy)
+
+        time_acc0_acc1_collect!(valid_profiles, buf, candidate,
+                               p0_eff, v0_eff, a0_eff, pf, vf, af,
+                               -jmax, vmin, vmax, amin, amax;
+                               brake_duration, brake=brake_copy)
 
         # Collect from time_all_vel (both directions)
-        clear!(buf)
-        if time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
-        end
-        clear!(buf)
-        if time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, -jmax, vmin, vmax, amin, amax)
-            add_profile!(valid_profiles, RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
-        end
+        time_all_vel_collect!(valid_profiles, buf,
+                             p0_eff, v0_eff, a0_eff, pf, vf, af,
+                             jmax, vmax, vmin, amax, amin;
+                             brake_duration, brake=brake_copy)
+
+        time_all_vel_collect!(valid_profiles, buf,
+                             p0_eff, v0_eff, a0_eff, pf, vf, af,
+                             -jmax, vmin, vmax, amin, amax;
+                             brake_duration, brake=brake_copy)
 
         # If valid profiles found, compute block with blocked intervals
         if valid_profiles.count > 0
