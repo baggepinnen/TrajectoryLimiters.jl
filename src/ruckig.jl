@@ -1336,6 +1336,8 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
     else
         # Full collection mode: try all profiles and return minimum
         # This matches C++ behavior when vf != 0 || af != 0
+        # IMPORTANT: C++ uses original limits here, NOT pd-swapped limits
+        # See position_third_step1.cpp lines 558-563
         best_duration = T(Inf)
         best_profile = nothing
 
@@ -1348,32 +1350,32 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
             end
         end
 
-        # Collect from time_all_none_acc0_acc1 (both directions)
-        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        # Collect from time_all_none_acc0_acc1 (both directions) - using ORIGINAL limits
+        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
             try_save_best!()
         end
         clear!(buf)
-        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
-            try_save_best!()
-        end
-
-        # Collect from time_acc0_acc1 (both directions)
-        clear!(buf)
-        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-            try_save_best!()
-        end
-        clear!(buf)
-        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
             try_save_best!()
         end
 
-        # Collect from time_all_vel (both directions)
+        # Collect from time_acc0_acc1 (both directions) - using ORIGINAL limits
         clear!(buf)
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
             try_save_best!()
         end
         clear!(buf)
-        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+            try_save_best!()
+        end
+
+        # Collect from time_all_vel (both directions) - using ORIGINAL limits
+        clear!(buf)
+        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            try_save_best!()
+        end
+        clear!(buf)
+        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
             try_save_best!()
         end
 
@@ -1385,39 +1387,40 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
     end
 
     # Two-step profiles (fallback, only if no regular profile found)
+    # C++ uses original limits for two-step profiles (lines 567-581)
     clear!(buf)
-    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
         return RuckigProfile(buf, pf, vf, af)
     end
     clear!(buf)
-    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-
-    clear!(buf)
-    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-    clear!(buf)
-    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+    if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
         return RuckigProfile(buf, pf, vf, af)
     end
 
     clear!(buf)
-    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
         return RuckigProfile(buf, pf, vf, af)
     end
     clear!(buf)
-    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
         return RuckigProfile(buf, pf, vf, af)
     end
 
     clear!(buf)
-    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
         return RuckigProfile(buf, pf, vf, af)
     end
     clear!(buf)
-    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+
+    clear!(buf)
+    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jmax, vmax, vmin, amax, amin)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+    clear!(buf)
+    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, -jmax, vmin, vmax, amin, amax)
         return RuckigProfile(buf, pf, vf, af)
     end
 
