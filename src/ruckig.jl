@@ -78,6 +78,23 @@ function clear!(buf::ProfileBuffer{T}) where T
     buf
 end
 
+"""Copy all contents from src buffer to dst buffer."""
+function copy_buffer!(dst::ProfileBuffer{T}, src::ProfileBuffer{T}) where T
+    for i in 1:7
+        dst.t[i] = src.t[i]
+        dst.t_sum[i] = src.t_sum[i]
+        dst.j[i] = src.j[i]
+    end
+    for i in 1:8
+        dst.a[i] = src.a[i]
+        dst.v[i] = src.v[i]
+        dst.p[i] = src.p[i]
+    end
+    dst.limits = src.limits
+    dst.control_signs = src.control_signs
+    dst
+end
+
 """
     RuckigProfile{T}
 
@@ -254,12 +271,13 @@ struct JerkLimiter{T}
     amin::T
     jmax::T
     roots::Roots{Float64}           # Always Float64 since polynomial roots are floating-point
-    buffer::ProfileBuffer{Float64}  # Always Float64 for computation
+    buffer::ProfileBuffer{Float64}  # Always Float64 for computation (stores best profile)
+    candidate::ProfileBuffer{Float64}  # Candidate buffer for profile search
 end
 
 function JerkLimiter(; vmax, amax, jmax, vmin=-vmax, amin=-amax)
     T = promote_type(typeof(vmax), typeof(vmin), typeof(amax), typeof(amin), typeof(jmax))
-    JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}(), ProfileBuffer{Float64}())
+    JerkLimiter(T(vmax), T(vmin), T(amax), T(amin), T(jmax), Roots{Float64}(), ProfileBuffer{Float64}(), ProfileBuffer{Float64}())
 end
 
 function Base.show(io::IO, lim::JerkLimiter)
@@ -753,8 +771,11 @@ end
 
 """
 Try ACC0, ACC1, and NONE profiles (no velocity limit reached).
+Returns the SHORTEST valid profile found (not the first).
+Uses candidate buffer for checking, copies best result to buf.
 """
-function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
+function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, candidate::ProfileBuffer{T},
+                                  p0, v0, a0, pf, vf, af,
                                   jMax, vMax, vMin, aMax, aMin) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
@@ -767,6 +788,10 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, p0, v0, a
     v0_v0 = v0^2
     vf_vf = vf^2
     pd = pf - p0
+
+    # Track the best (shortest duration) profile found
+    best_duration = T(Inf)
+    found_valid = false
 
     # NONE profile: t7 == 0 strategy from reference implementation
     # Solve for t (= t[3] in 1-indexed) using cubic polynomial
@@ -794,16 +819,21 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, p0, v0, a
         end
 
         h0 = h2_none/(2*jMax*t)
-        buf.t[1] = h0 + t/2 - a0/jMax
-        buf.t[2] = 0
-        buf.t[3] = t
-        buf.t[4] = 0
-        buf.t[5] = 0
-        buf.t[6] = 0
-        buf.t[7] = -h0 + t/2 + af/jMax
+        candidate.t[1] = h0 + t/2 - a0/jMax
+        candidate.t[2] = 0
+        candidate.t[3] = t
+        candidate.t[4] = 0
+        candidate.t[5] = 0
+        candidate.t[6] = 0
+        candidate.t[7] = -h0 + t/2 + af/jMax
 
-        if check!(buf, UDDU, LIMIT_NONE, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            return true
+        if check!(candidate, UDDU, LIMIT_NONE, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            dur = sum(candidate.t)
+            if dur < best_duration
+                best_duration = dur
+                found_valid = true
+                copy_buffer!(buf, candidate)
+            end
         end
     end
 
@@ -833,16 +863,21 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, p0, v0, a
             t -= orig / deriv
         end
 
-        buf.t[1] = (-a0 + aMax)/jMax
-        buf.t[2] = h3_acc0 - 2*t + jMax/aMax*t^2
-        buf.t[3] = t
-        buf.t[4] = 0
-        buf.t[5] = 0
-        buf.t[6] = 0
-        buf.t[7] = (af - aMax)/jMax + t
+        candidate.t[1] = (-a0 + aMax)/jMax
+        candidate.t[2] = h3_acc0 - 2*t + jMax/aMax*t^2
+        candidate.t[3] = t
+        candidate.t[4] = 0
+        candidate.t[5] = 0
+        candidate.t[6] = 0
+        candidate.t[7] = (af - aMax)/jMax + t
 
-        if check!(buf, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            return true
+        if check!(candidate, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            dur = sum(candidate.t)
+            if dur < best_duration
+                best_duration = dur
+                found_valid = true
+                copy_buffer!(buf, candidate)
+            end
         end
     end
 
@@ -888,20 +923,25 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, p0, v0, a
             end
         end
 
-        buf.t[1] = t
-        buf.t[2] = 0
-        buf.t[3] = (a0 - aMin)/jMax + t
-        buf.t[4] = 0
-        buf.t[5] = 0
-        buf.t[6] = h3_acc1 - (2*a0 + jMax*t)*t/aMin
-        buf.t[7] = (af - aMin)/jMax
+        candidate.t[1] = t
+        candidate.t[2] = 0
+        candidate.t[3] = (a0 - aMin)/jMax + t
+        candidate.t[4] = 0
+        candidate.t[5] = 0
+        candidate.t[6] = h3_acc1 - (2*a0 + jMax*t)*t/aMin
+        candidate.t[7] = (af - aMin)/jMax
 
-        if check!(buf, UDDU, LIMIT_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            return true
+        if check!(candidate, UDDU, LIMIT_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+            dur = sum(candidate.t)
+            if dur < best_duration
+                best_duration = dur
+                found_valid = true
+                copy_buffer!(buf, candidate)
+            end
         end
     end
 
-    return false
+    return found_valid
 end
 
 #=============================================================================
@@ -1258,64 +1298,126 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
         jMax2, vMax2, vMin2, aMax2, aMin2 = jmax, vmax, vmin, amax, amin
     end
 
-    # Try primary direction first
-    if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-        return RuckigProfile(buf, pf, vf, af)
+    # Reference implementation behavior:
+    # - When vf == 0 && af == 0: return first valid profile (fast path)
+    # - When vf != 0 || af != 0: collect all profiles and return minimum
+    # See position_third_step1.cpp lines 531-585
+
+    if abs(vf) < EPS && abs(af) < EPS
+        # Fast path: return first valid profile found
+        # Try primary direction first
+        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return RuckigProfile(buf, pf, vf, af)
+        end
+
+        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return RuckigProfile(buf, pf, vf, af)
+        end
+
+        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            return RuckigProfile(buf, pf, vf, af)
+        end
+
+        # Try secondary direction
+        clear!(buf)
+        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return RuckigProfile(buf, pf, vf, af)
+        end
+
+        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return RuckigProfile(buf, pf, vf, af)
+        end
+
+        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            return RuckigProfile(buf, pf, vf, af)
+        end
+
+        # Fall through to two-step profiles
+    else
+        # Full collection mode: try all profiles and return minimum
+        # This matches C++ behavior when vf != 0 || af != 0
+        best_duration = T(Inf)
+        best_profile = nothing
+
+        # Helper to check if current buffer has a shorter profile
+        function try_save_best!()
+            dur = sum(buf.t)
+            if dur < best_duration
+                best_duration = dur
+                best_profile = RuckigProfile(buf, pf, vf, af)
+            end
+        end
+
+        # Collect from time_all_none_acc0_acc1 (both directions)
+        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            try_save_best!()
+        end
+        clear!(buf)
+        if time_all_none_acc0_acc1!(lim.roots, buf, lim.candidate, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            try_save_best!()
+        end
+
+        # Collect from time_acc0_acc1 (both directions)
+        clear!(buf)
+        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            try_save_best!()
+        end
+        clear!(buf)
+        if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            try_save_best!()
+        end
+
+        # Collect from time_all_vel (both directions)
+        clear!(buf)
+        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+            try_save_best!()
+        end
+        clear!(buf)
+        if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+            try_save_best!()
+        end
+
+        if best_profile !== nothing
+            return best_profile
+        end
+
+        # Fall through to two-step profiles if no profile found
     end
 
-    if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-
-    if time_all_none_acc0_acc1!(lim.roots, buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-
+    # Two-step profiles (fallback, only if no regular profile found)
+    clear!(buf)
     if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
         return RuckigProfile(buf, pf, vf, af)
     end
-
-    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-
-    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-
-    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-
-    # Try secondary direction (for complex cases like starting with velocity
-    # in the wrong direction)
     clear!(buf)
-
-    if time_all_vel!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-
-    if time_acc0_acc1!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-
-    if time_all_none_acc0_acc1!(lim.roots, buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
-        return RuckigProfile(buf, pf, vf, af)
-    end
-
     if time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
         return RuckigProfile(buf, pf, vf, af)
     end
 
+    clear!(buf)
+    if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+    clear!(buf)
     if time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
         return RuckigProfile(buf, pf, vf, af)
     end
 
-    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+    clear!(buf)
+    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+    clear!(buf)
+    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
         return RuckigProfile(buf, pf, vf, af)
     end
 
-    if time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
+    clear!(buf)
+    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        return RuckigProfile(buf, pf, vf, af)
+    end
+    clear!(buf)
+    if time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax2, vMax2, vMin2, aMax2, aMin2)
         return RuckigProfile(buf, pf, vf, af)
     end
 
