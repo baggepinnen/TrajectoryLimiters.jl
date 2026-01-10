@@ -649,23 +649,27 @@ end
 end
 
 @testset "random waypoint traj" begin
-    lims = [
-        JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand()) for i = 1:7
-    ]
-    waypoints = [(p = randn(7),) for i = 1:10000]
-    @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
+    for _ in 1:10
+        lims = [
+            JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand()) for i = 1:7
+        ]
+        waypoints = [(p = randn(7),) for i = 1:10000]
+        @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
 
 
-    lims = [
-        JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand(), vmin=-10.0*rand(), amin=-50.0*rand()) for i = 1:2
-    ]
-    waypoints = [(p = randn(2),) for i = 1:10000]
-    @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
+        lims = [
+            JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand(), vmin=-10.0*rand(), amin=-50.0*rand()) for i = 1:2
+        ]
+        waypoints = [(p = randn(2),) for i = 1:10000]
+        @test_nowarn calculate_waypoint_trajectory(lims, waypoints, 0.001)
 
 
-    lim = JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand())
-    waypoints = [(p = randn(),) for i = 1:10000]
-    @test_nowarn calculate_waypoint_trajectory(lim, waypoints, 0.001)
+        lim = JerkLimiter(; vmax=10.0*rand(), amax=50.0*rand(), jmax=1000.0*rand())
+        waypoints = [(p = randn(),) for i = 1:10000]
+        @test_nowarn calculate_waypoint_trajectory(lim, waypoints, 0.001)
+
+        GC.gc()
+    end
 end
 
 
@@ -680,4 +684,10 @@ end
     p0,v0,a0 = (-0.43474443878557517, 0.0, 0.0)
     pf,vf,af = (-0.5629190782888567, 0.0, 0.0)
     calculate_trajectory(lim2; p0, v0, a0, pf, vf, af)
+
+    # Asymmetric limits case 2
+    lim3 = JerkLimiter(; vmax=6.568803887579402, vmin=-5.873698934812709, amax=16.355405347028825, amin=-28.737465951611775, jmax=663.5605816234907)
+    p0,v0,a0 = (0.1675166567390261, 0.0, 0.0)
+    pf,vf,af = (0.05958563199475451, 0.0, 0.0)
+    calculate_trajectory(lim3; p0, v0, a0, pf, vf, af)
 end

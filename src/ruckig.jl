@@ -448,10 +448,11 @@ end
 @inline function solve_cubic_all_real(a, b, c)
     roots = Roots{Float64}()
     # Cubic: x^3 + ax^2 + bx + c = 0 (Cardano's formula)
+    # Reference uses a /= 3, then a2 = a*a, so we need (a/3)^2
     a_over_3 = a / 3
-    a2 = a^2
+    a2 = a_over_3^2  # Must use (a/3)^2, not a^2
     q = a2 - b / 3
-    r = (a * (2*a2 - b) + c) / 2
+    r = (a_over_3 * (2*a2 - b) + c) / 2  # Must use a/3, not a
     r2 = r^2
     q3 = q^3
 
@@ -822,15 +823,12 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, p0, v0, a
     for t in solve_quartic_real!(roots, 1.0, polynom_acc0_0, polynom_acc0_1, polynom_acc0_2, polynom_acc0_3)
         (t < t_min_acc0 || t > t_max_acc0) && continue
 
-        # Newton iterations for refinement (multiple steps needed for numerical stability)
+        # Single Newton step (regarding pd) - matching reference exactly
         if t > EPS
-            for _ in 1:5
-                h1 = jMax*t
-                orig = h0_acc0/(12*jMax_jMax*t) + t*(h2_acc0 + h1*(h1 - 2*aMax))
-                abs(orig) < 1e-9 && break
-                deriv = 2*(h2_acc0 + h1*(2*h1 - 3*aMax))
-                t -= orig / deriv
-            end
+            h1 = jMax*t
+            orig = h0_acc0/(12*jMax_jMax*t) + t*(h2_acc0 + h1*(h1 - 2*aMax))
+            deriv = 2*(h2_acc0 + h1*(2*h1 - 3*aMax))
+            t -= orig / deriv
         end
 
         buf.t[1] = (-a0 + aMax)/jMax
@@ -863,15 +861,28 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, p0, v0, a
     for t in solve_quartic_real!(roots, 1.0, polynom_acc1_0, polynom_acc1_1, polynom_acc1_2, polynom_acc1_3)
         (t < t_min_acc1 || t > t_max_acc1) && continue
 
-        # Double Newton step for refinement
+        # Double Newton step for refinement (matching reference structure exactly)
         if t > EPS
             h5 = a0_p3 + 2*jMax*a0*v0
-            for _ in 1:3
+            h1 = jMax*t
+            orig = -(h0_acc1/2 + h1*(h5 + a0*(aMin - 2*h1)*(aMin - h1) + a0_a0*(5*h1/2 - 2*aMin) + aMin^2*h1/2 + jMax*(h1/2 - aMin)*(h1*t + 2*v0)))/jMax
+            deriv = (aMin - a0 - h1)*(h2_acc1 + h1*(4*a0 - aMin + 2*h1))
+            t -= min(orig / deriv, t)  # First step uses min
+
+            h1 = jMax*t
+            orig = -(h0_acc1/2 + h1*(h5 + a0*(aMin - 2*h1)*(aMin - h1) + a0_a0*(5*h1/2 - 2*aMin) + aMin^2*h1/2 + jMax*(h1/2 - aMin)*(h1*t + 2*v0)))/jMax
+
+            if abs(orig) > 1e-9
+                deriv = (aMin - a0 - h1)*(h2_acc1 + h1*(4*a0 - aMin + 2*h1))
+                t -= orig / deriv  # Second step: no min
+
                 h1 = jMax*t
                 orig = -(h0_acc1/2 + h1*(h5 + a0*(aMin - 2*h1)*(aMin - h1) + a0_a0*(5*h1/2 - 2*aMin) + aMin^2*h1/2 + jMax*(h1/2 - aMin)*(h1*t + 2*v0)))/jMax
-                abs(orig) < 1e-9 && break
-                deriv = (aMin - a0 - h1)*(h2_acc1 + h1*(4*a0 - aMin + 2*h1))
-                t -= min(orig / deriv, t)
+
+                if abs(orig) > 1e-9
+                    deriv = (aMin - a0 - h1)*(h2_acc1 + h1*(4*a0 - aMin + 2*h1))
+                    t -= orig / deriv  # Third step: no min
+                end
             end
         end
 
