@@ -935,3 +935,186 @@ end
     @test duration(profiles7[1]) ≈ duration(profiles7[2])  # synchronized
     @test duration(profiles7[1]) ≈ 0.78215181077265 rtol=1e-6  # C++ result
 end
+
+#=============================================================================
+ Velocity Control Tests (ruckig_velocity.jl)
+=============================================================================#
+
+@testset "Velocity control: JerkLimiter basic" begin
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+    # Accelerate from rest to vf=5
+    profile = calculate_velocity_trajectory(lim; vf=5.0)
+    @test duration(profile) > 0
+    _, v0, a0, _ = profile(0.0)
+    @test v0 ≈ 0.0
+    @test a0 ≈ 0.0
+    _, vf, af, _ = profile(duration(profile))
+    @test vf ≈ 5.0 atol=1e-6
+    @test af ≈ 0.0 atol=1e-6
+
+    # Decelerate from rest to negative velocity
+    profile2 = calculate_velocity_trajectory(lim; vf=-5.0)
+    @test duration(profile2) > 0
+    _, vf2, af2, _ = profile2(duration(profile2))
+    @test vf2 ≈ -5.0 atol=1e-6
+    @test af2 ≈ 0.0 atol=1e-6
+
+    # Start with initial velocity
+    profile3 = calculate_velocity_trajectory(lim; v0=3.0, vf=8.0)
+    @test duration(profile3) > 0
+    _, v0_3, _, _ = profile3(0.0)
+    @test v0_3 ≈ 3.0
+    _, vf3, af3, _ = profile3(duration(profile3))
+    @test vf3 ≈ 8.0 atol=1e-6
+    @test af3 ≈ 0.0 atol=1e-6
+end
+
+@testset "Velocity control: JerkLimiter with initial/final acceleration" begin
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+    # Start with initial acceleration
+    profile = calculate_velocity_trajectory(lim; v0=0.0, a0=10.0, vf=5.0)
+    @test duration(profile) > 0
+    _, v0, a0, _ = profile(0.0)
+    @test v0 ≈ 0.0
+    @test a0 ≈ 10.0
+    _, vf, af, _ = profile(duration(profile))
+    @test vf ≈ 5.0 atol=1e-6
+    @test af ≈ 0.0 atol=1e-6
+
+    # End with non-zero target acceleration
+    profile2 = calculate_velocity_trajectory(lim; v0=0.0, vf=5.0, af=10.0)
+    @test duration(profile2) > 0
+    _, vf2, af2, _ = profile2(duration(profile2))
+    @test vf2 ≈ 5.0 atol=1e-6
+    @test af2 ≈ 10.0 atol=1e-6
+
+    # Both initial and final acceleration
+    profile3 = calculate_velocity_trajectory(lim; v0=2.0, a0=5.0, vf=7.0, af=15.0)
+    @test duration(profile3) > 0
+    _, v0_3, a0_3, _ = profile3(0.0)
+    @test v0_3 ≈ 2.0
+    @test a0_3 ≈ 5.0
+    _, vf3, af3, _ = profile3(duration(profile3))
+    @test vf3 ≈ 7.0 atol=1e-6
+    @test af3 ≈ 15.0 atol=1e-6
+end
+
+@testset "Velocity control: JerkLimiter time-synchronized" begin
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+    # Specify target time
+    tf_target = 0.5
+    profile = calculate_velocity_trajectory(lim; vf=5.0, tf=tf_target)
+    @test duration(profile) ≈ tf_target atol=1e-6
+    _, vf, af, _ = profile(duration(profile))
+    @test vf ≈ 5.0 atol=1e-6
+    @test af ≈ 0.0 atol=1e-6
+
+    # Negative velocity with specified time
+    profile2 = calculate_velocity_trajectory(lim; vf=-3.0, tf=0.4)
+    @test duration(profile2) ≈ 0.4 atol=1e-6
+    _, vf2, _, _ = profile2(duration(profile2))
+    @test vf2 ≈ -3.0 atol=1e-6
+end
+
+@testset "Velocity control: JerkLimiter asymmetric limits" begin
+    lim = JerkLimiter(; vmax=10.0, vmin=-5.0, amax=50.0, amin=-30.0, jmax=1000.0)
+
+    # Positive velocity change
+    profile = calculate_velocity_trajectory(lim; vf=8.0)
+    @test duration(profile) > 0
+    _, vf, af, _ = profile(duration(profile))
+    @test vf ≈ 8.0 atol=1e-6
+    @test af ≈ 0.0 atol=1e-6
+
+    # Negative velocity change (constrained by vmin)
+    profile2 = calculate_velocity_trajectory(lim; vf=-4.0)
+    @test duration(profile2) > 0
+    _, vf2, af2, _ = profile2(duration(profile2))
+    @test vf2 ≈ -4.0 atol=1e-6
+    @test af2 ≈ 0.0 atol=1e-6
+end
+
+@testset "Velocity control: JerkLimiter limits respected" begin
+    lim = JerkLimiter(; vmax=5.0, amax=20.0, jmax=500.0)
+
+    profile = calculate_velocity_trajectory(lim; v0=0.0, vf=4.0)
+
+    # Check trajectory stays within limits
+    for t in range(0, duration(profile), length=50)
+        _, v, a, j = profile(t)
+        @test lim.vmin - 1e-6 <= v <= lim.vmax + 1e-6
+        @test lim.amin - 1e-6 <= a <= lim.amax + 1e-6
+        @test -lim.jmax - 1e-6 <= j <= lim.jmax + 1e-6
+    end
+end
+
+@testset "Velocity control: JerkLimiter initial state outside limits" begin
+    lim = JerkLimiter(; vmax=10.0, amax=20.0, jmax=1000.0)
+
+    # Initial acceleration exceeds amax - requires brake
+    profile = calculate_velocity_trajectory(lim; a0=35.0, vf=5.0)
+    @test duration(profile) > 0
+    _, _, a0, _ = profile(0.0)
+    @test a0 ≈ 35.0  # Starts above amax
+    _, vf, af, _ = profile(duration(profile))
+    @test vf ≈ 5.0 atol=1e-6
+    @test af ≈ 0.0 atol=1e-6
+end
+
+@testset "Velocity control: AccelerationLimiter basic" begin
+    lim = AccelerationLimiter(; vmax=100.0, amax=50.0)
+
+    # Accelerate from rest
+    profile = calculate_velocity_trajectory(lim; vf=10.0)
+    @test duration(profile) > 0
+    _, v0, _, _ = profile(0.0)
+    @test v0 ≈ 0.0
+    _, vf, _, _ = profile(duration(profile))
+    @test vf ≈ 10.0 atol=1e-6
+
+    # Decelerate
+    profile2 = calculate_velocity_trajectory(lim; v0=10.0, vf=0.0)
+    @test duration(profile2) > 0
+    _, vf2, _, _ = profile2(duration(profile2))
+    @test vf2 ≈ 0.0 atol=1e-6
+
+    # Negative velocity
+    profile3 = calculate_velocity_trajectory(lim; vf=-8.0)
+    @test duration(profile3) > 0
+    _, vf3, _, _ = profile3(duration(profile3))
+    @test vf3 ≈ -8.0 atol=1e-6
+end
+
+@testset "Velocity control: AccelerationLimiter time-synchronized" begin
+    lim = AccelerationLimiter(; vmax=100.0, amax=50.0)
+
+    # Specify target time
+    tf_target = 0.5
+    profile = calculate_velocity_trajectory(lim; vf=10.0, tf=tf_target)
+    @test duration(profile) ≈ tf_target atol=1e-6
+    _, vf, _, _ = profile(duration(profile))
+    @test vf ≈ 10.0 atol=1e-6
+
+    # Longer time requires lower acceleration
+    profile2 = calculate_velocity_trajectory(lim; vf=10.0, tf=1.0)
+    @test duration(profile2) ≈ 1.0 atol=1e-6
+    _, vf2, _, _ = profile2(duration(profile2))
+    @test vf2 ≈ 10.0 atol=1e-6
+end
+
+@testset "Velocity control: AccelerationLimiter asymmetric limits" begin
+    lim = AccelerationLimiter(; vmax=100.0, amax=50.0, amin=-30.0)
+
+    # Positive acceleration
+    profile = calculate_velocity_trajectory(lim; vf=10.0)
+    @test duration(profile) > 0
+
+    # Negative acceleration (uses amin)
+    profile2 = calculate_velocity_trajectory(lim; vf=-10.0)
+    @test duration(profile2) > 0
+    _, vf2, _, _ = profile2(duration(profile2))
+    @test vf2 ≈ -10.0 atol=1e-6
+end

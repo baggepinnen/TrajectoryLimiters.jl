@@ -69,8 +69,9 @@ function check_for_velocity!(buf::ProfileBuffer{T}, v0, a0, vf, af, jf, aMax, aM
     end
 
     # Check acceleration limits at boundaries (velocity control doesn't check position)
-    aUppLim = aMax + A_PRECISION
-    aLowLim = aMin - A_PRECISION
+    # Note: aMax/aMin may be swapped for DOWN direction, so use max/min to handle both orderings
+    aUppLim = max(aMax, aMin) + A_PRECISION
+    aLowLim = min(aMax, aMin) - A_PRECISION
 
     # Check acceleration at phase boundaries 1, 3, 5 (after jerk phases)
     for i in (2, 4, 6)
