@@ -1254,3 +1254,58 @@ end
 
     GC.gc(true)
 end
+
+@testset "Zero-jerk position trajectories (time_all_single_step!)" begin
+    # jmax=0 means no jerk limit - acceleration is constant (can't change)
+    # Only valid when af == a0 (acceleration can't change without jerk)
+
+    # Case 1: Constant velocity motion (a0=0, af=0, v0=vf)
+    # From p0=0 with v0=5, travel to pf=10 at constant velocity
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=0.0)
+    profile = calculate_trajectory(lim; v0=5.0, pf=10.0, vf=5.0, af=0.0)
+    @test duration(profile) ≈ 2.0 atol=1e-5  # t = pd/v0 = 10/5 = 2
+    pf_actual, vf_actual, af_actual, _ = profile(duration(profile))
+    @test pf_actual ≈ 10.0 atol=1e-5
+    @test vf_actual ≈ 5.0 atol=1e-5
+    @test af_actual ≈ 0.0 atol=1e-5
+
+    # Case 2: Constant acceleration motion (a0 != 0, af == a0)
+    # From rest with a0=10, reach pf=5 with same acceleration
+    # p = p0 + v0*t + 0.5*a0*t², with p0=0, v0=0, a0=10
+    # At t=1: p=5, v=10, a=10
+    lim2 = JerkLimiter(; vmax=20.0, amax=50.0, jmax=0.0)
+    profile2 = calculate_trajectory(lim2; v0=0.0, a0=10.0, pf=5.0, vf=10.0, af=10.0)
+    @test duration(profile2) ≈ 1.0 atol=1e-5
+    pf2, vf2, af2, _ = profile2(duration(profile2))
+    @test pf2 ≈ 5.0 atol=1e-5
+    @test vf2 ≈ 10.0 atol=1e-5
+    @test af2 ≈ 10.0 atol=1e-5
+
+    # Case 3: Already at target (pd ≈ 0, vd ≈ 0)
+    profile3 = calculate_trajectory(lim; v0=0.0, pf=0.0, vf=0.0)
+    @test duration(profile3) ≈ 0.0 atol=1e-10
+end
+
+@testset "Zero-jerk velocity trajectories (time_all_single_step_velocity!)" begin
+    # jmax=0 for velocity control: only valid when af == a0
+
+    # Case 1: Constant acceleration reaching target velocity
+    # a0=10, af=10, need to reach vf from v0
+    lim = JerkLimiter(; vmax=20.0, amax=50.0, jmax=0.0)
+    profile = calculate_velocity_trajectory(lim; v0=0.0, a0=10.0, vf=10.0, af=10.0)
+    @test duration(profile) > 0
+    _, vf_actual, af_actual, _ = profile(duration(profile))
+    @test vf_actual ≈ 10.0 atol=1e-5
+    @test af_actual ≈ 10.0 atol=1e-5
+
+    # Case 2: Already at target (vd ≈ 0, a0 == af == 0)
+    profile2 = calculate_velocity_trajectory(lim; v0=5.0, a0=0.0, vf=5.0, af=0.0)
+    @test duration(profile2) ≈ 0.0 atol=1e-10
+
+    # Case 3: Negative constant acceleration
+    profile3 = calculate_velocity_trajectory(lim; v0=10.0, a0=-5.0, vf=0.0, af=-5.0)
+    @test duration(profile3) > 0
+    _, vf3, af3, _ = profile3(duration(profile3))
+    @test vf3 ≈ 0.0 atol=1e-5
+    @test af3 ≈ -5.0 atol=1e-5
+end

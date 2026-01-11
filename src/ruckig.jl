@@ -1315,6 +1315,73 @@ end
 =============================================================================#
 
 """
+    check_for_profile!(buf, p0, v0, a0, pf, vf, af, jf, vMax, vMin, aMax, aMin, limits, control_signs) -> Bool
+
+Check and finalize a zero-jerk profile (constant acceleration motion).
+Used by time_all_single_step! for the jMax=0 special case.
+"""
+function check_for_profile!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af, jf,
+                            vMax, vMin, aMax, aMin, limits, control_signs) where T
+    # Set all jerks to zero (constant acceleration)
+    for i in 1:7
+        buf.j[i] = zero(T)
+    end
+
+    # Compute cumulative times
+    buf.t_sum[1] = buf.t[1]
+    for i in 2:7
+        buf.t_sum[i] = buf.t_sum[i-1] + buf.t[i]
+    end
+
+    # Check for negative times
+    for i in 1:7
+        if buf.t[i] < -EPS
+            return false
+        end
+    end
+
+    # Set initial state
+    buf.p[1] = p0
+    buf.v[1] = v0
+    buf.a[1] = a0
+
+    # Integrate through phases with constant acceleration
+    for i in 1:7
+        buf.a[i+1] = a0  # Constant acceleration throughout
+        buf.v[i+1] = buf.v[i] + buf.t[i] * a0
+        buf.p[i+1] = buf.p[i] + buf.t[i] * (buf.v[i] + buf.t[i] * a0 / 2)
+    end
+
+    # Check final position
+    if abs(buf.p[8] - pf) > P_PRECISION
+        return false
+    end
+
+    # Check final velocity
+    if abs(buf.v[8] - vf) > V_PRECISION
+        return false
+    end
+
+    # Check final acceleration
+    if abs(buf.a[8] - af) > A_PRECISION
+        return false
+    end
+
+    # Check velocity limits
+    for i in 1:8
+        if buf.v[i] > vMax + V_PRECISION || buf.v[i] < vMin - V_PRECISION
+            return false
+        end
+    end
+
+    buf.limits = limits
+    buf.control_signs = control_signs
+    buf.direction = vMax > 0 ? DIR_UP : DIR_DOWN
+
+    return true
+end
+
+"""
     time_all_single_step!(buf, p0, v0, a0, pf, vf, af, jMax, vMax, vMin, aMax, aMin) -> Bool
 
 Handle zero-limits special case when jMax=0, aMax=0, or aMin=0.
