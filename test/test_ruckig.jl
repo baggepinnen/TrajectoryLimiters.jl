@@ -683,6 +683,122 @@ end
 end
 
 
+@testset "Initial velocity outside limits" begin
+    # Test case where initial velocity exceeds vmax - requires brake profile
+    lim = JerkLimiter(; vmax=5.0, amax=50.0, jmax=1000.0)
+
+    # v0 = 8.0 > vmax = 5.0, need to brake to get within limits
+    profile = calculate_trajectory(lim; v0=8.0, pf=10.0)
+
+    @test duration(profile) > 0
+    p0, v0, a0, _ = evaluate_at(profile, 0.0)
+    @test v0 ≈ 8.0  # Starts above vmax
+    T_total = duration(profile)
+    pf, vf, af, _ = evaluate_at(profile, T_total)
+    @test pf ≈ 10.0 atol=1e-6
+    @test vf ≈ 0.0 atol=1e-6
+    @test af ≈ 0.0 atol=1e-6
+
+    # Check trajectory eventually comes within limits
+    for t in range(T_total/2, T_total, length=50)
+        p, v, a, j = evaluate_at(profile, t)
+        @test lim.vmin - 1e-6 <= v <= lim.vmax + 1e-6
+        @test lim.amin - 1e-6 <= a <= lim.amax + 1e-6
+    end
+
+    # Test negative direction: v0 < vmin
+    lim2 = JerkLimiter(; vmax=5.0, vmin=-3.0, amax=50.0, jmax=1000.0)
+    profile2 = calculate_trajectory(lim2; v0=-6.0, pf=-5.0)
+
+    _, v0_2, _, _ = evaluate_at(profile2, 0.0)
+    @test v0_2 ≈ -6.0  # Starts below vmin
+    pf_2, vf_2, _, _ = evaluate_at(profile2, duration(profile2))
+    @test pf_2 ≈ -5.0 atol=1e-6
+    @test vf_2 ≈ 0.0 atol=1e-6
+end
+
+@testset "Initial acceleration outside limits" begin
+    # Test case where initial acceleration exceeds amax - requires brake profile
+    lim = JerkLimiter(; vmax=10.0, amax=20.0, jmax=1000.0)
+
+    # a0 = 35.0 > amax = 20.0, need to brake to get within limits
+    profile = calculate_trajectory(lim; a0=35.0, pf=5.0)
+
+    @test duration(profile) > 0
+    _, _, a0, _ = profile(0.0)
+    @test a0 ≈ 35.0  # Starts above amax
+    T_total = duration(profile)
+    pf, vf, af, _ = profile(T_total)
+    @test pf ≈ 5.0 atol=1e-6
+    @test vf ≈ 0.0 atol=1e-6
+    @test af ≈ 0.0 atol=1e-6
+
+    # Check trajectory eventually comes within limits
+    for t in range(T_total/2, T_total, length=50)
+        p, v, a, j = profile(t)
+        @test lim.vmin - 1e-6 <= v <= lim.vmax + 1e-6
+        @test lim.amin - 1e-6 <= a <= lim.amax + 1e-6
+    end
+
+    # Test negative direction: a0 < amin
+    lim2 = JerkLimiter(; vmax=10.0, amax=20.0, amin=-15.0, jmax=1000.0)
+    profile2 = calculate_trajectory(lim2; a0=-25.0, pf=5.0)
+
+    _, _, a0_2, _ = profile2(0.0)
+    @test a0_2 ≈ -25.0  # Starts below amin
+    pf_2, _, af_2, _ = profile2(duration(profile2))
+    @test pf_2 ≈ 5.0 atol=1e-6
+    @test af_2 ≈ 0.0 atol=1e-6
+end
+
+@testset "Initial velocity and acceleration both outside limits" begin
+    # Test case where both initial velocity and acceleration exceed limits
+    lim = JerkLimiter(; vmax=5.0, amax=20.0, jmax=1000.0)
+
+    # v0 = 8.0 > vmax = 5.0 and a0 = 30.0 > amax = 20.0
+    profile = calculate_trajectory(lim; v0=8.0, a0=30.0, pf=15.0)
+
+    @test duration(profile) > 0
+    _, v0, a0, _ = profile(0.0)
+    @test v0 ≈ 8.0   # Starts above vmax
+    @test a0 ≈ 30.0  # Starts above amax
+    T_total = duration(profile)
+    pf, vf, af, _ = profile(T_total)
+    @test pf ≈ 15.0 atol=1e-6
+    @test vf ≈ 0.0 atol=1e-6
+    @test af ≈ 0.0 atol=1e-6
+
+    # Check trajectory eventually comes within limits
+    for t in range(T_total/2, T_total, length=50)
+        p, v, a, j = profile(t)
+        @test lim.vmin - 1e-6 <= v <= lim.vmax + 1e-6
+        @test lim.amin - 1e-6 <= a <= lim.amax + 1e-6
+    end
+
+    # Test with asymmetric limits and both negative out-of-range
+    lim2 = JerkLimiter(; vmax=5.0, vmin=-3.0, amax=20.0, amin=-15.0, jmax=1000.0)
+    profile2 = calculate_trajectory(lim2; v0=-7.0, a0=-25.0, pf=-10.0)
+
+    _, v0_2, a0_2, _ = profile2(0.0)
+    @test v0_2 ≈ -7.0   # Starts below vmin
+    @test a0_2 ≈ -25.0  # Starts below amin
+    pf_2, vf_2, af_2, _ = profile2(duration(profile2))
+    @test pf_2 ≈ -10.0 atol=1e-6
+    @test vf_2 ≈ 0.0 atol=1e-6
+    @test af_2 ≈ 0.0 atol=1e-6
+
+    # Mixed: v0 > vmax but a0 < amin
+    lim3 = JerkLimiter(; vmax=5.0, vmin=-5.0, amax=20.0, amin=-15.0, jmax=1000.0)
+    profile3 = calculate_trajectory(lim3; v0=8.0, a0=-25.0, pf=5.0)
+
+    _, v0_3, a0_3, _ = profile3(0.0)
+    @test v0_3 ≈ 8.0    # Starts above vmax
+    @test a0_3 ≈ -25.0  # Starts below amin
+    pf_3, vf_3, _, _ = evaluate_at(profile3, duration(profile3))
+    @test pf_3 ≈ 5.0 atol=1e-6
+    @test vf_3 ≈ 0.0 atol=1e-6
+end
+
 @testset "known failure case" begin
     lim = JerkLimiter(; vmax=5.378090911418406, amax=21.580739221501887, jmax=250.48205176578452)
     p0,v0,a0 = (0.48825150691793306, 0.0, 0.0)

@@ -114,6 +114,12 @@ end
 
 A 7-phase jerk-limited trajectory profile (immutable result).
 Optionally includes a pre-pended brake profile if initial state was outside limits.
+
+A profile can be evaluated at time `t` using either of
+```
+profile(t)
+evaluate_at(profile, t)
+```
 """
 struct RuckigProfile{T}
     t::NTuple{7,T}        # Phase durations
@@ -158,6 +164,8 @@ duration(p::RuckigProfile) = p.brake_duration + p.t_sum[end]
 
 """Duration of just the main profile (excluding brake)."""
 main_duration(p::RuckigProfile) = p.t_sum[end]
+
+(profile::RuckigProfile)(t) = evaluate_at(profile, t)
 
 #=============================================================================
  Block: Stores profile and blocked time intervals for synchronization
@@ -1964,14 +1972,14 @@ function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
         # Return initial state (before brake if any)
         if profile.brake !== nothing && brake_dur > 0
             bp = profile.brake
-            return bp.p[1], bp.v[1], bp.a[1], bp.j[1]
+            return (; p=bp.p[1], v=bp.v[1], a=bp.a[1], j=bp.j[1])
         else
-            return profile.p[1], profile.v[1], profile.a[1], profile.j[1]
+            return (; p=profile.p[1], v=profile.v[1], a=profile.a[1], j=profile.j[1])
         end
     end
 
     if t >= T_total
-        return profile.p[8], profile.v[8], profile.a[8], zero(T)
+        return (; p=profile.p[8], v=profile.v[8], a=profile.a[8], j=zero(T))
     end
 
     # Handle brake phase if present
@@ -1992,7 +2000,7 @@ function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
         v = vk + dt * (ak + dt * jk / 2)
         a = ak + dt * jk
 
-        return p, v, a, jk
+        return (; p, v, a, j=jk)
     end
 
     # Main profile evaluation (subtract brake duration)
@@ -2019,7 +2027,7 @@ function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
     v = vk + dt * (ak + dt * jk / 2)
     a = ak + dt * jk
 
-    return p, v, a, jk
+    return (; p, v, a, j=jk)
 end
 
 """
@@ -2044,7 +2052,7 @@ function evaluate_at(profile::RuckigProfile{T}, ts::AbstractVector) where T
         jerks[i] = j
     end
 
-    return positions, velocities, accelerations, jerks
+    return (p=positions, v=velocities, a=accelerations, j=jerks)
 end
 
 """
@@ -2058,7 +2066,7 @@ function evaluate_dt(profile::RuckigProfile, Ts)
     T = duration(profile)
     ts = 0:Ts:T
     pos, vel, acc, jerk = evaluate_at(profile, ts)
-    pos, vel, acc, jerk, ts
+    (p=pos, v=vel, a=acc, j=jerk, t=ts)
 end
 
 #=============================================================================
