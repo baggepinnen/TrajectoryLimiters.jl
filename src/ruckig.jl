@@ -1390,9 +1390,14 @@ end
 """
 Try all velocity-limited profiles (ACC0_ACC1_VEL, ACC1_VEL, ACC0_VEL, VEL).
 Returns true if any valid profile is found.
+
+If `vpc` is provided, collects ALL valid profiles into the collection (for block interval computation).
+If `vpc` is `nothing`, returns after finding the first valid profile (for time-optimal search).
 """
 function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
-                       jMax, vMax, vMin, aMax, aMin) where T
+                       jMax, vMax, vMin, aMax, aMin;
+                       vpc::Union{ValidProfileCollection{T}, Nothing}=nothing,
+                       brake_duration::T=zero(T), brake::Union{RuckigProfile{T}, Nothing}=nothing) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
     a0_a0 = a0^2
@@ -1404,6 +1409,8 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
     v0_v0 = v0^2
     vf_vf = vf^2
     pd = pf - p0
+
+    found_any = false
 
     # Strategy 1: ACC0_ACC1_VEL (reach aMax, vMax, aMin)
     begin
@@ -1424,7 +1431,11 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                                 jMax*(aMax*vf_vf - aMin*v0_v0))) / (24*aMax*aMin*jMax_jMax*vMax)
 
         if check!(buf, UDDU, LIMIT_ACC0_ACC1_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            return true
+            if vpc === nothing
+                return true
+            end
+            add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
+            found_any = true
         end
     end
 
@@ -1445,7 +1456,11 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
         buf.t[7] = buf.t[5] + af / jMax
 
         if check!(buf, UDDU, LIMIT_ACC1_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            return true
+            if vpc === nothing
+                return true
+            end
+            add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
+            found_any = true
         end
     end
 
@@ -1467,7 +1482,11 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
         buf.t[7] = t_acc1 + af/jMax
 
         if check!(buf, UDDU, LIMIT_ACC0_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            return true
+            if vpc === nothing
+                return true
+            end
+            add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
+            found_any = true
         end
     end
 
@@ -1488,18 +1507,27 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                        (v0/vMax + 1.0)*t_acc0 - (vf/vMax + 1.0)*t_acc1 + pd/vMax
 
         if check!(buf, UDDU, LIMIT_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            return true
+            if vpc === nothing
+                return true
+            end
+            add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
+            found_any = true
         end
     end
 
-    return false
+    return found_any
 end
 
 """
 Try ACC0_ACC1 profile (reach both aMax and aMin, but not vMax).
+
+If `vpc` is provided, collects ALL valid profiles into the collection (for block interval computation).
+If `vpc` is `nothing`, returns the shortest valid profile found (for time-optimal search).
 """
 function time_acc0_acc1!(buf::ProfileBuffer{T}, candidate::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
-                         jMax, vMax, vMin, aMax, aMin) where T
+                         jMax, vMax, vMin, aMax, aMin;
+                         vpc::Union{ValidProfileCollection{T}, Nothing}=nothing,
+                         brake_duration::T=zero(T), brake::Union{RuckigProfile{T}, Nothing}=nothing) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
     a0_a0 = a0^2
@@ -1525,7 +1553,7 @@ function time_acc0_acc1!(buf::ProfileBuffer{T}, candidate::ProfileBuffer{T}, p0,
     h2 = a0_a0/(2*aMax*jMax) + (aMin - 2*aMax)/(2*jMax) - v0/aMax
     h3 = -af_af/(2*aMin*jMax) - (aMax - 2*aMin)/(2*jMax) + vf/aMin
 
-    # Track the best (shortest duration) profile found
+    # Track the best (shortest duration) profile found (only used when vpc is nothing)
     best_duration = T(Inf)
     found_valid = false
 
@@ -1547,11 +1575,18 @@ function time_acc0_acc1!(buf::ProfileBuffer{T}, candidate::ProfileBuffer{T}, p0,
         candidate.t[7] = candidate.t[5] + af / jMax
 
         if check!(candidate, UDDU, LIMIT_ACC0_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            dur = sum(candidate.t)
-            if dur < best_duration
-                best_duration = dur
+            if vpc !== nothing
+                # Collecting mode: add all valid profiles
+                add_profile!(vpc, RuckigProfile(candidate, pf, vf, af; brake_duration, brake))
                 found_valid = true
-                copy_buffer!(buf, candidate)
+            else
+                # Optimization mode: keep shortest
+                dur = sum(candidate.t)
+                if dur < best_duration
+                    best_duration = dur
+                    found_valid = true
+                    copy_buffer!(buf, candidate)
+                end
             end
         end
     end
@@ -1563,10 +1598,15 @@ end
 Try ACC0, ACC1, and NONE profiles (no velocity limit reached).
 Returns the SHORTEST valid profile found (not the first).
 Uses candidate buffer for checking, copies best result to buf.
+
+If `vpc` is provided, collects ALL valid profiles into the collection (for block interval computation).
+If `vpc` is `nothing`, returns the shortest valid profile found (for time-optimal search).
 """
 function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, candidate::ProfileBuffer{T},
                                   p0, v0, a0, pf, vf, af,
-                                  jMax, vMax, vMin, aMax, aMin) where T
+                                  jMax, vMax, vMin, aMax, aMin;
+                                  vpc::Union{ValidProfileCollection{T}, Nothing}=nothing,
+                                  brake_duration::T=zero(T), brake::Union{RuckigProfile{T}, Nothing}=nothing) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
     a0_a0 = a0^2
@@ -1579,7 +1619,7 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, candidate
     vf_vf = vf^2
     pd = pf - p0
 
-    # Track the best (shortest duration) profile found
+    # Track the best (shortest duration) profile found (only used when vpc is nothing)
     best_duration = T(Inf)
     found_valid = false
 
@@ -1618,11 +1658,18 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, candidate
         candidate.t[7] = -h0 + t/2 + af/jMax
 
         if check!(candidate, UDDU, LIMIT_NONE, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            dur = sum(candidate.t)
-            if dur < best_duration
-                best_duration = dur
+            if vpc !== nothing
+                # Collecting mode: add all valid profiles
+                add_profile!(vpc, RuckigProfile(candidate, pf, vf, af; brake_duration, brake))
                 found_valid = true
-                copy_buffer!(buf, candidate)
+            else
+                # Optimization mode: keep shortest
+                dur = sum(candidate.t)
+                if dur < best_duration
+                    best_duration = dur
+                    found_valid = true
+                    copy_buffer!(buf, candidate)
+                end
             end
         end
     end
@@ -1662,11 +1709,18 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, candidate
         candidate.t[7] = (af - aMax)/jMax + t
 
         if check!(candidate, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            dur = sum(candidate.t)
-            if dur < best_duration
-                best_duration = dur
+            if vpc !== nothing
+                # Collecting mode: add all valid profiles
+                add_profile!(vpc, RuckigProfile(candidate, pf, vf, af; brake_duration, brake))
                 found_valid = true
-                copy_buffer!(buf, candidate)
+            else
+                # Optimization mode: keep shortest
+                dur = sum(candidate.t)
+                if dur < best_duration
+                    best_duration = dur
+                    found_valid = true
+                    copy_buffer!(buf, candidate)
+                end
             end
         end
     end
@@ -1722,11 +1776,18 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, candidate
         candidate.t[7] = (af - aMin)/jMax
 
         if check!(candidate, UDDU, LIMIT_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            dur = sum(candidate.t)
-            if dur < best_duration
-                best_duration = dur
+            if vpc !== nothing
+                # Collecting mode: add all valid profiles
+                add_profile!(vpc, RuckigProfile(candidate, pf, vf, af; brake_duration, brake))
                 found_valid = true
-                copy_buffer!(buf, candidate)
+            else
+                # Optimization mode: keep shortest
+                dur = sum(candidate.t)
+                if dur < best_duration
+                    best_duration = dur
+                    found_valid = true
+                    copy_buffer!(buf, candidate)
+                end
             end
         end
     end
@@ -2350,40 +2411,37 @@ function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0
     else
         # Full collection mode: collect ALL valid profiles for blocked interval computation
         # C++ uses original limits (NOT pd-swapped), see position_third_step1.cpp lines 558-563
-        # Use the _collect functions which add ALL valid profiles (not just the shortest)
 
         # Collect from time_all_none_acc0_acc1 (both directions)
-        time_all_none_acc0_acc1_collect!(valid_profiles, lim.roots, buf, candidate,
-                                         p0_eff, v0_eff, a0_eff, pf, vf, af,
-                                         jmax, vmax, vmin, amax, amin;
-                                         brake_duration, brake=brake_copy)
+        time_all_none_acc0_acc1!(lim.roots, buf, candidate,
+                                 p0_eff, v0_eff, a0_eff, pf, vf, af,
+                                 jmax, vmax, vmin, amax, amin;
+                                 vpc=valid_profiles, brake_duration, brake=brake_copy)
 
-        time_all_none_acc0_acc1_collect!(valid_profiles, lim.roots, buf, candidate,
-                                         p0_eff, v0_eff, a0_eff, pf, vf, af,
-                                         -jmax, vmin, vmax, amin, amax;
-                                         brake_duration, brake=brake_copy)
+        time_all_none_acc0_acc1!(lim.roots, buf, candidate,
+                                 p0_eff, v0_eff, a0_eff, pf, vf, af,
+                                 -jmax, vmin, vmax, amin, amax;
+                                 vpc=valid_profiles, brake_duration, brake=brake_copy)
 
         # Collect from time_acc0_acc1 (both directions)
-        time_acc0_acc1_collect!(valid_profiles, buf, candidate,
-                               p0_eff, v0_eff, a0_eff, pf, vf, af,
-                               jmax, vmax, vmin, amax, amin;
-                               brake_duration, brake=brake_copy)
+        time_acc0_acc1!(buf, candidate,
+                        p0_eff, v0_eff, a0_eff, pf, vf, af,
+                        jmax, vmax, vmin, amax, amin;
+                        vpc=valid_profiles, brake_duration, brake=brake_copy)
 
-        time_acc0_acc1_collect!(valid_profiles, buf, candidate,
-                               p0_eff, v0_eff, a0_eff, pf, vf, af,
-                               -jmax, vmin, vmax, amin, amax;
-                               brake_duration, brake=brake_copy)
+        time_acc0_acc1!(buf, candidate,
+                        p0_eff, v0_eff, a0_eff, pf, vf, af,
+                        -jmax, vmin, vmax, amin, amax;
+                        vpc=valid_profiles, brake_duration, brake=brake_copy)
 
         # Collect from time_all_vel (both directions)
-        time_all_vel_collect!(valid_profiles, buf,
-                             p0_eff, v0_eff, a0_eff, pf, vf, af,
-                             jmax, vmax, vmin, amax, amin;
-                             brake_duration, brake=brake_copy)
+        time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af,
+                      jmax, vmax, vmin, amax, amin;
+                      vpc=valid_profiles, brake_duration, brake=brake_copy)
 
-        time_all_vel_collect!(valid_profiles, buf,
-                             p0_eff, v0_eff, a0_eff, pf, vf, af,
-                             -jmax, vmin, vmax, amin, amax;
-                             brake_duration, brake=brake_copy)
+        time_all_vel!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af,
+                      -jmax, vmin, vmax, amin, amax;
+                      vpc=valid_profiles, brake_duration, brake=brake_copy)
 
         # If valid profiles found, compute block with blocked intervals
         if valid_profiles.count > 0
