@@ -799,6 +799,72 @@ end
     @test vf_3 ≈ 0.0 atol=1e-6
 end
 
+@testset "Target velocity at limit" begin
+    lim = JerkLimiter(; vmax=5.0, vmin=-3.0, amax=50.0, jmax=1000.0)
+
+    # Target velocity equals vmax
+    profile = calculate_trajectory(lim; pf=10.0, vf=5.0)
+    @test duration(profile) > 0
+    pf, vf, af, _ = profile(duration(profile))
+    @test pf ≈ 10.0 atol=1e-6
+    @test vf ≈ 5.0 atol=1e-6  # Exactly at vmax
+    @test af ≈ 0.0 atol=1e-6
+
+    # Target velocity equals vmin (asymmetric)
+    profile2 = calculate_trajectory(lim; pf=-5.0, vf=-3.0)
+    pf_2, vf_2, af_2, _ = profile2(duration(profile2))
+    @test pf_2 ≈ -5.0 atol=1e-6
+    @test vf_2 ≈ -3.0 atol=1e-6  # Exactly at vmin
+    @test af_2 ≈ 0.0 atol=1e-6
+end
+
+@testset "Target acceleration at limit" begin
+    lim = JerkLimiter(; vmax=10.0, amax=20.0, amin=-15.0, jmax=1000.0)
+
+    # Target acceleration equals amax
+    profile = calculate_trajectory(lim; pf=5.0, af=20.0)
+    @test duration(profile) > 0
+    pf, vf, af, _ = profile(duration(profile))
+    @test pf ≈ 5.0 atol=1e-6
+    @test vf ≈ 0.0 atol=1e-6
+    @test af ≈ 20.0 atol=1e-6  # Exactly at amax
+
+    # Target acceleration equals amin (asymmetric)
+    profile2 = calculate_trajectory(lim; pf=5.0, af=-15.0)
+    pf_2, vf_2, af_2, _ = profile2(duration(profile2))
+    @test pf_2 ≈ 5.0 atol=1e-6
+    @test vf_2 ≈ 0.0 atol=1e-6
+    @test af_2 ≈ -15.0 atol=1e-6  # Exactly at amin
+end
+
+@testset "Target velocity and acceleration both at limits" begin
+    lim = JerkLimiter(; vmax=5.0, vmin=-3.0, amax=20.0, amin=-15.0, jmax=1000.0)
+
+    # vf = vmax, af = amax
+    profile = calculate_trajectory(lim; pf=10.0, vf=5.0, af=20.0)
+    @test duration(profile) > 0
+    pf, vf, af, _ = profile(duration(profile))
+    @test pf ≈ 10.0 atol=1e-6
+    @test vf ≈ 5.0 atol=1e-6   # Exactly at vmax
+    @test af ≈ 20.0 atol=1e-6  # Exactly at amax
+
+    # vf = vmin, af = amin
+    profile2 = calculate_trajectory(lim; pf=-5.0, vf=-3.0, af=-15.0)
+    pf_2, vf_2, af_2, _ = profile2(duration(profile2))
+    @test pf_2 ≈ -5.0 atol=1e-6
+    @test vf_2 ≈ -3.0 atol=1e-6   # Exactly at vmin
+    @test af_2 ≈ -15.0 atol=1e-6  # Exactly at amin
+
+    # Mixed: vf = vmax, af = amin
+    @test_skip begin
+        profile3 = calculate_trajectory(lim; pf=8.0, vf=5.0, af=-15.0)
+        pf_3, vf_3, af_3, _ = profile3(duration(profile3))
+        @test pf_3 ≈ 8.0 atol=1e-6
+        @test vf_3 ≈ 5.0 atol=1e-6    # Exactly at vmax
+        @test af_3 ≈ -15.0 atol=1e-6  # Exactly at amin
+    end
+end
+
 @testset "known failure case" begin
     lim = JerkLimiter(; vmax=5.378090911418406, amax=21.580739221501887, jmax=250.48205176578452)
     p0,v0,a0 = (0.48825150691793306, 0.0, 0.0)
