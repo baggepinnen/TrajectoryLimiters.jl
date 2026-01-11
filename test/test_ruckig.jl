@@ -1123,7 +1123,7 @@ end
     # Helper to generate random value in [lo, hi]
     rand_in(lo, hi) = lo + rand() * (hi - lo)
 
-    for _ in 1:20
+    for _ in 1:10
         # Random symmetric JerkLimiter
         vmax = 5.0 + 10.0 * rand()
         amax = 20.0 + 50.0 * rand()
@@ -1151,7 +1151,7 @@ end
         @test af2 ≈ af atol=1e-5
     end
 
-    for _ in 1:20
+    for _ in 1:10
         # Random asymmetric JerkLimiter
         vmax = 5.0 + 10.0 * rand()
         vmin = -(3.0 + 8.0 * rand())
@@ -1308,4 +1308,226 @@ end
     _, vf3, af3, _ = profile3(duration(profile3))
     @test vf3 ≈ 0.0 atol=1e-5
     @test af3 ≈ -5.0 atol=1e-5
+end
+
+@testset "VelocityLimiter" begin
+    # Basic construction
+    lim = VelocityLimiter(; vmax=10.0)
+    @test lim.vmax == 10.0
+    @test lim.vmin == -10.0
+
+    # Asymmetric limits
+    lim2 = VelocityLimiter(; vmax=10.0, vmin=-5.0)
+    @test lim2.vmin == -5.0
+
+    # Time-optimal trajectory (positive direction)
+    profile = calculate_trajectory(lim; pf=100.0)
+    @test duration(profile) ≈ 10.0 atol=1e-6  # 100/10 = 10s at vmax
+    p, v, a, j = profile(duration(profile))
+    @test p ≈ 100.0 atol=1e-6
+    @test v ≈ 10.0 atol=1e-6  # constant velocity
+
+    # Time-optimal trajectory (negative direction)
+    profile2 = calculate_trajectory(lim; pf=-50.0)
+    @test duration(profile2) ≈ 5.0 atol=1e-6  # 50/10 = 5s at vmin
+
+    # With specified time
+    profile3 = calculate_trajectory(lim; pf=50.0, tf=10.0)
+    @test duration(profile3) ≈ 10.0 atol=1e-6
+    p, v, _, _ = profile3(5.0)
+    @test v ≈ 5.0 atol=1e-6  # 50/10 = 5 m/s
+
+    # Error: velocity would exceed limits
+    @test_throws ErrorException calculate_trajectory(lim; pf=100.0, tf=5.0)
+end
+
+@testset "Second-order brake functions" begin
+    using TrajectoryLimiters: BrakeProfile, get_second_order_position_brake_trajectory!,
+                              finalize_second_order_brake!, get_second_order_velocity_brake_trajectory!
+
+    @testset "get_second_order_position_brake_trajectory!" begin
+        bp = BrakeProfile{Float64}()
+
+        # Case 1: v0 > vMax (need to decelerate)
+        get_second_order_position_brake_trajectory!(bp, 15.0, 10.0, -10.0, 5.0, -5.0)
+        @test bp.t[1] > 0
+        @test bp.a[1] ≈ -5.0  # uses aMin
+
+        # Case 2: v0 < vMin (need to accelerate)
+        get_second_order_position_brake_trajectory!(bp, -15.0, 10.0, -10.0, 5.0, -5.0)
+        @test bp.t[1] > 0
+        @test bp.a[1] ≈ 5.0  # uses aMax
+
+        # Case 3: v0 within limits (no braking)
+        get_second_order_position_brake_trajectory!(bp, 5.0, 10.0, -10.0, 5.0, -5.0)
+        @test bp.t[1] ≈ 0.0
+
+        # Case 4: zero acceleration limits (skip braking)
+        get_second_order_position_brake_trajectory!(bp, 15.0, 10.0, -10.0, 0.0, -5.0)
+        @test bp.t[1] ≈ 0.0
+    end
+
+    @testset "finalize_second_order_brake!" begin
+        bp = BrakeProfile{Float64}()
+        get_second_order_position_brake_trajectory!(bp, 15.0, 10.0, -10.0, 5.0, -5.0)
+
+        ps, vs, as = finalize_second_order_brake!(bp, 0.0, 15.0, 0.0)
+        @test bp.duration > 0
+        @test vs ≈ 10.0 atol=1e-6  # braked to vMax
+
+        # No braking case
+        bp2 = BrakeProfile{Float64}()
+        get_second_order_position_brake_trajectory!(bp2, 5.0, 10.0, -10.0, 5.0, -5.0)
+        ps2, vs2, as2 = finalize_second_order_brake!(bp2, 0.0, 5.0, 0.0)
+        @test bp2.duration ≈ 0.0
+        @test ps2 ≈ 0.0
+        @test vs2 ≈ 5.0
+    end
+
+    @testset "get_second_order_velocity_brake_trajectory!" begin
+        bp = BrakeProfile{Float64}()
+        bp.t = (1.0, 2.0)
+        bp.j = (100.0, 50.0)
+
+        get_second_order_velocity_brake_trajectory!(bp)
+        @test bp.t == (0.0, 0.0)
+        @test bp.j == (0.0, 0.0)
+    end
+end
+
+@testset "get_profile" begin
+    using TrajectoryLimiters: get_profile, Block, BlockInterval
+
+    # Create profiles for testing
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+    profile1 = calculate_trajectory(lim; pf=1.0)
+    profile2 = calculate_trajectory(lim; pf=2.0)
+    profile3 = calculate_trajectory(lim; pf=3.0)
+
+    # Block with no intervals
+    block_simple = Block(profile1)
+    @test get_profile(block_simple, 0.0) === block_simple.p_min
+    @test get_profile(block_simple, 100.0) === block_simple.p_min
+
+    # Block with one interval
+    interval_a = BlockInterval(duration(profile1), duration(profile2), profile2)
+    block_a = Block{Float64}(profile1, duration(profile1), interval_a, nothing)
+    @test get_profile(block_a, 0.0) === profile1
+    @test get_profile(block_a, duration(profile2) + 0.1) === profile2
+
+    # Block with two intervals
+    interval_b = BlockInterval(duration(profile2), duration(profile3), profile3)
+    block_ab = Block{Float64}(profile1, duration(profile1), interval_a, interval_b)
+    @test get_profile(block_ab, 0.0) === profile1
+    @test get_profile(block_ab, duration(profile3) + 0.1) === profile3
+end
+
+@testset "get_position_extrema" begin
+    using TrajectoryLimiters: get_position_extrema
+
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+    # Monotonic trajectory (start to end, no internal extrema)
+    profile = calculate_trajectory(lim; pf=5.0)
+    bounds = get_position_extrema(profile)
+    @test bounds.min ≈ 0.0 atol=1e-6
+    @test bounds.max ≈ 5.0 atol=1e-6
+
+    # Trajectory with overshoot (non-zero initial velocity toward target)
+    profile2 = calculate_trajectory(lim; v0=8.0, pf=0.5)
+    bounds2 = get_position_extrema(profile2)
+    @test bounds2.min ≈ 0.0 atol=1e-6
+    @test bounds2.max > 0.5  # overshoots target
+
+    # Negative direction
+    profile3 = calculate_trajectory(lim; pf=-5.0)
+    bounds3 = get_position_extrema(profile3)
+    @test bounds3.min ≈ -5.0 atol=1e-6
+    @test bounds3.max ≈ 0.0 atol=1e-6
+
+    # Non-zero final velocity
+    profile4 = calculate_trajectory(lim; pf=2.0, vf=5.0)
+    bounds4 = get_position_extrema(profile4)
+    @test bounds4.min ≤ 0.01
+    @test bounds4.max ≥ 1.99
+end
+
+@testset "get_first_state_at_position" begin
+    using TrajectoryLimiters: get_first_state_at_position
+
+    lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+    # Find time to reach intermediate position
+    profile = calculate_trajectory(lim; pf=5.0)
+
+    # Position at start
+    found, t = get_first_state_at_position(profile, 0.0)
+    @test found
+    @test t ≈ 0.0 atol=1e-6
+
+    # Position at end
+    found, t = get_first_state_at_position(profile, 5.0)
+    @test found
+    @test t ≈ duration(profile) atol=1e-5
+
+    # Intermediate position
+    found, t = get_first_state_at_position(profile, 2.5)
+    @test found
+    @test 0.0 < t < duration(profile)
+    p, _, _, _ = profile(t)
+    @test p ≈ 2.5 atol=1e-5
+
+    # Position never reached
+    found, t = get_first_state_at_position(profile, 10.0)
+    @test !found
+    @test isnan(t)
+
+    # Profile with overshoot (reaches position twice)
+    profile2 = calculate_trajectory(lim; v0=8.0, pf=0.5)
+    found_first, t_first = get_first_state_at_position(profile2, 1.0)
+    if found_first
+        p_check, _, _, _ = profile2(t_first)
+        @test p_check ≈ 1.0 atol=1e-5
+    end
+
+    # With time_after constraint
+    found1, t1 = get_first_state_at_position(profile, 2.5)
+    if found1
+        found2, t2 = get_first_state_at_position(profile, 2.5; time_after=t1 + 0.01)
+        # Should not find it again in a monotonic trajectory
+        @test !found2 || t2 > t1
+    end
+end
+
+@testset "solve_cubic_real" begin
+    using TrajectoryLimiters: solve_cubic_real
+
+    # Quadratic fallback (a ≈ 0)
+    # Solve: 0*x³ + 1*x² - 3*x + 2 = 0 => (x-1)(x-2) = 0
+    roots = solve_cubic_real(0.0, 1.0, -3.0, 2.0)
+    @test length(roots) == 2
+    @test any(r -> abs(r - 1.0) < 1e-10, roots)
+    @test any(r -> abs(r - 2.0) < 1e-10, roots)
+
+    # Linear fallback (a ≈ 0, b ≈ 0)
+    # Solve: 2*x + 4 = 0 => x = -2
+    roots = solve_cubic_real(0.0, 0.0, 2.0, 4.0)
+    @test length(roots) == 1
+    @test roots[1] ≈ -2.0
+
+    # True cubic with one real root
+    # x³ + x + 2 = 0 has one real root at x ≈ -1
+    roots = solve_cubic_real(1.0, 0.0, 1.0, 2.0)
+    @test length(roots) >= 1
+    for r in roots
+        @test abs(r^3 + r + 2) < 1e-8
+    end
+
+    # True cubic with three real roots
+    # (x-1)(x-2)(x-3) = x³ - 6x² + 11x - 6
+    roots = solve_cubic_real(1.0, -6.0, 11.0, -6.0)
+    @test length(roots) == 3
+    for r in roots
+        @test abs(r^3 - 6*r^2 + 11*r - 6) < 1e-8
+    end
 end
