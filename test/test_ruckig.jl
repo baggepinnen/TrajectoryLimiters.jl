@@ -1118,3 +1118,139 @@ end
     _, vf2, _, _ = profile2(duration(profile2))
     @test vf2 ≈ -10.0 atol=1e-6
 end
+
+@testset "Velocity control: random trajectories" begin
+    # Helper to generate random value in [lo, hi]
+    rand_in(lo, hi) = lo + rand() * (hi - lo)
+
+    for _ in 1:20
+        # Random symmetric JerkLimiter
+        vmax = 5.0 + 10.0 * rand()
+        amax = 20.0 + 50.0 * rand()
+        jmax = 500.0 + 1000.0 * rand()
+        lim = JerkLimiter(; vmax, amax, jmax)
+
+        # Random targets within limits
+        vf = rand_in(-vmax, vmax)
+        af = rand_in(-amax, amax)
+
+        # Time-optimal from rest
+        profile = calculate_velocity_trajectory(lim; vf, af)
+        @test duration(profile) > 0
+        _, vf_actual, af_actual, _ = profile(duration(profile))
+        @test vf_actual ≈ vf atol=1e-5
+        @test af_actual ≈ af atol=1e-5
+
+        # With random initial state within limits
+        v0 = rand_in(-vmax, vmax)
+        a0 = rand_in(-amax, amax)
+        profile2 = calculate_velocity_trajectory(lim; v0, a0, vf, af)
+        @test duration(profile2) >= 0
+        _, vf2, af2, _ = profile2(duration(profile2))
+        @test vf2 ≈ vf atol=1e-5
+        @test af2 ≈ af atol=1e-5
+    end
+
+    for _ in 1:20
+        # Random asymmetric JerkLimiter
+        vmax = 5.0 + 10.0 * rand()
+        vmin = -(3.0 + 8.0 * rand())
+        amax = 20.0 + 50.0 * rand()
+        amin = -(15.0 + 40.0 * rand())
+        jmax = 500.0 + 1000.0 * rand()
+        lim = JerkLimiter(; vmax, vmin, amax, amin, jmax)
+
+        # Random targets within asymmetric limits
+        vf = rand_in(vmin, vmax)
+        af = rand_in(amin, amax)
+
+        profile = calculate_velocity_trajectory(lim; vf, af)
+        @test duration(profile) > 0
+        _, vf_actual, af_actual, _ = profile(duration(profile))
+        @test vf_actual ≈ vf atol=1e-5
+        @test af_actual ≈ af atol=1e-5
+
+        # With random initial state
+        v0 = rand_in(vmin, vmax)
+        a0 = rand_in(amin, amax)
+        profile2 = calculate_velocity_trajectory(lim; v0, a0, vf, af)
+        @test duration(profile2) >= 0
+        _, vf2, af2, _ = profile2(duration(profile2))
+        @test vf2 ≈ vf atol=1e-5
+        @test af2 ≈ af atol=1e-5
+    end
+
+    for _ in 1:10
+        # Random AccelerationLimiter (second-order, no jerk limit)
+        vmax = 10.0 + 20.0 * rand()
+        amax = 20.0 + 50.0 * rand()
+        lim = AccelerationLimiter(; vmax, amax)
+
+        # Random target velocity within limits
+        vf = rand_in(-vmax, vmax)
+
+        profile = calculate_velocity_trajectory(lim; vf)
+        @test duration(profile) > 0
+        _, vf_actual, _, _ = profile(duration(profile))
+        @test vf_actual ≈ vf atol=1e-5
+
+        # With random initial velocity
+        v0 = rand_in(-vmax, vmax)
+        profile2 = calculate_velocity_trajectory(lim; v0, vf)
+        @test duration(profile2) >= 0
+        _, vf2, _, _ = profile2(duration(profile2))
+        @test vf2 ≈ vf atol=1e-5
+
+        # Time-synchronized (ensure tf is feasible)
+        tf_min = duration(calculate_velocity_trajectory(lim; v0, vf))
+        tf = tf_min + 0.1 + 0.5 * rand()  # Add margin to ensure feasibility
+        profile3 = calculate_velocity_trajectory(lim; v0, vf, tf)
+        @test duration(profile3) ≈ tf atol=1e-6
+        _, vf3, _, _ = profile3(duration(profile3))
+        @test vf3 ≈ vf atol=1e-5
+    end
+
+    for _ in 1:10
+        # Random asymmetric AccelerationLimiter
+        vmax = 10.0 + 20.0 * rand()
+        vmin = -(5.0 + 15.0 * rand())
+        amax = 20.0 + 50.0 * rand()
+        amin = -(15.0 + 40.0 * rand())
+        lim = AccelerationLimiter(; vmax, vmin, amax, amin)
+
+        vf = rand_in(vmin, vmax)
+        v0 = rand_in(vmin, vmax)
+
+        profile = calculate_velocity_trajectory(lim; v0, vf)
+        @test duration(profile) >= 0
+        _, vf_actual, _, _ = profile(duration(profile))
+        @test vf_actual ≈ vf atol=1e-5
+    end
+
+    for _ in 1:10
+        # JerkLimiter time-synchronized velocity control
+        vmax = 5.0 + 10.0 * rand()
+        amax = 20.0 + 50.0 * rand()
+        jmax = 500.0 + 1000.0 * rand()
+        lim = JerkLimiter(; vmax, amax, jmax)
+
+        vf = rand_in(-vmax, vmax)
+        v0 = rand_in(-vmax, vmax)
+        a0 = rand_in(-amax, amax)
+        af = rand_in(-amax, amax)
+
+        # Get minimum time first
+        profile_opt = calculate_velocity_trajectory(lim; v0, a0, vf, af)
+        tf_min = duration(profile_opt)
+
+        # Request longer time
+        tf = tf_min + 0.05 + 0.2 * rand()
+        profile = calculate_velocity_trajectory(lim; v0, a0, vf, af, tf)
+        @test duration(profile) ≈ tf atol=1e-6
+        _, vf_actual, af_actual, _ = profile(duration(profile))
+        @test vf_actual ≈ vf atol=1e-5
+        @test af_actual ≈ af atol=1e-5
+    end
+
+    GC.gc(true)
+end

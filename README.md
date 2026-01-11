@@ -216,6 +216,39 @@ plot(
 
 ![initial velocity](https://github.com/user-attachments/assets/67ab9661-6ca0-4d5f-82dc-6d3b9cb9bbea)
 
+### Velocity Control
+
+For applications where you need to reach a target velocity (rather than a target position), use `calculate_velocity_trajectory`. This is useful for, e.g.,:
+- Conveyor belt speed control
+- Spindle speed changes
+
+```julia
+using TrajectoryLimiters
+
+# Create a jerk limiter
+lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+# Accelerate from rest to velocity 5.0
+profile = calculate_velocity_trajectory(lim; vf=5.0)
+
+# Evaluate the trajectory
+p, v, a, j = profile(duration(profile))
+# v ≈ 5.0 (target velocity reached)
+
+# With initial velocity and acceleration
+profile2 = calculate_velocity_trajectory(lim; v0=2.0, a0=10.0, vf=8.0, af=0.0)
+
+# Time-synchronized: reach target velocity in exactly 0.5 seconds
+profile3 = calculate_velocity_trajectory(lim; vf=5.0, tf=0.5)
+```
+
+The `AccelerationLimiter` (second-order, no jerk limit) also supports velocity control:
+
+```julia
+lim2 = AccelerationLimiter(; vmax=100.0, amax=50.0)
+profile = calculate_velocity_trajectory(lim2; vf=10.0)
+```
+
 ### Asymmetric Limits
 
 For applications where positive and negative motion have different constraints (e.g., gravity-affected systems), specify the directional limits:
