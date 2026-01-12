@@ -24,6 +24,7 @@ end
 
 @testset "Simple trajectory: rest to rest" begin
     lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+    display(lim)
 
     # Move from 0 to 1
     profile = calculate_trajectory(lim; pf=1.0)
@@ -1066,7 +1067,8 @@ end
 
 @testset "Velocity control: AccelerationLimiter basic" begin
     lim = AccelerationLimiter(; vmax=100.0, amax=50.0)
-
+    display(lim)
+    
     # Accelerate from rest
     profile = calculate_velocity_trajectory(lim; vf=10.0)
     @test duration(profile) > 0
@@ -1313,6 +1315,7 @@ end
 @testset "VelocityLimiter" begin
     # Basic construction
     lim = VelocityLimiter(; vmax=10.0)
+    display(lim)
     @test lim.vmax == 10.0
     @test lim.vmin == -10.0
 
@@ -1529,5 +1532,293 @@ end
     @test length(roots) == 3
     for r in roots
         @test abs(r^3 - 6*r^2 + 11*r - 6) < 1e-8
+    end
+end
+
+@testset "solve_quadratic_real!" begin
+    using TrajectoryLimiters: solve_quadratic_real!, Roots
+
+    # Linear fallback (a ≈ 0)
+    roots = Roots{Float64}()
+    solve_quadratic_real!(roots, 0.0, 2.0, -6.0)
+    @test length(roots) == 1
+    @test roots[1] ≈ 3.0
+
+    # Linear fallback with b ≈ 0 (no solution)
+    roots = Roots{Float64}()
+    solve_quadratic_real!(roots, 0.0, 0.0, 5.0)
+    @test length(roots) == 0
+
+    # Quadratic with two real roots
+    # x² - 5x + 6 = 0 => (x-2)(x-3) = 0
+    roots = Roots{Float64}()
+    solve_quadratic_real!(roots, 1.0, -5.0, 6.0)
+    @test length(roots) == 2
+    @test any(r -> abs(r - 2.0) < 1e-10, roots)
+    @test any(r -> abs(r - 3.0) < 1e-10, roots)
+
+    # Quadratic with one real root (discriminant = 0)
+    # x² - 4x + 4 = 0 => (x-2)² = 0
+    roots = Roots{Float64}()
+    solve_quadratic_real!(roots, 1.0, -4.0, 4.0)
+    @test length(roots) == 1
+    @test roots[1] ≈ 2.0 atol=1e-10
+
+    # Quadratic with no real roots (negative discriminant)
+    # x² + x + 1 = 0 has no real roots
+    roots = Roots{Float64}()
+    solve_quadratic_real!(roots, 1.0, 1.0, 1.0)
+    @test length(roots) == 0
+end
+
+@testset "Second-order timing functions" begin
+    using TrajectoryLimiters: ProfileBuffer, time_acc0_second_order!, time_none_second_order!, check_for_second_order!
+
+    @testset "time_acc0_second_order!" begin
+        buf = ProfileBuffer{Float64}()
+
+        # Case 1: Accelerate to vMax, coast, decelerate to vf
+        # From rest to pf=10, with vMax=5
+        # Should accelerate: 0 -> 5 at aMax=2 (t1 = 2.5s, d1 = 6.25)
+        # Then decelerate: 5 -> 0 at aMin=-2 (t3 = 2.5s, d3 = 6.25)
+        # Need coast distance: 10 - 6.25 - 6.25 = -2.5 (negative, so ACC0 fails)
+        result = time_acc0_second_order!(buf, 0.0, 0.0, 10.0, 0.0, 5.0, -5.0, 2.0, -2.0)
+        # This should fail because distance is too short for ACC0 profile
+        @test !result
+
+        # Case 2: Longer distance where ACC0 profile works
+        # From rest to pf=50, with vMax=5, aMax=2
+        # Accelerate: 0 -> 5 at a=2 (t1 = 2.5s, d1 = 6.25)
+        # Decelerate: 5 -> 0 at a=-2 (t3 = 2.5s, d3 = 6.25)
+        # Coast distance: 50 - 6.25 - 6.25 = 37.5 at v=5 (t2 = 7.5s)
+        result = time_acc0_second_order!(buf, 0.0, 0.0, 50.0, 0.0, 5.0, -5.0, 2.0, -2.0)
+        @test result
+        @test buf.t[1] ≈ 2.5 atol=1e-6  # accel time
+        @test buf.t[2] ≈ 7.5 atol=1e-6  # coast time
+        @test buf.t[3] ≈ 2.5 atol=1e-6  # decel time
+
+        # Case 3: Negative times (invalid)
+        result = time_acc0_second_order!(buf, 0.0, 10.0, 5.0, 0.0, 5.0, -5.0, 2.0, -2.0)
+        @test !result  # v0 > vMax, can't accelerate up
+    end
+
+    @testset "time_none_second_order!" begin
+        buf = ProfileBuffer{Float64}()
+
+        # Case: Short distance where direct accel/decel works
+        # Triangular velocity profile (no coast)
+        result = time_none_second_order!(buf, 0.0, 0.0, 5.0, 0.0, 10.0, -10.0, 2.0, -2.0)
+        @test result
+        @test buf.t[2] ≈ 0.0 atol=1e-10  # no coast time
+
+        # Verify the profile reaches the target
+        total_time = buf.t[1] + buf.t[2] + buf.t[3]
+        @test total_time > 0
+    end
+
+    @testset "check_for_second_order!" begin
+        using TrajectoryLimiters: LIMIT_NONE, UDDU
+        buf = ProfileBuffer{Float64}()
+
+        # Set up a valid second-order profile manually
+        buf.t[1] = 1.0  # accel phase
+        buf.t[2] = 2.0  # coast phase
+        buf.t[3] = 1.0  # decel phase
+        for i in 4:7
+            buf.t[i] = 0.0
+        end
+
+        # Parameters for check
+        p0, v0, pf, vf = 0.0, 0.0, 10.0, 0.0
+        aMax, aMin = 2.0, -2.0
+        vMax, vMin = 5.0, -5.0
+
+        result = check_for_second_order!(buf, p0, v0, pf, vf, aMax, aMin, vMax, vMin, LIMIT_NONE, UDDU)
+        # Result depends on whether the times actually give a valid trajectory
+        @test result isa Bool
+
+        # Negative time should fail
+        buf.t[1] = -1.0
+        result = check_for_second_order!(buf, p0, v0, pf, vf, aMax, aMin, vMax, vMin, LIMIT_NONE, UDDU)
+        @test !result
+    end
+end
+
+@testset "AccelerationLimiter calculate_trajectory" begin
+    # Test various scenarios for the AccelerationLimiter trajectory calculation
+
+    @testset "Rest to rest" begin
+        lim = AccelerationLimiter(; vmax=10.0, amax=5.0)
+        profile = calculate_trajectory(lim; pf=20.0)
+
+        @test duration(profile) > 0
+        p0, v0, a0, _ = profile(0.0)
+        @test p0 ≈ 0.0 atol=1e-6
+        @test v0 ≈ 0.0 atol=1e-6
+
+        pf, vf, af, _ = profile(duration(profile))
+        @test pf ≈ 20.0 atol=1e-6
+        @test vf ≈ 0.0 atol=1e-6
+    end
+
+    @testset "Non-zero initial velocity" begin
+        lim = AccelerationLimiter(; vmax=10.0, amax=5.0)
+        profile = calculate_trajectory(lim; pf=30.0, v0=5.0)
+
+        @test duration(profile) > 0
+        _, v0_actual, _, _ = profile(0.0)
+        @test v0_actual ≈ 5.0 atol=1e-6
+
+        pf, vf, _, _ = profile(duration(profile))
+        @test pf ≈ 30.0 atol=1e-6
+        @test vf ≈ 0.0 atol=1e-6
+    end
+
+    @testset "Non-zero final velocity" begin
+        lim = AccelerationLimiter(; vmax=10.0, amax=5.0)
+        profile = calculate_trajectory(lim; pf=20.0, vf=3.0)
+
+        @test duration(profile) > 0
+        pf, vf_actual, _, _ = profile(duration(profile))
+        @test pf ≈ 20.0 atol=1e-6
+        @test vf_actual ≈ 3.0 atol=1e-6
+    end
+
+    @testset "Negative direction" begin
+        lim = AccelerationLimiter(; vmax=10.0, amax=5.0)
+        profile = calculate_trajectory(lim; pf=-15.0)
+
+        @test duration(profile) > 0
+        pf, vf, _, _ = profile(duration(profile))
+        @test pf ≈ -15.0 atol=1e-6
+        @test vf ≈ 0.0 atol=1e-6
+    end
+
+    @testset "Asymmetric limits" begin
+        lim = AccelerationLimiter(; vmax=10.0, vmin=-5.0, amax=5.0, amin=-3.0)
+        profile = calculate_trajectory(lim; pf=25.0)
+
+        @test duration(profile) > 0
+        # Verify trajectory stays within limits
+        for t in range(0, duration(profile), length=50)
+            _, v, a, _ = profile(t)
+            @test v <= 10.0 + 1e-6
+            @test v >= -5.0 - 1e-6
+        end
+    end
+
+    @testset "Initial velocity outside limits (triggers brake)" begin
+        lim = AccelerationLimiter(; vmax=10.0, amax=5.0)
+        # Start with v0 > vmax, should trigger braking first
+        profile = calculate_trajectory(lim; pf=50.0, v0=15.0)
+
+        @test duration(profile) > 0
+        _, v0_actual, _, _ = profile(0.0)
+        @test v0_actual ≈ 15.0 atol=1e-6
+
+        pf, vf, _, _ = profile(duration(profile))
+        @test pf ≈ 50.0 atol=1e-6
+        @test vf ≈ 0.0 atol=1e-6
+    end
+end
+
+@testset "Two-step profile functions" begin
+    using TrajectoryLimiters: ProfileBuffer, time_none_two_step!, time_acc0_two_step!,
+                              time_acc1_vel_two_step!, time_vel_two_step!, check!, UDDU, LIMIT_NONE
+
+    @testset "time_none_two_step!" begin
+        buf = ProfileBuffer{Float64}()
+
+        # Simple case: small velocity change with matching initial/final acceleration
+        # This tests the symmetric acceleration peak case
+        p0, v0, a0 = 0.0, 0.0, 0.0
+        pf, vf, af = 1.0, 0.0, 0.0
+        jMax = 100.0
+        vMax, vMin = 10.0, -10.0
+        aMax, aMin = 50.0, -50.0
+
+        result = time_none_two_step!(buf, p0, v0, a0, pf, vf, af, jMax, vMax, vMin, aMax, aMin)
+        # Result depends on whether this specific profile type works for these parameters
+        @test result isa Bool
+
+        # If successful, verify times are non-negative
+        if result
+            for i in 1:7
+                @test buf.t[i] >= -1e-10
+            end
+        end
+    end
+
+    @testset "time_acc0_two_step!" begin
+        buf = ProfileBuffer{Float64}()
+
+        # Test with non-zero initial acceleration
+        p0, v0, a0 = 0.0, 5.0, 10.0
+        pf, vf, af = 10.0, 5.0, 10.0
+        jMax = 100.0
+        vMax, vMin = 20.0, -20.0
+        aMax, aMin = 50.0, -50.0
+
+        result = time_acc0_two_step!(buf, p0, v0, a0, pf, vf, af, jMax, vMax, vMin, aMax, aMin)
+        @test result isa Bool
+
+        # If successful, verify times are non-negative
+        if result
+            for i in 1:7
+                @test buf.t[i] >= -1e-10
+            end
+        end
+    end
+
+    @testset "time_acc1_vel_two_step!" begin
+        buf = ProfileBuffer{Float64}()
+
+        # Test parameters for ACC1_VEL profile
+        p0, v0, a0 = 0.0, 0.0, 5.0
+        pf, vf, af = 20.0, 0.0, -5.0
+        jMax = 100.0
+        vMax, vMin = 10.0, -10.0
+        aMax, aMin = 50.0, -50.0
+
+        result = time_acc1_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax, vMax, vMin, aMax, aMin)
+        @test result isa Bool
+    end
+
+    @testset "time_vel_two_step!" begin
+        buf = ProfileBuffer{Float64}()
+
+        # Test parameters for VEL profile
+        p0, v0, a0 = 0.0, 0.0, 0.0
+        pf, vf, af = 50.0, 0.0, 0.0
+        jMax = 100.0
+        vMax, vMin = 10.0, -10.0
+        aMax, aMin = 50.0, -50.0
+
+        result = time_vel_two_step!(buf, p0, v0, a0, pf, vf, af, jMax, vMax, vMin, aMax, aMin)
+        @test result isa Bool
+
+        # If successful, check coast time exists
+        if result
+            @test buf.t[4] >= -1e-10  # coast time
+        end
+    end
+
+    @testset "Two-step integration via calculate_velocity_trajectory with tf" begin
+        # Two-step profiles are typically used in Step 2 synchronization
+        # when a specific duration tf is requested (supported for velocity control)
+        lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
+
+        # First get time-optimal velocity trajectory
+        profile_opt = calculate_velocity_trajectory(lim; vf=5.0)
+        t_opt = duration(profile_opt)
+
+        # Request a longer duration (should use Step 2 synchronization)
+        tf_slow = t_opt * 2.0
+        profile_slow = calculate_velocity_trajectory(lim; vf=5.0, tf=tf_slow)
+
+        @test duration(profile_slow) ≈ tf_slow atol=1e-5
+        _, v, a, _ = profile_slow(tf_slow)
+        @test v ≈ 5.0 atol=1e-5
+        @test a ≈ 0.0 atol=1e-5
     end
 end

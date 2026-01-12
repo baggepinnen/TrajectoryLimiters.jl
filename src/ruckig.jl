@@ -239,17 +239,6 @@ function get_profile(block::Block, t)
     return block.p_min
 end
 
-"""String representation of Block (matches C++ Block::to_string)."""
-function Base.show(io::IO, block::Block)
-    print(io, "[", block.t_min, " ")
-    if !isnothing(block.a)
-        print(io, block.a.left, "] [", block.a.right, " ")
-    end
-    if !isnothing(block.b)
-        print(io, block.b.left, "] [", block.b.right, " ")
-    end
-    print(io, "-")
-end
 
 #=============================================================================
  ValidProfileCollection: Collects valid profiles during Step 1 for Block calculation
@@ -444,7 +433,7 @@ end
 Base.length(r::Roots) = r.count
 
 # Helper to get root by index (1-based)
-@inline function _get_root(r::Roots, i)
+@inline function Base.getindex(r::Roots, i)
     i == 1 && return r.r1
     i == 2 && return r.r2
     i == 3 && return r.r3
@@ -455,7 +444,7 @@ end
 # Matches C++ PositiveSet behavior: only iterate over non-negative roots
 function Base.iterate(r::Roots)
     for i in 1:r.count
-        val = _get_root(r, i)
+        val = r[i]
         val >= 0 && return (val, i + 1)
     end
     return nothing
@@ -463,7 +452,7 @@ end
 
 function Base.iterate(r::Roots, state)
     for i in state:r.count
-        val = _get_root(r, i)
+        val = r[i]
         val >= 0 && return (val, i + 1)
     end
     return nothing
@@ -841,16 +830,23 @@ function check_for_second_order!(buf::ProfileBuffer{T}, p0, v0, pf, vf, aMax, aM
         return false
     end
 
-    # Check velocity limits
-    for i in 1:8
-        if buf.v[i] > vMax + V_PRECISION || buf.v[i] < vMin - V_PRECISION
+    # Determine direction and velocity limits (handles swapped limits for negative direction)
+    # C++ reference: profile.hpp lines 331-333
+    direction = vMax > 0 ? DIR_UP : DIR_DOWN
+    vUppLim = (direction == DIR_UP ? vMax : vMin) + V_PRECISION
+    vLowLim = (direction == DIR_UP ? vMin : vMax) - V_PRECISION
+
+    # Check velocity limits (skip v[1] and v[2] - initial velocity can be outside limits)
+    # C++ reference: profile.hpp lines 345-347 checks v[2] through v[6] (0-indexed)
+    for i in 3:7
+        if buf.v[i] > vUppLim || buf.v[i] < vLowLim
             return false
         end
     end
 
     buf.limits = limits
     buf.control_signs = control_signs
-    buf.direction = vMax > 0 ? DIR_UP : DIR_DOWN
+    buf.direction = direction
 
     return true
 end
