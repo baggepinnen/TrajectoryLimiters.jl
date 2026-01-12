@@ -19,7 +19,7 @@ jobs:
       matrix:
         version:
           - '1.11'
-          - 'latest'
+          - '1'
         os:
           - ubuntu-latest
         arch:
