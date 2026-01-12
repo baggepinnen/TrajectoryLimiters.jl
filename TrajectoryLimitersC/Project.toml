@@ -1,0 +1,6 @@
+name = "TrajectoryLimitersC"
+uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+version = "0.1.0"
+
+[deps]
+TrajectoryLimiters = "9792e600-fe43-4e4e-833b-462f466b8006"
