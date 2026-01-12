@@ -4434,7 +4434,7 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
     length(af) == ndof || throw(ArgumentError("af must have length $ndof"))
 
     # Step 1: Calculate minimum-time profile for each DOF with blocked intervals
-    blocks = Vector{Block{Float64}}(undef, ndof)
+    blocks = Vector{Block{T}}(undef, ndof)
     for i in 1:ndof
         blocks[i] = calculate_trajectory_with_block(lims[i];
             p0=p0[i], v0=v0[i], a0=a0[i],
@@ -4447,15 +4447,17 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
 
     # Build list of candidate synchronization times
     # Format: (time, dof_index, source) where source: 0=t_min, 1=a.right, 2=b.right
-    candidates = Tuple{Float64, Int, Int}[]
+    candidates = Tuple{T, Int, Int}[]
 
     for i in 1:ndof
-        push!(candidates, (blocks[i].t_min, i, 0))
-        if !isnothing(blocks[i].a)
-            push!(candidates, (blocks[i].a.right, i, 1))
+        bi = blocks[i]
+        push!(candidates, (bi.t_min, i, 0))
+        if bi.a !== nothing
+            bi.a.right
+            push!(candidates, (bi.a.right, i, 1))
         end
-        if !isnothing(blocks[i].b)
-            push!(candidates, (blocks[i].b.right, i, 2))
+        if bi.b !== nothing
+            push!(candidates, (bi.b.right, i, 2))
         end
     end
 
@@ -4500,14 +4502,15 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
     profiles = Vector{RuckigProfile{Float64}}(undef, ndof)
 
     for i in 1:ndof
+        bi = blocks[i]
         # Check if this DOF can use an existing profile (from Step 1 or blocked interval)
         # Use 2*eps tolerance for numerical robustness (matching C++ line 480)
-        if abs(t_sync - blocks[i].t_min) < 2 * T_PRECISION
-            profiles[i] = blocks[i].p_min
-        elseif !isnothing(blocks[i].a) && abs(t_sync - blocks[i].a.right) < 2 * T_PRECISION
-            profiles[i] = blocks[i].a.profile
-        elseif !isnothing(blocks[i].b) && abs(t_sync - blocks[i].b.right) < 2 * T_PRECISION
-            profiles[i] = blocks[i].b.profile
+        if abs(t_sync - bi.t_min) < 2 * T_PRECISION
+            profiles[i] = bi.p_min
+        elseif !isnothing(bi.a) && abs(t_sync - bi.a.right) < 2 * T_PRECISION
+            profiles[i] = bi.a.profile
+        elseif !isnothing(bi.b) && abs(t_sync - bi.b.right) < 2 * T_PRECISION
+            profiles[i] = bi.b.profile
         else
             # Need to recalculate for synchronized duration (Step 2)
             buf = lims[i].buffer

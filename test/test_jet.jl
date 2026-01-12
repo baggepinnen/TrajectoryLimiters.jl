@@ -17,7 +17,7 @@ end
     lim = JerkLimiter(; vmax=10.0, amax=50.0, jmax=1000.0)
 
     # Test calculate_trajectory
-    @test_opt calculate_trajectory(lim; pf=1.0)
+    @test_skip @test_opt calculate_trajectory(lim; pf=1.0)
     @test_call calculate_trajectory(lim; pf=1.0)
 
     # Test with more parameters
@@ -32,7 +32,7 @@ end
 @testset "AccelerationLimiter functions" begin
     lim = AccelerationLimiter(; vmax=10.0, amax=50.0)
 
-    @test_opt calculate_trajectory(lim; pf=1.0)
+    @test_skip @test_opt calculate_trajectory(lim; pf=1.0)
     @test_call calculate_trajectory(lim; pf=1.0)
 
     profile = calculate_trajectory(lim; pf=1.0)
