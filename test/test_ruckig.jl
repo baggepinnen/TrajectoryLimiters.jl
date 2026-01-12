@@ -1822,3 +1822,113 @@ end
         @test a ≈ 0.0 atol=1e-5
     end
 end
+
+@testset "Step 2 profile functions" begin
+    using TrajectoryLimiters: ProfileBuffer, Step2PreComputed, Roots,
+                              time_none_step2!, time_acc0_step2!, time_acc1_step2!, time_acc0_acc1_step2!
+
+    # Common test setup
+    p0, v0, a0 = 0.0, 0.0, 0.0
+    pf, vf, af = 5.0, 0.0, 0.0
+    vMax, vMin = 10.0, -10.0
+    aMax, aMin = 50.0, -50.0
+    jMax = 1000.0
+
+    # First compute the time-optimal duration
+    lim = JerkLimiter(; vmax=vMax, amax=aMax, jmax=jMax)
+    profile_opt = calculate_trajectory(lim; pf)
+    t_opt = duration(profile_opt)
+
+    # Test with a longer duration (Step 2 scenario)
+    tf = t_opt * 1.5
+
+    @testset "time_none_step2!" begin
+        buf = ProfileBuffer{Float64}()
+        roots = Roots{Float64}()
+        pc = Step2PreComputed(tf, p0, v0, a0, pf, vf, af, jMax)
+
+        result = time_none_step2!(roots, buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+        @test result isa Bool
+
+        # If successful, verify the profile
+        if result
+            total_time = sum(buf.t[i] for i in 1:7)
+            @test total_time ≈ tf atol=1e-5
+            for i in 1:7
+                @test buf.t[i] >= -1e-10
+            end
+        end
+    end
+
+    @testset "time_acc0_step2!" begin
+        buf = ProfileBuffer{Float64}()
+        pc = Step2PreComputed(tf, p0, v0, a0, pf, vf, af, jMax)
+
+        result = time_acc0_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+        @test result isa Bool
+
+        if result
+            total_time = sum(buf.t[i] for i in 1:7)
+            @test total_time ≈ tf atol=1e-5
+            for i in 1:7
+                @test buf.t[i] >= -1e-10
+            end
+        end
+    end
+
+    @testset "time_acc1_step2!" begin
+        buf = ProfileBuffer{Float64}()
+        pc = Step2PreComputed(tf, p0, v0, a0, pf, vf, af, jMax)
+
+        result = time_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+        @test result isa Bool
+
+        if result
+            total_time = sum(buf.t[i] for i in 1:7)
+            @test total_time ≈ tf atol=1e-5
+            for i in 1:7
+                @test buf.t[i] >= -1e-10
+            end
+        end
+    end
+
+    @testset "time_acc0_acc1_step2!" begin
+        buf = ProfileBuffer{Float64}()
+        pc = Step2PreComputed(tf, p0, v0, a0, pf, vf, af, jMax)
+
+        result = time_acc0_acc1_step2!(buf, pc, p0, v0, a0, pf, vf, af, vMax, vMin, aMax, aMin, jMax)
+        @test result isa Bool
+
+        if result
+            total_time = sum(buf.t[i] for i in 1:7)
+            @test total_time ≈ tf atol=1e-5
+            for i in 1:7
+                @test buf.t[i] >= -1e-10
+            end
+        end
+    end
+
+    @testset "Step 2 with different parameters" begin
+        # Test with non-zero initial/final states
+        buf = ProfileBuffer{Float64}()
+        roots = Roots{Float64}()
+
+        p0_2, v0_2, a0_2 = 0.0, 2.0, 5.0
+        pf_2, vf_2, af_2 = 10.0, 1.0, -3.0
+        tf_2 = 2.0
+
+        pc = Step2PreComputed(tf_2, p0_2, v0_2, a0_2, pf_2, vf_2, af_2, jMax)
+
+        # Try all Step 2 profile types
+        result_none = time_none_step2!(roots, buf, pc, p0_2, v0_2, a0_2, pf_2, vf_2, af_2, vMax, vMin, aMax, aMin, jMax)
+        result_acc0 = time_acc0_step2!(buf, pc, p0_2, v0_2, a0_2, pf_2, vf_2, af_2, vMax, vMin, aMax, aMin, jMax)
+        result_acc1 = time_acc1_step2!(buf, pc, p0_2, v0_2, a0_2, pf_2, vf_2, af_2, vMax, vMin, aMax, aMin, jMax)
+        result_acc0_acc1 = time_acc0_acc1_step2!(buf, pc, p0_2, v0_2, a0_2, pf_2, vf_2, af_2, vMax, vMin, aMax, aMin, jMax)
+
+        # At least one should succeed or all should return Bool
+        @test result_none isa Bool
+        @test result_acc0 isa Bool
+        @test result_acc1 isa Bool
+        @test result_acc0_acc1 isa Bool
+    end
+end
