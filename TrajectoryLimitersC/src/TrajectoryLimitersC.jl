@@ -1,7 +1,7 @@
 module TrajectoryLimitersC
 
 using TrajectoryLimiters
-using TrajectoryLimiters: State, trajlim
+using TrajectoryLimiters: State, trajlim, RuckigProfile
 
 # Global storage to prevent GC of Julia objects accessed via opaque pointers
 const OBJECT_STORE = Dict{UInt, Any}()
@@ -128,7 +128,7 @@ end
 Get the total duration of a trajectory profile.
 """
 Base.@ccallable function profile_duration(handle::Ptr{Cvoid})::Cdouble
-    profile = get_object(handle)
+    profile = get_object(handle)::RuckigProfile{Float64}
     return duration(profile)
 end
 
@@ -141,7 +141,7 @@ Arguments:
 - result_ptr: Pointer to array of 4 doubles to store [p, v, a, j]
 """
 Base.@ccallable function profile_evaluate(handle::Ptr{Cvoid}, t::Cdouble, result_ptr::Ptr{Cdouble})::Cvoid
-    profile = get_object(handle)
+    profile = get_object(handle)::RuckigProfile{Float64}
     p, v, a, j = profile(t)
 
     result_arr = unsafe_wrap(Array, result_ptr, 4)

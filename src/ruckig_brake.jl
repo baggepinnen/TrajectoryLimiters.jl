@@ -50,6 +50,9 @@ function BrakeProfile{T}() where T
     BrakeProfile{T}(z, (z, z), (z, z), (z, z), (z, z), (z, z))
 end
 
+# Copy function for JuliaC compatibility (avoids type-unstable deepcopy)
+Base.copy(b::BrakeProfile{T}) where T = BrakeProfile{T}(b.duration, b.t, b.j, b.a, b.v, b.p)
+
 #=============================================================================
  Brake Computation Functions
 =============================================================================#

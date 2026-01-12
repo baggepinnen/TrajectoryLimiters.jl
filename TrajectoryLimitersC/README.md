@@ -81,8 +81,7 @@ juliac --output-lib trajlim --trim=safe --compile-ccallable .
 ```
 
 This creates:
-- `build/lib/libtrajlim.so` (Linux) or `build/lib/libtrajlim.dylib` (macOS)
-- Bundled Julia runtime in `build/`
+- `trajlim.so` (Linux) or `trajlim.dylib` (macOS) in the current directory
 
 ## Building the C Example
 
@@ -92,16 +91,16 @@ After building the shared library:
 
 ```bash
 gcc -o example/caller example/caller.c \
-    -L./build/lib -ltrajlim \
-    -Wl,-rpath,'$ORIGIN/../build/lib'
+    -L. -l:trajlim.so \
+    -Wl,-rpath,'$ORIGIN/..'
 ```
 
 ### macOS
 
 ```bash
 clang -o example/caller example/caller.c \
-    -L./build/lib -ltrajlim \
-    -Wl,-rpath,@executable_path/../build/lib
+    -L. -ltrajlim \
+    -Wl,-rpath,@executable_path/..
 ```
 
 ## Running the Example
