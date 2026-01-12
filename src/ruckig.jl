@@ -2225,7 +2225,7 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
     brake_duration = brake.duration
 
     # Create a copy of the brake profile to store in the result (if braking occurred)
-    brake_copy = brake_duration > 0 ? deepcopy(brake) : nothing
+    brake_copy = brake_duration > 0 ? copy(brake) : nothing
 
     # Use post-brake state as effective initial state
     p0_eff, v0_eff, a0_eff = ps, vs, as
@@ -2248,7 +2248,12 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
         if time_all_single_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
             return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
         end
-        error("No valid trajectory found for zero-limits case from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
+        # Build error message with explicit concatenation to avoid vararg type instability (JuliaC compatibility)
+        msg = "No valid trajectory found for zero-limits case from (" * string(p0) * ", " * string(v0) * ", " * string(a0) *
+              ") to (" * string(pf) * ", " * string(vf) * ", " * string(af) *
+              "), limiter: vmax=" * string(lim.vmax) * ", vmin=" * string(lim.vmin) *
+              ", amax=" * string(lim.amax) * ", amin=" * string(lim.amin) * ", jmax=" * string(lim.jmax)
+        error(msg)
     end
 
     # Reference implementation behavior:
@@ -2291,7 +2296,8 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
         # This matches C++ behavior when vf != 0 || af != 0
         # IMPORTANT: C++ uses original limits here, NOT pd-swapped limits
         # See position_third_step1.cpp lines 558-563
-        best_duration = Ref(T(Inf))
+        # Note: Using Ref types to avoid Core.Box type instability in closure (required for JuliaC)
+        best_duration = Ref{T}(T(Inf))
         best_profile = Ref{Union{Nothing, RuckigProfile{T}}}(nothing)
 
         # Helper to check if current buffer has a shorter profile
@@ -2377,7 +2383,12 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
         return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
     end
 
-    error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
+    # Build error message with explicit concatenation to avoid vararg type instability (JuliaC compatibility)
+    msg = "No valid trajectory found from (" * string(p0) * ", " * string(v0) * ", " * string(a0) *
+          ") to (" * string(pf) * ", " * string(vf) * ", " * string(af) *
+          "), limiter: vmax=" * string(lim.vmax) * ", vmin=" * string(lim.vmin) *
+          ", amax=" * string(lim.amax) * ", amin=" * string(lim.amin) * ", jmax=" * string(lim.jmax)
+    error(msg)
 
 end
 
@@ -2430,7 +2441,12 @@ function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0
         if time_all_single_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
             return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
         end
-        error("No valid trajectory found for zero-limits case from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
+        # Build error message with explicit concatenation to avoid vararg type instability (JuliaC compatibility)
+        msg = "No valid trajectory found for zero-limits case from (" * string(p0) * ", " * string(v0) * ", " * string(a0) *
+              ") to (" * string(pf) * ", " * string(vf) * ", " * string(af) *
+              "), limiter: vmax=" * string(lim.vmax) * ", vmin=" * string(lim.vmin) *
+              ", amax=" * string(lim.amax) * ", amin=" * string(lim.amin) * ", jmax=" * string(lim.jmax)
+        error(msg)
     end
 
     # Reference implementation behavior (position_third_step1.cpp lines 531-585):
@@ -2543,7 +2559,12 @@ function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0
         return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
     end
 
-    error("No valid trajectory found from ($p0, $v0, $a0) to ($pf, $vf, $af), limiter: ", lim)
+    # Build error message with explicit concatenation to avoid vararg type instability (JuliaC compatibility)
+    msg = "No valid trajectory found from (" * string(p0) * ", " * string(v0) * ", " * string(a0) *
+          ") to (" * string(pf) * ", " * string(vf) * ", " * string(af) *
+          "), limiter: vmax=" * string(lim.vmax) * ", vmin=" * string(lim.vmin) *
+          ", amax=" * string(lim.amax) * ", amin=" * string(lim.amin) * ", jmax=" * string(lim.jmax)
+    error(msg)
 end
 
 #=============================================================================
