@@ -42,6 +42,13 @@ X2, Ẋ2, Ẍ2 = limiter(X, Ẋ, Ẍ, R)
     include("test_ruckig.jl")
 end
 
+# JET tests must be run LAST - loading JET.jl may interfere with other tests
+# due to its extensive use of Julia's compiler internals
+@testset "JET static analysis" begin
+    @info "Testing with JET.jl (static analysis)"
+    include("test_jet.jl")
+end
+
 end
 
 

@@ -242,12 +242,19 @@ profile2 = calculate_velocity_trajectory(lim; v0=2.0, a0=10.0, vf=8.0, af=0.0)
 profile3 = calculate_velocity_trajectory(lim; vf=5.0, tf=0.5)
 ```
 
-The `AccelerationLimiter` (second-order, no jerk limit) also supports velocity control:
+The `AccelerationLimiter` (second-order, no jerk limit) and `VelocityLimiter` (first-order, velocity limit only) also support velocity control:
 
 ```julia
+# AccelerationLimiter: acceleration-limited trajectories (no jerk constraint)
 lim2 = AccelerationLimiter(; vmax=100.0, amax=50.0)
 profile = calculate_velocity_trajectory(lim2; vf=10.0)
+
+# VelocityLimiter: velocity-limited trajectories (constant velocity, instantaneous changes)
+lim3 = VelocityLimiter(; vmax=10.0)
+profile = calculate_trajectory(lim3; pf=100.0)  # Travels at vmax=10 for 10 seconds
 ```
+
+The `VelocityLimiter` is useful for simple motion planning where acceleration constraints are not important, or as a baseline for comparison.
 
 ### Asymmetric Limits
 
