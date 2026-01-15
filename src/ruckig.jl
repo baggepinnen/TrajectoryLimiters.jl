@@ -165,6 +165,7 @@ duration(p::RuckigProfile) = p.brake_duration + p.t_sum[end]
 main_duration(p::RuckigProfile) = p.t_sum[end]
 
 (profile::RuckigProfile)(t) = evaluate_at(profile, t)
+(profiles::Vector{<:RuckigProfile})(t) = evaluate_at(profiles, t)
 
 #=============================================================================
  Block: Stores profile and blocked time intervals for synchronization
@@ -4573,17 +4574,8 @@ function evaluate_at(profiles::AbstractVector{<:RuckigProfile{T}}, t::Real) wher
     return ps, vs, as, js
 end
 
-"""
-    evaluate_dt(profiles::AbstractVector{<:RuckigProfile}, Ts)
-
-Evaluate all DOF profiles at regular time intervals.
-Returns matrices (pos, vel, acc, jerk) where each column is a DOF,
-plus the time vector ts.
-"""
-function evaluate_dt(profiles::AbstractVector{<:RuckigProfile{T}}, Ts) where T
+function evaluate_at(profiles::AbstractVector{<:RuckigProfile{T}}, ts::AbstractVector) where T
     ndof = length(profiles)
-    Tf = duration(profiles[1])  # All profiles have same duration (synchronized)
-    ts = 0:Ts:Tf
     n = length(ts)
 
     pos = Matrix{T}(undef, n, ndof)
@@ -4598,6 +4590,19 @@ function evaluate_dt(profiles::AbstractVector{<:RuckigProfile{T}}, Ts) where T
     end
 
     return pos, vel, acc, jerk, ts
+end
+
+"""
+    evaluate_dt(profiles::AbstractVector{<:RuckigProfile}, Ts)
+
+Evaluate all DOF profiles at regular time intervals.
+Returns matrices (pos, vel, acc, jerk) where each column is a DOF,
+plus the time vector ts.
+"""
+function evaluate_dt(profiles::AbstractVector{<:RuckigProfile{T}}, Ts) where T
+    Tf = duration(profiles[1])  # All profiles have same duration (synchronized)
+    ts = 0:Ts:Tf
+    return evaluate_at(profiles, ts)
 end
 
 # Include velocity control interface
