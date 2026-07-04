@@ -4654,6 +4654,26 @@ function try_phase_synchronization!(profiles::Vector{RuckigProfile{Float64}},
 end
 
 """
+    is_trivially_phase_synchronized(ndof, p0, v0, a0, pf, vf, af) -> Bool
+
+Single-DOF trajectories and all-zero-motion inputs are straight lines by
+construction: the copy-scale attempt declines them (they have no scale
+direction), but `:phase_strict` must not error on them. C++ likewise treats
+these cases as unproblematic (they never reach the phase block).
+"""
+function is_trivially_phase_synchronized(ndof, p0, v0, a0, pf, vf, af)
+    ndof == 1 && return true
+    for i in 1:ndof
+        if abs(pf[i] - p0[i]) > COLLINEARITY_EPS || abs(v0[i]) > COLLINEARITY_EPS ||
+           abs(a0[i]) > COLLINEARITY_EPS || abs(vf[i]) > COLLINEARITY_EPS ||
+           abs(af[i]) > COLLINEARITY_EPS
+            return false
+        end
+    end
+    return true
+end
+
+"""
     is_phase_synchronized(profiles::AbstractVector{<:RuckigProfile}; rtol=1e-9) -> Bool
 
 Check whether a multi-DOF trajectory returned by [`calculate_trajectory`](@ref)
@@ -4718,7 +4738,8 @@ possible (non-colinear input, a braking DOF, or a scaled profile violating
 some DOF's limits, which can happen when different DOFs are constrained by
 different limits), `:phase` silently falls back to time synchronization;
 detect this with [`is_phase_synchronized`](@ref). `:phase_strict` errors
-instead of falling back.
+instead of falling back, except for trivially straight results (a single DOF,
+or an all-zero-motion input) which never error.
 
 # Returns
 Vector of RuckigProfile, one per DOF, all with the same duration.
@@ -4816,7 +4837,8 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
         if try_phase_synchronization!(profiles, lims, blocks, limiting_dof,
                                       limiting_source, p0, v0, a0, pf, vf, af)
             return profiles
-        elseif synchronization === :phase_strict
+        elseif synchronization === :phase_strict &&
+               !is_trivially_phase_synchronized(ndof, p0, v0, a0, pf, vf, af)
             error("Phase synchronization not possible: the input is not colinear, " *
                   "a DOF requires a brake pre-trajectory, or no straight-line " *
                   "profile satisfies the per-DOF limits")

@@ -41,7 +41,9 @@ same_timing(a, b) = a.t == b.t && a.t_sum == b.t_sum && a.j == b.j &&
         @test max_line_deviation(pp, zeros(3), pf) < 1e-9
         @test max_line_deviation(pt, zeros(3), pf) > 1e-3  # time sync is curved here
 
-        # Targets reached and per-DOF limits respected
+        # Targets reached and per-DOF limits respected (violations aggregated
+        # to keep the failure output readable)
+        violations = 0
         for (i, p) in enumerate(pp)
             st = evaluate_at(p, duration(p))
             @test st.p ≈ pf[i] atol = 1e-6
@@ -49,11 +51,13 @@ same_timing(a, b) = a.t == b.t && a.t_sum == b.t_sum && a.j == b.j &&
             @test abs(st.a) < 1e-6
             for t in range(0, duration(p), length = 500)
                 s = evaluate_at(p, t)
-                @test -1.0 - 1e-9 <= s.v <= 1.0 + 1e-9
-                @test -2.0 - 1e-9 <= s.a <= 2.0 + 1e-9
-                @test abs(s.j) <= 20.0 + 1e-9
+                ok = (-1.0 - 1e-9 <= s.v <= 1.0 + 1e-9) &&
+                     (-2.0 - 1e-9 <= s.a <= 2.0 + 1e-9) &&
+                     (abs(s.j) <= 20.0 + 1e-9)
+                ok || (violations += 1)
             end
         end
+        @test violations == 0
 
         # phase_strict succeeds for a colinear input
         ps = calculate_trajectory(lims; pf, synchronization = :phase_strict)
@@ -117,14 +121,17 @@ same_timing(a, b) = a.t == b.t && a.t_sum == b.t_sum && a.j == b.j &&
         pp = calculate_trajectory(lims; pf, synchronization = :phase)
         @test is_phase_synchronized(pp)
         @test max_line_deviation(pp, zeros(2), pf) < 1e-9
+        violations = 0
         for (i, p) in enumerate(pp)
             @test evaluate_at(p, duration(p)).p ≈ pf[i] atol = 1e-6
             for t in range(0, duration(p), length = 500)
                 s = evaluate_at(p, t)
-                @test -0.6 - 1e-9 <= s.v <= 1.0 + 1e-9
-                @test -3.0 - 1e-9 <= s.a <= 2.0 + 1e-9
+                ok = (-0.6 - 1e-9 <= s.v <= 1.0 + 1e-9) &&
+                     (-3.0 - 1e-9 <= s.a <= 2.0 + 1e-9)
+                ok || (violations += 1)
             end
         end
+        @test violations == 0
     end
 
     @testset "zero-travel DOF" begin
@@ -133,9 +140,7 @@ same_timing(a, b) = a.t == b.t && a.t_sum == b.t_sum && a.j == b.j &&
 
         pp = calculate_trajectory(lims; pf, synchronization = :phase)
         @test is_phase_synchronized(pp)
-        for t in range(0, duration(pp[2]), length = 200)
-            @test abs(evaluate_at(pp[2], t).p) < 1e-12
-        end
+        @test maximum(abs(evaluate_at(pp[2], t).p) for t in range(0, duration(pp[2]), length = 200)) < 1e-12
 
         # A moving zero-travel DOF is not colinear: falls back
         pnc = calculate_trajectory(lims; pf, v0 = [0.0, 0.3, 0.0], synchronization = :phase)
@@ -162,6 +167,17 @@ same_timing(a, b) = a.t == b.t && a.t_sum == b.t_sum && a.j == b.j &&
         @test duration(pp[1]) == duration(ps)
         @test pp[1].t == ps.t
         @test is_phase_synchronized(pp)
+    end
+
+    @testset "trivially straight inputs never error under :phase_strict" begin
+        lim = JerkLimiter(vmax = 1.0, amax = 2.0, jmax = 20.0)
+        # Single DOF
+        p1 = calculate_trajectory([lim]; pf = [1.0], synchronization = :phase_strict)
+        @test is_phase_synchronized(p1)
+        # All-zero motion
+        p0m = calculate_trajectory([lim, lim]; pf = [0.0, 0.0], synchronization = :phase_strict)
+        @test is_phase_synchronized(p0m)
+        @test duration(p0m[1]) == 0.0
     end
 
     @testset "argument validation" begin

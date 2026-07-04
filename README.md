@@ -339,13 +339,14 @@ plot(post[:, 1], post[:, 2], label=":time (curved)")
 plot!(posp[:, 1], posp[:, 2], label=":phase (straight)", xlabel="q₁", ylabel="q₂")
 ```
 
-Phase synchronization requires the boundary states of all DOFs to be *colinear*: the vectors `pf - p0`, `v0`, `a0`, `vf`, `af` must all be proportional to a common direction (rest-to-rest motion is always colinear). When phase synchronization is not possible — non-colinear input, a DOF requiring a brake pre-trajectory, or the scaled straight-line profile violating some DOF's limits (which can happen when different DOFs are constrained by different limits, e.g. one velocity-bound and another jerk-bound) — `:phase` silently falls back to time synchronization, exactly like C++ ruckig. Use `is_phase_synchronized(profiles)` to detect the fallback, or `synchronization = :phase_strict` to error instead.
+Phase synchronization requires the boundary states of all DOFs to be *colinear*: the vectors `pf - p0`, `v0`, `a0`, `vf`, `af` must all be proportional to a common direction (rest-to-rest motion is always colinear). When phase synchronization is not possible — non-colinear input, or the scaled straight-line profile violating some DOF's limits (which can happen when different DOFs are constrained by different limits, e.g. one velocity-bound and another jerk-bound) — `:phase` silently falls back to time synchronization, matching C++ ruckig. In addition, inputs that require a brake pre-trajectory always fall back to time synchronization; this is a deliberate deviation from C++, whose behavior in that case is ill-defined (see below). Use `is_phase_synchronized(profiles)` to detect the fallback, or `synchronization = :phase_strict` to error instead.
 
 ### Differences from C++ ruckig
 
 The port covers the offline trajectory-generation part of [ruckig](https://github.com/pantor/ruckig) (community version): the third-order position and velocity interfaces, time and phase synchronization, brake pre-trajectories, asymmetric limits, and the second-order (`AccelerationLimiter`) and first-order (`VelocityLimiter`) reductions. Deliberate differences and omissions:
 
 - `evaluate_at` holds the final state constant for `t ≥ duration` where C++ extrapolates with constant acceleration; holding is what reference generation typically wants.
+- Phase synchronization falls back to time synchronization whenever a DOF requires a brake pre-trajectory. C++ attempts phase synchronization in that case, copying main-profile durations across DOFs whose brake durations differ, which can desynchronize the total durations.
 - Not ported: the online `update()` control loop, `minimum_duration`, discrete duration (`DurationDiscretization`), per-DOF synchronization/control-interface/enabled flags, multi-DOF synchronization for the velocity interface, and ruckig's intermediate-waypoint engine (the waypoint support here plans segment-wise and is not globally time-optimal).
 
 ### Multi-DOF Waypoint Trajectories
