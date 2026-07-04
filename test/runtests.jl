@@ -47,6 +47,11 @@ end
     include("test_regression.jl")
 end
 
+@testset "phase synchronization" begin
+    @info "Testing phase synchronization"
+    include("test_phase_sync.jl")
+end
+
 @testset "properties" begin
     @info "Testing randomized properties"
     include("test_properties.jl")
