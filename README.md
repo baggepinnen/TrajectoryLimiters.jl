@@ -320,6 +320,34 @@ hline!([1000 500 800], sp=4, ls=:dash, label="", c=(1:3)')
 
 The image shows how different parts of the trajectory is limited by different degrees of freedom, all three DOF start and reach the end at the same time.
 
+### Phase Synchronization (Straight-Line Trajectories)
+
+Time synchronization makes all DOFs reach their targets at the same instant, but the velocity ratios between DOFs vary along the way, so the path traced in the output space is in general curved. With `synchronization = :phase` (the `Synchronization::Phase` mode of C++ ruckig), the DOFs are phase-synchronized when possible: the velocity direction is kept constant so that the path is an exact straight line from the start point to the target point, at the same (time-optimal) duration as time synchronization.
+
+```julia
+using TrajectoryLimiters, Plots
+
+lims = [JerkLimiter(; vmax=1.0, amax=2.0, jmax=20.0) for _ in 1:2]
+pf = [1.0, 2.0]
+
+profiles_time  = calculate_trajectory(lims; pf)                          # curved path
+profiles_phase = calculate_trajectory(lims; pf, synchronization=:phase) # straight line
+
+post, = evaluate_dt(profiles_time, 0.001)
+posp, = evaluate_dt(profiles_phase, 0.001)
+plot(post[:, 1], post[:, 2], label=":time (curved)")
+plot!(posp[:, 1], posp[:, 2], label=":phase (straight)", xlabel="q₁", ylabel="q₂")
+```
+
+Phase synchronization requires the boundary states of all DOFs to be *colinear*: the vectors `pf - p0`, `v0`, `a0`, `vf`, `af` must all be proportional to a common direction (rest-to-rest motion is always colinear). When phase synchronization is not possible — non-colinear input, a DOF requiring a brake pre-trajectory, or the scaled straight-line profile violating some DOF's limits (which can happen when different DOFs are constrained by different limits, e.g. one velocity-bound and another jerk-bound) — `:phase` silently falls back to time synchronization, exactly like C++ ruckig. Use `is_phase_synchronized(profiles)` to detect the fallback, or `synchronization = :phase_strict` to error instead.
+
+### Differences from C++ ruckig
+
+The port covers the offline trajectory-generation part of [ruckig](https://github.com/pantor/ruckig) (community version): the third-order position and velocity interfaces, time and phase synchronization, brake pre-trajectories, asymmetric limits, and the second-order (`AccelerationLimiter`) and first-order (`VelocityLimiter`) reductions. Deliberate differences and omissions:
+
+- `evaluate_at` holds the final state constant for `t ≥ duration` where C++ extrapolates with constant acceleration; holding is what reference generation typically wants.
+- Not ported: the online `update()` control loop, `minimum_duration`, discrete duration (`DurationDiscretization`), per-DOF synchronization/control-interface/enabled flags, multi-DOF synchronization for the velocity interface, and ruckig's intermediate-waypoint engine (the waypoint support here plans segment-wise and is not globally time-optimal).
+
 ### Multi-DOF Waypoint Trajectories
 
 For multi-DOF systems that need to pass through multiple waypoints, use `calculate_waypoint_trajectory` with an array of limiters. Each waypoint specifies arrays for position (and optionally velocity/acceleration) for all DOFs:

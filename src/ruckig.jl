@@ -4474,13 +4474,219 @@ end
 export PositionBound, get_position_extrema, get_first_state_at_position
 
 #=============================================================================
+ Phase Synchronization
+
+ Port of the Synchronization::Phase mode of the C++ reference
+ (calculator_target.hpp): when the boundary states of all DOFs are colinear,
+ the limiting DOF's phase durations are copied to the other DOFs with the
+ jerk scaled by each DOF's direction ratio, producing a straight-line path
+ in the output space at the time-synchronized duration.
+=============================================================================#
+
+# C++ TargetCalculator::eps (std::numeric_limits<double>::epsilon())
+const COLLINEARITY_EPS = 2.220446049250313e-16
+
+# Type-stable dispatch on which vector serves as the scale vector
+@inline _scale_entry(code::Int, pd, v0, a0, vf, af, i) =
+    code == 1 ? pd[i] : code == 2 ? v0[i] : code == 3 ? a0[i] : code == 4 ? vf[i] : af[i]
+
+"""
+    is_input_collinear!(new_phase_control, pd, v0, a0, vf, af, limiting_direction, limiting_dof, jmax_limiting) -> Bool
+
+Check whether the vectors `pd = pf - p0`, `v0`, `a0`, `vf`, `af` are colinear
+across the DOFs (all proportional to a common scale vector), the precondition
+for phase synchronization. On success fills `new_phase_control[dof]` with the
+signed peak jerk for each DOF: the limiting DOF's jerk scaled by the DOF's
+direction ratio. Port of C++ `TargetCalculator::is_input_collinear`.
+"""
+function is_input_collinear!(new_phase_control::Vector{Float64}, pd::Vector{Float64},
+                             v0, a0, vf, af, limiting_direction::Direction,
+                             limiting_dof::Int, jmax_limiting::Float64)
+    ndof = length(pd)
+    isinf(jmax_limiting) && return false
+
+    # Select the scale vector: the first DOF with a non-trivial component,
+    # tried in the order pd, v0, a0, vf, af (DOF-major, matching C++)
+    scale_code = 0
+    scale_dof = 0
+    for dof in 1:ndof
+        if abs(pd[dof]) > COLLINEARITY_EPS
+            scale_code = 1; scale_dof = dof; break
+        elseif abs(v0[dof]) > COLLINEARITY_EPS
+            scale_code = 2; scale_dof = dof; break
+        elseif abs(a0[dof]) > COLLINEARITY_EPS
+            scale_code = 3; scale_dof = dof; break
+        elseif abs(vf[dof]) > COLLINEARITY_EPS
+            scale_code = 4; scale_dof = dof; break
+        elseif abs(af[dof]) > COLLINEARITY_EPS
+            scale_code = 5; scale_dof = dof; break
+        end
+    end
+    # All-zero input is in theory colinear, but that trivial case is handled by
+    # the time-synchronization path (matching the C++ comment)
+    scale_dof == 0 && return false
+
+    scale = _scale_entry(scale_code, pd, v0, a0, vf, af, scale_dof)
+    pd_scale = pd[scale_dof] / scale
+    v0_scale = v0[scale_dof] / scale
+    a0_scale = a0[scale_dof] / scale
+    vf_scale = vf[scale_dof] / scale
+    af_scale = af[scale_dof] / scale
+
+    scale_limiting = _scale_entry(scale_code, pd, v0, a0, vf, af, limiting_dof)
+    control_limiting = limiting_direction == DIR_UP ? jmax_limiting : -jmax_limiting
+
+    for dof in 1:ndof
+        current_scale = _scale_entry(scale_code, pd, v0, a0, vf, af, dof)
+        if abs(pd[dof] - pd_scale * current_scale) > COLLINEARITY_EPS ||
+           abs(v0[dof] - v0_scale * current_scale) > COLLINEARITY_EPS ||
+           abs(a0[dof] - a0_scale * current_scale) > COLLINEARITY_EPS ||
+           abs(vf[dof] - vf_scale * current_scale) > COLLINEARITY_EPS ||
+           abs(af[dof] - af_scale * current_scale) > COLLINEARITY_EPS
+            return false
+        end
+        # A zero scale_limiting yields Inf here, which the jerk-magnitude guard
+        # in the copy-scale attempt rejects (same outcome as C++)
+        new_phase_control[dof] = control_limiting * current_scale / scale_limiting
+    end
+
+    return true
+end
+
+"""
+    try_phase_sync_copy_scale!(profiles, lims, blocks, p_limiting, limiting_dof, new_phase_control, pf, vf, af) -> Bool
+
+Derive the non-limiting DOFs' profiles by copying the limiting DOF's phase
+durations and control signs with the jerk scaled per DOF, validating each
+against its own limits with `check!` (`LIMIT_NONE`, no plateau assertions).
+Returns false as soon as any DOF's scaled profile is invalid, in which case
+the caller falls back to time synchronization. Port of the Phase
+Synchronization block of C++ `TargetCalculator::calculate`.
+"""
+function try_phase_sync_copy_scale!(profiles::Vector{RuckigProfile{Float64}},
+                                    lims, blocks::Vector{Block{Float64}},
+                                    p_limiting::RuckigProfile{Float64}, limiting_dof::Int,
+                                    new_phase_control::Vector{Float64}, pf, vf, af)
+    ndof = length(lims)
+    for dof in 1:ndof
+        dof == limiting_dof && continue
+
+        lim = lims[dof]
+        jf = new_phase_control[dof]
+        # The jerk-magnitude clause of C++ check_with_timing
+        abs(jf) < lim.jmax + EPS || return false
+
+        pm = blocks[dof].p_min
+        buf = lim.buffer
+        clear!(buf)
+        @inbounds for i in 1:7
+            buf.t[i] = p_limiting.t[i]
+        end
+
+        # Post-brake initial state from the step-1 profile. With the any-brake
+        # guard in try_phase_synchronization! it equals the raw input today, but
+        # reading it from the block keeps this correct if that guard is relaxed
+        ok = check!(buf, p_limiting.control_signs, LIMIT_NONE, jf,
+                    lim.vmax, lim.vmin, lim.amax, lim.amin,
+                    pm.p[1], pm.v[1], pm.a[1], pf[dof], vf[dof], af[dof])
+        ok || return false
+
+        # After the check call, to set the correct limits (C++ comment)
+        buf.limits = p_limiting.limits
+        profiles[dof] = RuckigProfile(buf, pf[dof], vf[dof], af[dof])
+    end
+
+    profiles[limiting_dof] = p_limiting
+    return true
+end
+
+"""
+    try_phase_synchronization!(profiles, lims, blocks, limiting_dof, limiting_source, p0, v0, a0, pf, vf, af) -> Bool
+
+Attempt phase synchronization for a multi-DOF trajectory after time
+synchronization has determined the limiting DOF. On success, fills `profiles`
+and returns true; on failure (non-colinear input, a braking DOF, or a scaled
+profile violating some DOF's limits) returns false and the caller proceeds
+with time synchronization.
+"""
+function try_phase_synchronization!(profiles::Vector{RuckigProfile{Float64}},
+                                    lims, blocks::Vector{Block{Float64}},
+                                    limiting_dof::Int, limiting_source::Int,
+                                    p0, v0, a0, pf, vf, af)
+    ndof = length(lims)
+    ndof == 1 && return false
+    limiting_dof == 0 && return false
+
+    # C++ behavior with brake pre-trajectories is ill-defined here (it copies
+    # main-profile durations across DOFs whose brake durations differ), so fall
+    # back to time synchronization whenever any DOF brakes
+    for i in 1:ndof
+        blocks[i].p_min.brake_duration > 0 && return false
+    end
+
+    bl = blocks[limiting_dof]
+    p_limiting = if limiting_source == 1 && bl.a !== nothing
+        bl.a.profile
+    elseif limiting_source == 2 && bl.b !== nothing
+        bl.b.profile
+    else
+        bl.p_min
+    end
+
+    pd = Vector{Float64}(undef, ndof)
+    @inbounds for i in 1:ndof
+        pd[i] = pf[i] - p0[i]
+    end
+    new_phase_control = Vector{Float64}(undef, ndof)
+
+    is_input_collinear!(new_phase_control, pd, v0, a0, vf, af,
+                        p_limiting.direction, limiting_dof,
+                        Float64(lims[limiting_dof].jmax)) || return false
+
+    return try_phase_sync_copy_scale!(profiles, lims, blocks, p_limiting,
+                                      limiting_dof, new_phase_control, pf, vf, af)
+end
+
+"""
+    is_phase_synchronized(profiles::AbstractVector{<:RuckigProfile}; rtol=1e-9) -> Bool
+
+Check whether a multi-DOF trajectory returned by [`calculate_trajectory`](@ref)
+is phase-synchronized: all DOFs share identical phase durations, brake duration
+and control signs, and their jerk patterns are pairwise proportional, so the
+path traced in the output space is a straight line. Use this to detect whether
+`synchronization = :phase` succeeded or silently fell back to time
+synchronization.
+"""
+function is_phase_synchronized(profiles::AbstractVector{<:RuckigProfile}; rtol=1e-9)
+    length(profiles) <= 1 && return true
+    ref = profiles[1]
+    for k in 2:length(profiles)
+        p = profiles[k]
+        p.t == ref.t || return false
+        p.t_sum == ref.t_sum || return false
+        p.brake_duration == ref.brake_duration || return false
+        p.control_signs == ref.control_signs || return false
+
+        # Proportional jerk patterns: all pairwise cross products vanish
+        jscale = max(maximum(abs, ref.j), maximum(abs, p.j))
+        tol = rtol * jscale^2
+        for i in 1:7, m in (i+1):7
+            abs(p.j[i] * ref.j[m] - p.j[m] * ref.j[i]) <= tol || return false
+        end
+    end
+    return true
+end
+
+export is_phase_synchronized
+
+#=============================================================================
  Multi-DOF Trajectory Calculation
 =============================================================================#
 
 """
-    calculate_trajectory(lims::AbstractVector{<:JerkLimiter}; pf, p0, v0, a0, vf, af)
+    calculate_trajectory(lims::AbstractVector{<:JerkLimiter}; pf, p0, v0, a0, vf, af, synchronization = :time)
 
-Calculate time-synchronized trajectories for multiple degrees of freedom.
+Calculate synchronized trajectories for multiple degrees of freedom.
 All DOFs will have the same total duration.
 
 # Arguments
@@ -4491,6 +4697,22 @@ All DOFs will have the same total duration.
 - `a0`: Vector of initial accelerations (default: zeros)
 - `vf`: Vector of final velocities (default: zeros)
 - `af`: Vector of final accelerations (default: zeros)
+- `synchronization`: `:time` (default), `:phase`, or `:phase_strict`
+
+# Synchronization modes
+With `:time`, every DOF reaches its target at the same instant but the velocity
+ratios between DOFs vary along the way, so the path traced in the output space
+is in general curved. With `:phase` (the `Synchronization::Phase` mode of C++
+ruckig), when the boundary states of all DOFs are colinear — the vectors
+`pf - p0`, `v0`, `a0`, `vf`, `af` all proportional to a common direction — the
+limiting DOF's profile is copied to the other DOFs with scaled jerk, keeping
+the velocity direction constant: the path is an exact straight line and the
+duration equals the `:time` duration. When phase synchronization is not
+possible (non-colinear input, a braking DOF, or a scaled profile violating
+some DOF's limits, which can happen when different DOFs are constrained by
+different limits), `:phase` silently falls back to time synchronization;
+detect this with [`is_phase_synchronized`](@ref). `:phase_strict` errors
+instead of falling back.
 
 # Returns
 Vector of RuckigProfile, one per DOF, all with the same duration.
@@ -4502,8 +4724,11 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
     a0::AbstractVector = zeros(T, length(lims)),
     vf::AbstractVector = zeros(T, length(lims)),
     af::AbstractVector = zeros(T, length(lims)),
+    synchronization::Symbol = :time,
 ) where T
     ndof = length(lims)
+    (synchronization === :time || synchronization === :phase || synchronization === :phase_strict) ||
+        throw(ArgumentError("synchronization must be :time, :phase, or :phase_strict, got :" * string(synchronization)))
     length(pf) == ndof || throw(ArgumentError("pf must have length $ndof"))
     length(p0) == ndof || throw(ArgumentError("p0 must have length $ndof"))
     length(v0) == ndof || throw(ArgumentError("v0 must have length $ndof"))
@@ -4577,9 +4802,22 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
         error("Failed to find valid synchronization time. Blocks: ", blocks)
     end
 
-    # Step 2: Recalculate non-limiting DOFs for synchronized duration
     profiles = Vector{RuckigProfile{Float64}}(undef, ndof)
 
+    # Phase synchronization: derive all profiles from the limiting DOF when the
+    # input is colinear; fall back to time synchronization otherwise
+    if synchronization !== :time
+        if try_phase_synchronization!(profiles, lims, blocks, limiting_dof,
+                                      limiting_source, p0, v0, a0, pf, vf, af)
+            return profiles
+        elseif synchronization === :phase_strict
+            error("Phase synchronization not possible: the input is not colinear, " *
+                  "a DOF requires a brake pre-trajectory, or no straight-line " *
+                  "profile satisfies the per-DOF limits")
+        end
+    end
+
+    # Step 2: Recalculate non-limiting DOFs for synchronized duration
     for i in 1:ndof
         bi = blocks[i]
         # Check if this DOF can use an existing profile (from Step 1 or blocked interval).
