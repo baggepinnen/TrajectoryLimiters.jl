@@ -42,6 +42,16 @@ X2, Ẋ2, Ẍ2 = limiter(X, Ẋ, Ẍ, R)
     include("test_ruckig.jl")
 end
 
+@testset "regression" begin
+    @info "Testing regressions for C++-alignment fixes"
+    include("test_regression.jl")
+end
+
+@testset "properties" begin
+    @info "Testing randomized properties"
+    include("test_properties.jl")
+end
+
 # JET tests must be run LAST - loading JET.jl may interfere with other tests
 # due to its extensive use of Julia's compiler internals
 @testset "JET static analysis" begin

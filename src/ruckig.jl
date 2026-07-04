@@ -18,6 +18,7 @@ const V_PRECISION = 1e-8
 const A_PRECISION = 1e-10
 const T_PRECISION = 1e-12
 const NEWTON_TOL = 1e-9  # Newton refinement tolerance (C++ uses 1e-9 for profile refinement)
+const T_MAX = 1e12  # Maximum profile duration accepted by check! (C++ profile.hpp t_max)
 
 # Include brake profile implementation
 include("ruckig_brake.jl")
@@ -187,10 +188,11 @@ end
 Create a BlockInterval from two profiles.
 Automatically determines left/right based on durations (matching C++ Interval constructor).
 The profile stored is the one with the longer duration (corresponding to `right`).
+Durations include the brake duration (C++ block.hpp adds brake.duration).
 """
 function BlockInterval(profile_left::RuckigProfile{T}, profile_right::RuckigProfile{T}) where T
-    left_duration = profile_left.t_sum[end]
-    right_duration = profile_right.t_sum[end]
+    left_duration = duration(profile_left)
+    right_duration = duration(profile_right)
     if left_duration < right_duration
         BlockInterval{T}(left_duration, right_duration, profile_right)
     else
@@ -313,9 +315,8 @@ function calculate_block!(vpc::ValidProfileCollection{T}) where T
         idx_other = 3 - idx_min
 
         p_min = profiles[idx_min]
-        t_min = p_min.t_sum[end]
         interval_a = BlockInterval(profiles[idx_min], profiles[idx_other])
-        return Block{T}(p_min, t_min, interval_a, nothing)
+        return Block{T}(p_min, duration(p_min), interval_a, nothing)
     end
 
     # For 4 profiles, try to remove near-duplicates (numerical issue handling)
@@ -355,26 +356,24 @@ function calculate_block!(vpc::ValidProfileCollection{T}) where T
     end
 
     p_min = profiles[idx_min]
-    t_min = p_min.t_sum[end]
+    t_min = duration(p_min)
 
     if valid_count == 3
-        # C++ block.hpp lines 108-113
-        # C++ uses (idx_min + 1) % 3 and (idx_min + 2) % 3 with 0-based indexing
-        # For Julia 1-based: if idx_min=1, others are 2,3; if idx_min=2, others are 3,1; if idx_min=3, others are 1,2
-        idx_else_1 = mod1(idx_min, 3) == idx_min ? mod1(idx_min + 1, 3) : mod1(idx_min + 1, 3)
+        # C++ block.hpp lines 108-113: cyclic order (idx_min + k) % 3, 0-based
+        idx_else_1 = mod1(idx_min + 1, 3)
         idx_else_2 = mod1(idx_min + 2, 3)
-        # Simpler: get the two indices that aren't idx_min
-        others = filter(i -> i != idx_min, 1:3)
-        idx_else_1, idx_else_2 = others[1], others[2]
 
         interval_a = BlockInterval(profiles[idx_else_1], profiles[idx_else_2])
         return Block{T}(p_min, t_min, interval_a, nothing)
 
     elseif valid_count == 5
-        # C++ block.hpp lines 115-128
-        # Get the 4 indices that aren't idx_min, in order
-        others = filter(i -> i != idx_min, 1:5)
-        idx_else_1, idx_else_2, idx_else_3, idx_else_4 = others[1], others[2], others[3], others[4]
+        # C++ block.hpp lines 115-128: cyclic order (idx_min + k) % 5, 0-based.
+        # The order matters here: the direction-based pairing test below compares
+        # the profiles that FOLLOW the minimum cyclically, not in ascending index order
+        idx_else_1 = mod1(idx_min + 1, 5)
+        idx_else_2 = mod1(idx_min + 2, 5)
+        idx_else_3 = mod1(idx_min + 3, 5)
+        idx_else_4 = mod1(idx_min + 4, 5)
 
         # Check direction pairing (C++ line 121)
         if profiles[idx_else_1].direction == profiles[idx_else_2].direction
@@ -441,9 +440,44 @@ Base.length(r::Roots) = r.count
     return r.r4
 end
 
+@inline function Base.setindex!(r::Roots, val, i)
+    if i == 1
+        r.r1 = val
+    elseif i == 2
+        r.r2 = val
+    elseif i == 3
+        r.r3 = val
+    else
+        r.r4 = val
+    end
+    val
+end
+
+# C++ roots::Set sorts its contents when begin() is called; consumers rely on
+# ascending order (e.g. picking the first crossing time). Insertion sort over
+# at most 4 slots; isless places NaN last, where the >= 0 iterator filter skips it.
+function sort_roots!(r::Roots)
+    @inbounds for i in 2:r.count
+        v = r[i]
+        j = i - 1
+        while j >= 1 && isless(v, r[j])
+            r[j+1] = r[j]
+            j -= 1
+        end
+        r[j+1] = v
+    end
+    r
+end
+
+# Iteration yields fewer elements than length(r) when negative/NaN roots are
+# stored, so the iterator size is unknown (keeps collect/comprehensions correct)
+Base.IteratorSize(::Type{<:Roots}) = Base.SizeUnknown()
+Base.eltype(::Type{Roots{T}}) where T = T
+
 # Iterator interface for for-loop consumption
-# Matches C++ PositiveSet behavior: only iterate over non-negative roots
+# Matches C++ PositiveSet behavior: ascending order, only non-negative roots
 function Base.iterate(r::Roots)
+    sort_roots!(r)
     for i in 1:r.count
         val = r[i]
         val >= 0 && return (val, i + 1)
@@ -768,9 +802,11 @@ end
 Check and finalize a second-order profile.
 """
 function check_for_second_order!(buf::ProfileBuffer{T}, p0, v0, pf, vf, aMax, aMin, vMax, vMin, limits, control_signs) where T
-    # Set all jerks to zero (second-order profile)
+    # Check for negative times
     for i in 1:7
-        buf.j[i] = zero(T)
+        if buf.t[i] < -EPS
+            return false
+        end
     end
 
     # Compute cumulative times
@@ -779,24 +815,29 @@ function check_for_second_order!(buf::ProfileBuffer{T}, p0, v0, pf, vf, aMax, aM
         buf.t_sum[i] = buf.t_sum[i-1] + buf.t[i]
     end
 
-    # Check for negative times
-    for i in 1:7
-        if buf.t[i] < -EPS
-            return false
-        end
-    end
+    # Reject numerically absurd durations (C++ profile.hpp: t_sum.back() > t_max)
+    buf.t_sum[7] > T_MAX && return false
 
-    # Set accelerations for each phase
-    # Phase 1: accelerate at aMax
-    # Phase 2: coast (a=0)
-    # Phase 3: decelerate at aMin
-    buf.a[1] = aMax
-    buf.a[2] = aMax  # End of phase 1
-    buf.a[3] = zero(T)  # Coast
-    buf.a[4] = aMin  # Deceleration
-    for i in 5:8
-        buf.a[i] = zero(T)
+    # Zero jerk (second-order profile); per-phase constant accelerations.
+    # C++ profile.hpp check_for_second_order: the a array holds the acceleration
+    # DURING each phase (used by the integration below and by evaluate_at)
+    for i in 1:7
+        buf.j[i] = zero(T)
     end
+    buf.a[1] = buf.t[1] > 0 ? aMax : zero(T)
+    buf.a[2] = zero(T)
+    buf.a[3] = buf.t[3] > 0 ? aMin : zero(T)
+    buf.a[4] = zero(T)
+    if control_signs == UDDU
+        buf.a[5] = buf.t[5] > 0 ? aMin : zero(T)
+        buf.a[6] = zero(T)
+        buf.a[7] = buf.t[7] > 0 ? aMax : zero(T)
+    else  # UDUD
+        buf.a[5] = buf.t[5] > 0 ? aMax : zero(T)
+        buf.a[6] = zero(T)
+        buf.a[7] = buf.t[7] > 0 ? aMin : zero(T)
+    end
+    buf.a[8] = zero(T)  # Final acceleration is zero for second-order position profiles
 
     # Set initial state
     buf.p[1] = p0
@@ -804,17 +845,8 @@ function check_for_second_order!(buf::ProfileBuffer{T}, p0, v0, pf, vf, aMax, aM
 
     # Integrate through phases (second-order: v' = a, no jerk)
     for i in 1:7
-        ai = i == 1 ? aMax : (i == 3 ? aMin : zero(T))
-        if i == 2  # Coast
-            ai = zero(T)
-        elseif i == 1  # Accelerate
-            ai = aMax
-        elseif i == 3  # Decelerate
-            ai = aMin
-        end
-
-        buf.v[i+1] = buf.v[i] + buf.t[i] * ai
-        buf.p[i+1] = buf.p[i] + buf.t[i] * (buf.v[i] + buf.t[i] * ai / 2)
+        buf.v[i+1] = buf.v[i] + buf.t[i] * buf.a[i]
+        buf.p[i+1] = buf.p[i] + buf.t[i] * (buf.v[i] + buf.t[i] * buf.a[i] / 2)
     end
 
     # Check final position and velocity
@@ -863,7 +895,7 @@ function calculate_trajectory(lim::AccelerationLimiter{T}; pf, p0=zero(T), v0=ze
     get_second_order_position_brake_trajectory!(brake, v0, vmax, vmin, amax, amin)
     ps, vs, as = finalize_second_order_brake!(brake, p0, v0, zero(T))
     brake_duration = brake.duration
-    brake_copy = brake_duration > 0 ? deepcopy(brake) : nothing
+    brake_copy = brake_duration > 0 ? copy(brake) : nothing
 
     p0_eff, v0_eff = ps, vs
     pd = pf - p0_eff
@@ -988,7 +1020,9 @@ function solve_cubic_real!(roots::Roots, a, b, c, d)
         push!(roots, u + v - p/3)
     elseif disc < -EPS
         m = 2 * sqrt(-aa/3)
-        θ = acos(3bb / (aa * m)) / 3
+        # Clamp: near disc ≈ 0 the argument can drift outside [-1, 1] and acos
+        # would throw a DomainError; C++ uses an atan-based form that never fails
+        θ = acos(clamp(3bb / (aa * m), -1.0, 1.0)) / 3
         for k in 0:2
             push!(roots, m * cos(θ - 2π*k/3) - p/3)
         end
@@ -1159,13 +1193,19 @@ end
 =============================================================================#
 
 """
-    check!(buf, control_signs, limits, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af) -> Bool
+    check!(buf, control_signs, limits, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, set_limits) -> Bool
 
 Validate profile: check times >= 0, integrate, verify limits and final state.
 This matches the reference implementation's check() template function.
+
+`set_limits` corresponds to the C++ template flag of the same name: when true,
+boundary accelerations of limit-reaching profiles are snapped to the exact limit
+values (aMax/aMin). It is true only at the step-1 call sites that C++ instantiates
+with `set_limits = true` (LIMIT_ACC0_ACC1 and LIMIT_ACC1), never in step 2.
 """
 function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::ReachedLimits,
-                jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af=zero(T)) where T
+                jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af=zero(T),
+                set_limits::Bool=false) where T
 
     # Set jerk pattern based on control signs
     # Note: jerk is set after times are clamped below (C++ sets jerk based on t > 0)
@@ -1229,29 +1269,36 @@ function check!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits::Reac
         buf.p[i+1] = pi + ti * (vi + ti * (ai / 2 + ti * ji / 6))
 
         # Reference implementation (profile.hpp lines 225-246):
-        # For velocity-limited profiles, explicitly set a[4] = 0 after phase 3
-        # This is done ALWAYS for velocity profiles (not inside set_limits block)
-        if limits in (LIMIT_ACC0_ACC1_VEL, LIMIT_ACC0_VEL, LIMIT_ACC1_VEL, LIMIT_VEL) && i == 3
+        # For profiles whose acceleration returns to zero after phase 3
+        # (all velocity-limited classes and ACC0_ACC1), explicitly set a[4] = 0.
+        # This is done ALWAYS (not inside the set_limits block)
+        if limits in (LIMIT_ACC0_ACC1_VEL, LIMIT_ACC0_ACC1, LIMIT_ACC0_VEL, LIMIT_ACC1_VEL, LIMIT_VEL) && i == 3
             buf.a[4] = zero(T)
         end
 
-        # For ACC1 profiles, set a[4] = aMin (C++ uses set_limits=true for ACC1)
-        if limits == LIMIT_ACC1 && i == 3
-            buf.a[4] = aMin
-        end
+        # C++ gates these snaps behind the set_limits template flag: only the
+        # step-1 ACC1/ACC0_ACC1 call sites request them; step 2 never does,
+        # where snapping would corrupt profiles whose plateau is not at the limit
+        if set_limits
+            if limits == LIMIT_ACC1 && i == 3
+                buf.a[4] = aMin
+            end
 
-        # For ACC0_ACC1 profiles, set a[2] = aMax and a[6] = aMin
-        if limits == LIMIT_ACC0_ACC1
-            if i == 1
-                buf.a[2] = aMax
-            elseif i == 5
-                buf.a[6] = aMin
+            if limits == LIMIT_ACC0_ACC1
+                if i == 1
+                    buf.a[2] = aMax
+                elseif i == 5
+                    buf.a[6] = aMin
+                end
             end
         end
 
         cumtime += ti
         buf.t_sum[i] = cumtime
     end
+
+    # Reject numerically absurd durations (C++ profile.hpp: t_sum.back() > t_max)
+    buf.t_sum[7] > T_MAX && return false
 
     # Check final state
     abs(buf.p[8] - pf) > P_PRECISION && return false
@@ -1454,7 +1501,7 @@ If `vpc` is `nothing`, returns after finding the first valid profile (for time-o
 function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                        jMax, vMax, vMin, aMax, aMin;
                        vpc::Union{ValidProfileCollection{T}, Nothing}=nothing,
-                       brake_duration::T=zero(T), brake::Union{RuckigProfile{T}, Nothing}=nothing) where T
+                       brake_duration::T=zero(T), brake::Union{BrakeProfile{T}, Nothing}=nothing) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
     a0_a0 = a0^2
@@ -1466,8 +1513,6 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
     v0_v0 = v0^2
     vf_vf = vf^2
     pd = pf - p0
-
-    found_any = false
 
     # Strategy 1: ACC0_ACC1_VEL (reach aMax, vMax, aMin)
     begin
@@ -1488,11 +1533,10 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                                 jMax*(aMax*vf_vf - aMin*v0_v0))) / (24*aMax*aMin*jMax_jMax*vMax)
 
         if check!(buf, UDDU, LIMIT_ACC0_ACC1_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            if vpc === nothing
-                return true
-            end
-            add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
-            found_any = true
+            # C++ time_all_vel returns after the FIRST successful profile even in
+            # collection mode - the velocity family contributes at most one profile
+            vpc === nothing || add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
+            return true
         end
     end
 
@@ -1513,11 +1557,10 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
         buf.t[7] = buf.t[5] + af / jMax
 
         if check!(buf, UDDU, LIMIT_ACC1_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            if vpc === nothing
-                return true
-            end
-            add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
-            found_any = true
+            # C++ time_all_vel returns after the FIRST successful profile even in
+            # collection mode - the velocity family contributes at most one profile
+            vpc === nothing || add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
+            return true
         end
     end
 
@@ -1539,11 +1582,10 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
         buf.t[7] = t_acc1 + af/jMax
 
         if check!(buf, UDDU, LIMIT_ACC0_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            if vpc === nothing
-                return true
-            end
-            add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
-            found_any = true
+            # C++ time_all_vel returns after the FIRST successful profile even in
+            # collection mode - the velocity family contributes at most one profile
+            vpc === nothing || add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
+            return true
         end
     end
 
@@ -1564,15 +1606,14 @@ function time_all_vel!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                        (v0/vMax + 1.0)*t_acc0 - (vf/vMax + 1.0)*t_acc1 + pd/vMax
 
         if check!(buf, UDDU, LIMIT_VEL, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            if vpc === nothing
-                return true
-            end
-            add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
-            found_any = true
+            # C++ time_all_vel returns after the FIRST successful profile even in
+            # collection mode - the velocity family contributes at most one profile
+            vpc === nothing || add_profile!(vpc, RuckigProfile(buf, pf, vf, af; brake_duration, brake))
+            return true
         end
     end
 
-    return found_any
+    return false
 end
 
 """
@@ -1584,7 +1625,7 @@ If `vpc` is `nothing`, returns the shortest valid profile found (for time-optima
 function time_acc0_acc1!(buf::ProfileBuffer{T}, candidate::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
                          jMax, vMax, vMin, aMax, aMin;
                          vpc::Union{ValidProfileCollection{T}, Nothing}=nothing,
-                         brake_duration::T=zero(T), brake::Union{RuckigProfile{T}, Nothing}=nothing) where T
+                         brake_duration::T=zero(T), brake::Union{BrakeProfile{T}, Nothing}=nothing) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
     a0_a0 = a0^2
@@ -1631,7 +1672,7 @@ function time_acc0_acc1!(buf::ProfileBuffer{T}, candidate::ProfileBuffer{T}, p0,
         candidate.t[6] = h3 + h1_sign * h1 / aMin
         candidate.t[7] = candidate.t[5] + af / jMax
 
-        if check!(candidate, UDDU, LIMIT_ACC0_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(candidate, UDDU, LIMIT_ACC0_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, true)
             if vpc !== nothing
                 # Collecting mode: add all valid profiles
                 add_profile!(vpc, RuckigProfile(candidate, pf, vf, af; brake_duration, brake))
@@ -1663,7 +1704,7 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, candidate
                                   p0, v0, a0, pf, vf, af,
                                   jMax, vMax, vMin, aMax, aMin;
                                   vpc::Union{ValidProfileCollection{T}, Nothing}=nothing,
-                                  brake_duration::T=zero(T), brake::Union{RuckigProfile{T}, Nothing}=nothing) where T
+                                  brake_duration::T=zero(T), brake::Union{BrakeProfile{T}, Nothing}=nothing) where T
     # Pre-compute common terms
     jMax_jMax = jMax^2
     a0_a0 = a0^2
@@ -1832,7 +1873,7 @@ function time_all_none_acc0_acc1!(roots::Roots, buf::ProfileBuffer{T}, candidate
         candidate.t[6] = h3_acc1 - (2*a0 + jMax*t)*t/aMin
         candidate.t[7] = (af - aMin)/jMax
 
-        if check!(candidate, UDDU, LIMIT_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+        if check!(candidate, UDDU, LIMIT_ACC1, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, true)
             if vpc !== nothing
                 # Collecting mode: add all valid profiles
                 add_profile!(vpc, RuckigProfile(candidate, pf, vf, af; brake_duration, brake))
@@ -1939,36 +1980,29 @@ function time_acc0_two_step!(buf::ProfileBuffer{T}, p0, v0, a0, pf, vf, af,
         return true
     end
 
-    # Strategy 3: Three-step with polynomial solution
-    h0 = 3*(af_af - a0_a0 + 2*jMax*(v0 + vf))
-    if abs(h0) > EPS
+    # Strategy 3: Three-step - Removed aMax (position_third_step1.cpp lines 333-350)
+    begin
+        h0 = 3*(af_af - a0_a0 + 2*jMax*(v0 + vf))
         h2 = a0_p3 + 2*af_p3 + 6*jMax_jMax*pd + 6*(af - a0)*jMax*vf - 3*a0*af_af
+        h1_rad = 2*(2*h2^2 + h0*(a0_p4 - 6*a0_a0*(af_af + 2*jMax*vf) +
+                    8*a0*(af_p3 + 3*jMax_jMax*pd + 3*af*jMax*vf) -
+                    3*(af_p4 + 4*af_af*jMax*vf + 4*jMax_jMax*(vf^2 - v0^2))))
 
-        # Solve for intermediate acceleration
-        # The polynomial is complex; use a simplified approach
-        h1_sq = 2*(2*h2^2 + h0*(a0_p4 - 6*a0_a0*(af_af + 2*jMax*vf) +
-                8*a0_p3*af + 3*af_p4 - 6*af_af*jMax*vf - 12*jMax_jMax*(vf^2 - pd*(vf - v0))))
+        # C++ takes sqrt of a possibly-negative radicand and lets the NaN fail the
+        # check; Julia sqrt would throw, so skip the strategy explicitly instead
+        if h1_rad >= 0
+            h1 = sqrt(h1_rad) * abs(jMax) / jMax
 
-        if h1_sq >= 0
-            for h1_sign in (1, -1)
-                h1 = h1_sign * sqrt(h1_sq)
-                a_peak = (a0_a0 + af_af + 2*jMax*(vf - v0) + h1/h0) / 2
+            buf.t[1] = (4*af_p3 + 2*a0_p3 - 6*a0*af_af + 12*jMax_jMax*pd + 12*(af - a0)*jMax*vf + h1)/(2*jMax*h0)
+            buf.t[2] = -h1/(jMax*h0)
+            buf.t[3] = (-4*a0_p3 - 2*af_p3 + 6*a0_a0*af + 12*jMax_jMax*pd - 12*(af - a0)*jMax*v0 + h1)/(2*jMax*h0)
+            buf.t[4] = 0
+            buf.t[5] = 0
+            buf.t[6] = 0
+            buf.t[7] = 0
 
-                if a_peak > 0
-                    a_peak = sqrt(a_peak)
-
-                    buf.t[1] = (a_peak - a0)/jMax
-                    buf.t[2] = 0
-                    buf.t[3] = (a_peak - af)/jMax
-                    buf.t[4] = 0
-                    buf.t[5] = 0
-                    buf.t[6] = 0
-                    buf.t[7] = 0
-
-                    if check!(buf, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-                        return true
-                    end
-                end
+            if check!(buf, UDDU, LIMIT_ACC0, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
             end
         end
     end
@@ -2245,8 +2279,10 @@ function calculate_trajectory(lim::JerkLimiter{T}; pf, p0=zero(T), v0=zero(T), a
 
     # Zero-limits special case: jMax=0, aMax=0, or aMin=0
     # C++ Reference: position_third_step1.cpp lines 511-525
+    # C++ passes the UNSWAPPED limits here; the profile checks are not
+    # direction-aware, so swapped limits reject every pd < 0 trajectory
     if jmax == 0 || amax == 0 || amin == 0
-        if time_all_single_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
+        if time_all_single_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
             return RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
         end
         # Build error message with explicit concatenation to avoid vararg type instability (JuliaC compatibility)
@@ -2422,7 +2458,7 @@ function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0
     get_position_brake_trajectory!(brake, v0, a0, vmax, vmin, amax, amin, jmax)
     ps, vs, as = finalize_brake!(brake, p0, v0, a0)
     brake_duration = brake.duration
-    brake_copy = brake_duration > 0 ? deepcopy(brake) : nothing
+    brake_copy = brake_duration > 0 ? copy(brake) : nothing
 
     # Use post-brake state as effective initial state
     p0_eff, v0_eff, a0_eff = ps, vs, as
@@ -2438,9 +2474,18 @@ function calculate_trajectory_with_block(lim::JerkLimiter{T}; pf, p0=zero(T), v0
     end
 
     # Zero-limits special case: jMax=0, aMax=0, or aMin=0
+    # C++ passes the UNSWAPPED limits here (see comment in calculate_trajectory)
     if jmax == 0 || amax == 0 || amin == 0
-        if time_all_single_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jMax1, vMax1, vMin1, aMax1, aMin1)
-            return Block(RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy))
+        if time_all_single_step!(buf, p0_eff, v0_eff, a0_eff, pf, vf, af, jmax, vmax, vmin, amax, amin)
+            profile = RuckigProfile(buf, pf, vf, af; brake_duration, brake=brake_copy)
+            # C++ position_third_step1.cpp:497-499: with a moving initial state
+            # only the exact t_min duration is feasible - block everything longer
+            if abs(v0_eff) > EPS || abs(a0_eff) > EPS
+                t_min_zl = duration(profile)
+                return Block{Float64}(profile, t_min_zl,
+                    BlockInterval{Float64}(t_min_zl, Inf, profile), nothing)
+            end
+            return Block(profile)
         end
         # Build error message with explicit concatenation to avoid vararg type instability (JuliaC compatibility)
         msg = "No valid trajectory found for zero-limits case from (" * string(p0) * ", " * string(v0) * ", " * string(a0) *
@@ -2630,20 +2675,23 @@ function calculate_waypoint_trajectory(lim::JerkLimiter, waypoints, Ts)
         # Sample at Ts intervals
         ps, vs, as, js, ts = evaluate_dt(profile, Ts)
 
-        # Shift times by offset and append
-        if i == 1
-            append!(all_ts, ts .+ t_offset)
-            append!(all_ps, ps)
-            append!(all_vs, vs)
-            append!(all_as, as)
-            append!(all_js, js)
-        else
-            # Skip first point to avoid duplicates at waypoint boundaries
+        # Shift times by offset and append. The first sample of a segment (at
+        # exactly t_offset) is a duplicate only when the previous segment's last
+        # sample landed on its full duration, i.e. the duration was a multiple of
+        # Ts - otherwise the exact waypoint sample must be kept
+        skip_first = !isempty(all_ts) && abs(all_ts[end] - t_offset) <= Ts * 1e-9
+        if skip_first
             append!(all_ts, (ts .+ t_offset)[2:end])
             append!(all_ps, ps[2:end])
             append!(all_vs, vs[2:end])
             append!(all_as, as[2:end])
             append!(all_js, js[2:end])
+        else
+            append!(all_ts, ts .+ t_offset)
+            append!(all_ps, ps)
+            append!(all_vs, vs)
+            append!(all_as, as)
+            append!(all_js, js)
         end
 
         t_offset += duration(profile)
@@ -2714,19 +2762,22 @@ function calculate_waypoint_trajectory(lims::AbstractVector{<:JerkLimiter{T}}, w
         # Sample at Ts intervals
         ps, vs, as, js, ts = evaluate_dt(profiles, Ts)
 
-        # Shift times by offset and append
-        if i == 1
-            append!(all_ts, ts .+ t_offset)
-            for k in axes(ps, 1)
+        # Shift times by offset and append. The first sample of a segment is a
+        # duplicate only when the previous segment's last sample landed exactly
+        # on its full duration (duration a multiple of Ts) - otherwise the exact
+        # waypoint sample must be kept
+        skip_first = !isempty(all_ts) && abs(all_ts[end] - t_offset) <= Ts * 1e-9
+        if skip_first
+            append!(all_ts, (ts .+ t_offset)[2:end])
+            for k in 2:size(ps, 1)
                 push!(all_ps, ps[k, :])
                 push!(all_vs, vs[k, :])
                 push!(all_as, as[k, :])
                 push!(all_js, js[k, :])
             end
         else
-            # Skip first point to avoid duplicates at waypoint boundaries
-            append!(all_ts, (ts .+ t_offset)[2:end])
-            for k in 2:size(ps, 1)
+            append!(all_ts, ts .+ t_offset)
+            for k in axes(ps, 1)
                 push!(all_ps, ps[k, :])
                 push!(all_vs, vs[k, :])
                 push!(all_as, as[k, :])
@@ -2827,16 +2878,10 @@ function check_step2!(buf::ProfileBuffer{T}, control_signs::ControlSigns, limits
     # Check jerk limit if provided
     abs(jf) > jMax_limit + EPS && return false
 
-    # Use existing check function
-    result = check!(buf, control_signs, limits, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-    if !result
-        return false
-    end
-
-    # Verify total duration matches tf
-    abs(buf.t_sum[7] - tf) > T_PRECISION && return false
-
-    return true
+    # No duration check against tf: C++ check_with_timing has it commented out
+    # ("Time doesn't need to be checked as every profile has a: tf - ... equation");
+    # an absolute gate would spuriously reject valid profiles for large tf
+    return check!(buf, control_signs, limits, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
 end
 
 """
@@ -2861,19 +2906,22 @@ function time_acc0_acc1_vel_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
                 4*af_af + 2*a0_a0 + (4*af + aMax - aMin)*(aMax - aMin) +
                 4*jMax*(aMin - aMax + jMax*tf - 2*af)*tf
 
-        h1_sq >= 0 || return false
-        h1 = sqrt(h1_sq) * sign(jMax)
+        # C++ sqrt(negative) yields NaN and merely fails this candidate's check;
+        # skip only this UDDU attempt - the UDUD profile below must still be tried
+        if h1_sq >= 0
+            h1 = sqrt(h1_sq) * sign(jMax)
 
-        buf.t[1] = (-a0 + aMax)/jMax
-        buf.t[2] = (-(af_af - a0_a0 + 2*aMax^2 + aMin*(aMin - 2*ad - 3*aMax) + 2*jMax*(aMin*tf - vd)) + aMin*h1)/(2*(aMax - aMin)*jMax)
-        buf.t[3] = aMax/jMax
-        buf.t[4] = (aMin - aMax + h1)/(2*jMax)
-        buf.t[5] = -aMin/jMax
-        buf.t[6] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + buf.t[4] + 2*buf.t[5] + af/jMax)
-        buf.t[7] = buf.t[5] + af/jMax
+            buf.t[1] = (-a0 + aMax)/jMax
+            buf.t[2] = (-(af_af - a0_a0 + 2*aMax^2 + aMin*(aMin - 2*ad - 3*aMax) + 2*jMax*(aMin*tf - vd)) + aMin*h1)/(2*(aMax - aMin)*jMax)
+            buf.t[3] = aMax/jMax
+            buf.t[4] = (aMin - aMax + h1)/(2*jMax)
+            buf.t[5] = -aMin/jMax
+            buf.t[6] = tf - (buf.t[1] + buf.t[2] + buf.t[3] + buf.t[4] + 2*buf.t[5] + af/jMax)
+            buf.t[7] = buf.t[5] + af/jMax
 
-        if check_step2!(buf, UDDU, LIMIT_ACC0_ACC1_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            return true
+            if check_step2!(buf, UDDU, LIMIT_ACC0_ACC1_VEL, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
         end
     end
 
@@ -2933,7 +2981,6 @@ function time_acc1_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreC
         # Newton refinement
         if abs(a0 + jMax*t) > 16*EPS
             h0 = jMax*t*t
-            h1 = -((a0_a0 + af_af)/2 + jMax*(-vd + 2*a0*t + h0))/aMin
             orig = -pd + (3*(a0_p4 + af_p4) - 8*af_p3*aMin - 4*a0_p3*aMin +
                    6*af_af*(aMin^2 + 2*jMax*(h0 - vd)) +
                    6*a0_a0*(af_af - 2*af*aMin + aMin^2 + 2*aMin*jMax*(-2*t + tf) + 2*jMax*(5*h0 - vd)) +
@@ -3122,9 +3169,9 @@ function time_acc0_acc1_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
         buf.t[6] = tf - (2*buf.t[1] + buf.t[2] + 2*buf.t[5])
         buf.t[7] = buf.t[5]
 
-        if check_step2!(buf, UDDU, LIMIT_ACC0_ACC1, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
-            return true
-        end
+        # C++ returns the simple-case check result directly and never tries the
+        # general case for zero boundary accelerations
+        return check_step2!(buf, UDDU, LIMIT_ACC0_ACC1, tf, jf, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af, abs(jMax))
     end
 
     # UDDU general case
@@ -3200,11 +3247,11 @@ function time_acc0_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
           3*jMax*(jMax*(-2*pd + aMax*tf_tf + 2*tf*v0) + aMax*(aMax*tf - 2*vd)) +
           3*af*(aMax^2 + 2*aMax*jMax*tf - 2*jMax*vd)
     h0_sq = 4*h0b^2 - 18*h0a^3
-    if h0_sq >= 0
+    # Degenerate h1: C++ divides (giving Inf/NaN), the check fails, and the
+    # NEXT solution block below is still tried - skip only this block
+    if h0_sq >= 0 && abs(3*jMax*h0a) >= EPS
         h0 = abs(jMax) * sqrt(h0_sq)
         h1 = 3*jMax*h0a
-
-        abs(h1) < EPS && return false
 
         buf.t[1] = (-a0 + aMax)/jMax
         buf.t[2] = (-a0_p3 + af_p3 + af_af*(-6*aMax + 3*jMax*tf) +
@@ -3229,11 +3276,9 @@ function time_acc0_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
           3*a0_a0*(af - 2*aMax + jMax*tf) - 6*jMax_jMax*g1 +
           6*(af - aMax)*jMax*vd - 3*aMax*jMax_jMax*tf_tf
     h0_sq = 4*h0a^2 - 18*h0b^3
-    if h0_sq >= 0
+    if h0_sq >= 0 && abs(6*jMax*h0b) >= EPS
         h1 = (jMax > 0 ? 1 : -1) * sqrt(h0_sq)
         h2 = 6*jMax*h0b
-
-        abs(h2) < EPS && return false
 
         buf.t[1] = (-a0 + aMax)/jMax
         buf.t[2] = ad/jMax - 2*buf.t[1] - (2*h0a - h1)/h2 + tf
@@ -3270,11 +3315,11 @@ function time_acc1_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
     if h0_sq >= 0
         h0 = sqrt(h0_sq)/jMax
         h1_sq = (a0_a0 + af_af - 2*a0*af - 2*ad*jMax*tf + 2*h0)/jMax_jMax + tf_tf
-        if h1_sq >= 0
+        # Degenerate denominator: C++ divides (Inf/NaN), the check fails, and the
+        # remaining solution blocks are still tried - skip only this block
+        denom = 2*jMax*(-ad + jMax*tf)
+        if h1_sq >= 0 && abs(denom) >= EPS
             h1 = sqrt(h1_sq)
-
-            denom = 2*jMax*(-ad + jMax*tf)
-            abs(denom) < EPS && return false
 
             buf.t[1] = -(a0_a0 + af_af + 2*a0*(jMax*tf - af) - 2*jMax*vd + h0)/denom
             buf.t[2] = 0
@@ -3298,11 +3343,9 @@ function time_acc1_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
     if h0_sq >= 0
         h0 = sqrt(h0_sq)/jMax
         h1_sq = (a0_a0 + af_af - 2*a0*af + 2*ad*jMax*tf + 2*h0)/jMax_jMax + tf_tf
-        if h1_sq >= 0
+        denom = 2*jMax*(ad + jMax*tf)
+        if h1_sq >= 0 && abs(denom) >= EPS
             h1 = sqrt(h1_sq)
-
-            denom = 2*jMax*(ad + jMax*tf)
-            abs(denom) < EPS && return false
 
             buf.t[1] = 0
             buf.t[2] = 0
@@ -3329,26 +3372,24 @@ function time_acc1_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
           4*a0*(af_p3 - 3*af*aMin*(-aMin - 2*jMax*tf) + 3*af_af*(-aMin - jMax*tf) +
                 3*jMax*(-aMin^2*tf + jMax*(-2*pd - aMin*tf_tf + 2*tf*vf)))
     h0_sq = 4*h0a^2 - 6*h0b*h0c
-    if h0_sq >= 0
+    if h0_sq >= 0 && abs(6*jMax*h0b) >= EPS
         h1 = (jMax > 0 ? 1 : -1) * sqrt(h0_sq)
         h2 = 6*jMax*h0b
 
-        abs(h2) < EPS && return false
+        t3 = (2*h0a + h1)/h2
+        denom = 2*jMax*(a0 - aMin - jMax*t3)
+        if abs(denom) >= EPS
+            buf.t[1] = 0
+            buf.t[2] = 0
+            buf.t[3] = t3
+            buf.t[4] = -(a0_a0 + af_af - 2*(a0 + af)*aMin + 2*(aMin^2 + aMin*jMax*tf - jMax*vd))/denom
+            buf.t[5] = (a0 - aMin)/jMax - t3
+            buf.t[6] = tf - (buf.t[3] + buf.t[4] + buf.t[5] + (af - aMin)/jMax)
+            buf.t[7] = (af - aMin)/jMax
 
-        buf.t[1] = 0
-        buf.t[2] = 0
-        buf.t[3] = (2*h0a + h1)/h2
-
-        denom = 2*jMax*(a0 - aMin - jMax*buf.t[3])
-        abs(denom) < EPS && return false
-
-        buf.t[4] = -(a0_a0 + af_af - 2*(a0 + af)*aMin + 2*(aMin^2 + aMin*jMax*tf - jMax*vd))/denom
-        buf.t[5] = (a0 - aMin)/jMax - buf.t[3]
-        buf.t[6] = tf - (buf.t[3] + buf.t[4] + buf.t[5] + (af - aMin)/jMax)
-        buf.t[7] = (af - aMin)/jMax
-
-        if check_step2!(buf, UDDU, LIMIT_ACC1, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
-            return true
+            if check_step2!(buf, UDDU, LIMIT_ACC1, tf, jMax, vMax, vMin, aMax, aMin, p0, v0, a0, pf, vf, af)
+                return true
+            end
         end
     end
 
@@ -3361,11 +3402,9 @@ function time_acc1_step2!(buf::ProfileBuffer{T}, pc::Step2PreComputed,
           4*a0*(af_p3 + 3*af*aMax*(aMax - 2*jMax*tf) - 3*af_af*(aMax - jMax*tf) +
                 3*jMax*(aMax^2*tf + jMax*(-2*pd - aMax*tf_tf + 2*tf*vf)))
     h0_sq = 4*h0a^2 - 6*h0b*h0c
-    if h0_sq >= 0
+    if h0_sq >= 0 && abs(6*jMax*h0b) >= EPS
         h1 = (jMax > 0 ? 1 : -1) * sqrt(h0_sq)
         h2 = 6*jMax*h0b
-
-        abs(h2) < EPS && return false
 
         buf.t[1] = 0
         buf.t[2] = 0
@@ -3816,18 +3855,21 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
                      72*jMax_jMax*jMax*(jMax*g1*g1 + vd_vd*vd + 2*af*g1*vd) - 6*af_p4*jMax*vd +
                      36*af_af*jMax_jMax*vd_vd + 9*a0_p4*p1 + 3*a0_a0*ph2)/(144*jMax_jMax*jMax_jMax*ph4)
 
-        # Solve quintic using quartic derivative to find intervals
-        deriv_0 = 5.0
-        deriv_1 = 4*polynom_0
-        deriv_2 = 3*polynom_1
-        deriv_3 = 2*polynom_2
-        deriv_4 = polynom_3
+        # Solve quintic using quartic derivative to find intervals.
+        # C++ uses the MONIC derivative chain (poly_monic_derivative): deriv = P'/5,
+        # dderiv = P''/5 - the Newton trigger and the double-root tolerance below
+        # are calibrated against these normalized values
+        deriv_0 = 1.0
+        deriv_1 = 4*polynom_0/5
+        deriv_2 = 3*polynom_1/5
+        deriv_3 = 2*polynom_2/5
+        deriv_4 = polynom_3/5
 
-        # Second derivative coefficients for tolerance check
-        dderiv_0 = 20.0
-        dderiv_1 = 12*polynom_0
-        dderiv_2 = 6*polynom_1
-        dderiv_3 = 2*polynom_2
+        # Second derivative coefficients (derivative of the monic deriv): P''/5
+        dderiv_0 = 4.0
+        dderiv_1 = 3*deriv_1
+        dderiv_2 = 2*deriv_2
+        dderiv_3 = deriv_3
 
         ROOTS_TOL = 1e-14
 
@@ -3912,8 +3954,9 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
     end
 
     @label udud_general
-    # Profile UDUD - general case with 6th order polynomial
-    if !(abs(v0) < EPS && abs(a0) < EPS && abs(vf) < EPS && abs(af) < EPS)
+    # Profile UDUD - general case with 6th order polynomial.
+    # C++ runs this block unconditionally, also for all-zero boundary states
+    begin
         ph1 = af_af - 2*jMax*(2*af*tf + jMax*tf_tf - 3*vd)
         ph2 = af_p3 - 3*jMax_jMax*g1 + 3*af*jMax*vd
         ph3 = 2*jMax*tf*g1 + 3*vd_vd
@@ -3930,20 +3973,21 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
                      72*jMax_jMax*jMax*(jMax*g1*g1 - vd_vd*vd - 2*af*g1*vd) - 6*af_p4*jMax*vd -
                      36*af_af*jMax_jMax*vd_vd + 8*a0_p3*ph2 + 3*a0_a0*ph4)/(144*jMax_jMax*jMax_jMax*jMax_jMax)
 
-        # Solve using quintic derivative to find intervals
-        deriv_0 = 6.0
-        deriv_1 = 5*polynom_0
-        deriv_2 = 4*polynom_1
-        deriv_3 = 3*polynom_2
-        deriv_4 = 2*polynom_3
-        deriv_5 = polynom_4
+        # Solve using quintic derivative to find intervals.
+        # Monic derivative chain matching C++: deriv = P'/6, dderiv = P''/30
+        deriv_0 = 1.0
+        deriv_1 = 5*polynom_0/6
+        deriv_2 = 4*polynom_1/6
+        deriv_3 = 3*polynom_2/6
+        deriv_4 = 2*polynom_3/6
+        deriv_5 = polynom_4/6
 
-        # Use quartic solution on 4th derivative to find extrema
-        dderiv_0 = 30.0
-        dderiv_1 = 20*polynom_0
-        dderiv_2 = 12*polynom_1
-        dderiv_3 = 6*polynom_2
-        dderiv_4 = 2*polynom_3
+        # Use quartic solution on the second monic derivative to find extrema
+        dderiv_0 = 1.0
+        dderiv_1 = 4*deriv_1/5
+        dderiv_2 = 3*deriv_2/5
+        dderiv_3 = 2*deriv_3/5
+        dderiv_4 = deriv_4/5
 
         dd_tz_current = tz_min
         intervals = NTuple{2,T}[]
@@ -3951,6 +3995,13 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
         for tz in solve_quartic_real!(roots, dderiv_0, dderiv_1, dderiv_2, dderiv_3, dderiv_4)
             tz >= tz_max && continue
             tz <= dd_tz_current && continue  # Skip extrema that would create backwards intervals
+
+            # Newton refinement of the dderiv extremum (C++ does this before the sign test)
+            dd_orig = dderiv_4 + tz*(dderiv_3 + tz*(dderiv_2 + tz*(dderiv_1 + tz*dderiv_0)))
+            if abs(dd_orig) > 1e-14
+                ddd_val = dderiv_3 + tz*(2*dderiv_2 + tz*(3*dderiv_1 + tz*4*dderiv_0))
+                abs(ddd_val) > EPS && (tz -= dd_orig / ddd_val)
+            end
 
             # Check sign change in 1st derivative
             val_current = deriv_5 + dd_tz_current*(deriv_4 + dd_tz_current*(deriv_3 + dd_tz_current*(deriv_2 + dd_tz_current*(deriv_1 + dd_tz_current*deriv_0))))
@@ -4325,7 +4376,9 @@ function get_first_state_at_position(profile::RuckigProfile{T}, pt::Real; time_a
             disc = v^2 - 2*a*(p - pt)
             if disc >= 0
                 disc_sqrt = sqrt(disc)
-                for t_root in ((-v - disc_sqrt) / a, (-v + disc_sqrt) / a)
+                # minmax: iterate in ascending time order regardless of sign(a),
+                # so the FIRST crossing is returned
+                for t_root in minmax((-v - disc_sqrt) / a, (-v + disc_sqrt) / a)
                     if 0 < t_root <= profile.t[i] && (time_after - t_cum) <= t_root
                         return (true, t_root + t_cum)
                     end
@@ -4405,13 +4458,16 @@ function solve_cubic_real(a, b, c, d)
         end
     else
         # Three distinct real roots
-        theta = acos(R / sqrt(-Q^3))
+        theta = acos(clamp(R / sqrt(-Q^3), -1.0, 1.0))
         sqrt_neg_Q = sqrt(-Q)
         push!(roots, 2*sqrt_neg_Q*cos(theta/3) - p/3)
         push!(roots, 2*sqrt_neg_Q*cos((theta + 2π)/3) - p/3)
         push!(roots, 2*sqrt_neg_Q*cos((theta + 4π)/3) - p/3)
     end
 
+    # Ascending order so that consumers scanning for the first crossing time
+    # find the earliest root (C++ roots::Set sorts on access)
+    sort!(roots)
     return roots
 end
 
@@ -4455,8 +4511,10 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
     length(vf) == ndof || throw(ArgumentError("vf must have length $ndof"))
     length(af) == ndof || throw(ArgumentError("af must have length $ndof"))
 
-    # Step 1: Calculate minimum-time profile for each DOF with blocked intervals
-    blocks = Vector{Block{T}}(undef, ndof)
+    # Step 1: Calculate minimum-time profile for each DOF with blocked intervals.
+    # Profiles are always computed in Float64 (the limiter work buffers are Float64),
+    # so the element type here is Float64 regardless of the limiter value type T
+    blocks = Vector{Block{Float64}}(undef, ndof)
     for i in 1:ndof
         blocks[i] = calculate_trajectory_with_block(lims[i];
             p0=p0[i], v0=v0[i], a0=a0[i],
@@ -4475,7 +4533,6 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
         bi = blocks[i]
         push!(candidates, (bi.t_min, i, 0))
         if bi.a !== nothing
-            bi.a.right
             push!(candidates, (bi.a.right, i, 1))
         end
         if bi.b !== nothing
@@ -4525,21 +4582,28 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
 
     for i in 1:ndof
         bi = blocks[i]
-        # Check if this DOF can use an existing profile (from Step 1 or blocked interval)
-        # Use 2*eps tolerance for numerical robustness (matching C++ line 480)
-        if abs(t_sync - bi.t_min) < 2 * T_PRECISION
+        # Check if this DOF can use an existing profile (from Step 1 or blocked interval).
+        # Block boundaries include the brake duration, so compare against t_sync directly.
+        # Use 2*eps tolerance for numerical robustness (C++ calculator_target.hpp:476)
+        if abs(t_sync - bi.t_min) < 2 * eps(Float64)
             profiles[i] = bi.p_min
-        elseif !isnothing(bi.a) && abs(t_sync - bi.a.right) < 2 * T_PRECISION
+        elseif !isnothing(bi.a) && abs(t_sync - bi.a.right) < 2 * eps(Float64)
             profiles[i] = bi.a.profile
-        elseif !isnothing(bi.b) && abs(t_sync - bi.b.right) < 2 * T_PRECISION
+        elseif !isnothing(bi.b) && abs(t_sync - bi.b.right) < 2 * eps(Float64)
             profiles[i] = bi.b.profile
         else
-            # Need to recalculate for synchronized duration (Step 2)
+            # Need to recalculate for synchronized duration (Step 2).
+            # C++ solves step 2 from the post-brake state for the brake-excluded
+            # duration and keeps the brake pre-trajectory on the profile
+            pm = bi.p_min
+            t_profile = t_sync - pm.brake_duration
+            p0_eff, v0_eff, a0_eff = pm.p[1], pm.v[1], pm.a[1]
+
             buf = lims[i].buffer
             clear!(buf)
 
-            success = calculate_profile_step2!(lims[i].roots, buf, t_sync,
-                p0[i], v0[i], a0[i], pf[i], vf[i], af[i],
+            success = calculate_profile_step2!(lims[i].roots, buf, t_profile,
+                p0_eff, v0_eff, a0_eff, pf[i], vf[i], af[i],
                 lims[i].jmax, lims[i].vmax, lims[i].vmin,
                 lims[i].amax, lims[i].amin)
 
@@ -4547,7 +4611,8 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
                 error("Failed to find synchronized profile for DOF $i at duration $t_sync. Blocks: $blocks, lims = $lims, p0 = $p0, v0 = $v0, a0 = $a0, pf = $pf, vf = $vf, af = $af")
             end
 
-            profiles[i] = RuckigProfile(buf, pf[i], vf[i], af[i])
+            profiles[i] = RuckigProfile(buf, pf[i], vf[i], af[i];
+                brake_duration=pm.brake_duration, brake=pm.brake)
         end
     end
 

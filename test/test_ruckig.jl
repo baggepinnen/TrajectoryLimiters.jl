@@ -1245,13 +1245,29 @@ end
         profile_opt = calculate_velocity_trajectory(lim; v0, a0, vf, af)
         tf_min = duration(profile_opt)
 
-        # Request longer time
-        tf = tf_min + 0.05 + 0.2 * rand()
-        profile = calculate_velocity_trajectory(lim; v0, a0, vf, af, tf)
-        @test duration(profile) ≈ tf atol=1e-6
-        _, vf_actual, af_actual, _ = profile(duration(profile))
-        @test vf_actual ≈ vf atol=1e-5
-        @test af_actual ≈ af atol=1e-5
+        # Request a longer duration. With af != 0 a blocked interval of
+        # infeasible durations can exist just above the minimum (the same
+        # phenomenon as the blocked intervals of the position interface), so
+        # escalate the offset until a feasible duration is found
+        profile = nothing
+        tf = tf_min
+        for offset in (0.05 + 0.2 * rand(), 0.5, 1.0, 2.0, 5.0)
+            tf = tf_min + offset
+            try
+                profile = calculate_velocity_trajectory(lim; v0, a0, vf, af, tf)
+                break
+            catch
+                profile = nothing
+            end
+        end
+        if profile === nothing
+            @test false  # no feasible synchronized duration found in the sweep
+        else
+            @test duration(profile) ≈ tf atol=1e-6
+            _, vf_actual, af_actual, _ = profile(duration(profile))
+            @test vf_actual ≈ vf atol=1e-5
+            @test af_actual ≈ af atol=1e-5
+        end
     end
 
     GC.gc(true)

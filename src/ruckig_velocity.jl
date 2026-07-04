@@ -86,7 +86,21 @@ function check_for_velocity!(buf::ProfileBuffer{T}, v0, a0, vf, af, jf, aMax, aM
 
     buf.limits = limits
     buf.control_signs = control_signs
+    # C++ sets the direction per accepted profile from the sign of the aMax argument
+    buf.direction = aMax > 0 ? DIR_UP : DIR_DOWN
     return true
+end
+
+"""
+Shift the profile's position trace by the brake displacement `ps`: the main
+profile starts at the post-brake position (C++ brake.finalize updates p.p[0]
+in place, which the velocity interface then integrates from).
+"""
+function shift_position!(buf::ProfileBuffer, ps)
+    @inbounds for i in 1:8
+        buf.p[i] += ps
+    end
+    buf
 end
 
 """
@@ -342,8 +356,14 @@ function time_velocity_second_order_step1!(buf::ProfileBuffer{T}, v0, vf, aMax, 
         buf.p[i+1] = buf.p[i] + buf.t[i] * (buf.v[i] + buf.t[i] * buf.a[i] / 2)
     end
 
+    # Final-velocity and duration validation (C++ check_for_second_order_velocity);
+    # written NaN-safely: degenerate limits (aMax = 0) produce NaN/Inf times
+    abs(buf.v[8] - vf) <= V_PRECISION || return false
+    buf.t_sum[7] <= T_MAX || return false
+
     buf.limits = LIMIT_ACC0
     buf.control_signs = UDDU
+    buf.direction = af >= 0 ? DIR_UP : DIR_DOWN
     return true
 end
 
@@ -395,8 +415,12 @@ function time_velocity_second_order_step2!(buf::ProfileBuffer{T}, tf, v0, vf, aM
         buf.p[i+1] = buf.p[i] + buf.t[i] * (buf.v[i] + buf.t[i] * buf.a[i] / 2)
     end
 
+    abs(buf.v[8] - vf) <= V_PRECISION || return false
+    buf.t_sum[7] <= T_MAX || return false
+
     buf.limits = LIMIT_NONE
     buf.control_signs = UDDU
+    buf.direction = af >= 0 ? DIR_UP : DIR_DOWN
     return true
 end
 
@@ -427,9 +451,9 @@ function calculate_velocity_trajectory(lim::JerkLimiter{T}; vf, v0=zero(T), a0=z
 
     # Compute velocity brake profile if initial acceleration is outside limits
     get_velocity_brake_trajectory!(brake, a0, amax, amin, jmax)
-    _, vs, as = finalize_brake!(brake, zero(T), v0, a0)
+    ps, vs, as = finalize_brake!(brake, zero(T), v0, a0)
     brake_duration = brake.duration
-    brake_copy = brake_duration > 0 ? deepcopy(brake) : nothing
+    brake_copy = brake_duration > 0 ? copy(brake) : nothing
 
     v0_eff, a0_eff = vs, as
     vd = vf - v0_eff
@@ -439,7 +463,8 @@ function calculate_velocity_trajectory(lim::JerkLimiter{T}; vf, v0=zero(T), a0=z
         # Zero-limits special case
         if jmax == 0
             if time_all_single_step_velocity!(buf, v0_eff, a0_eff, vf, af, amax, amin)
-                return RuckigProfile(buf, zero(T), vf, af; brake_duration, brake=brake_copy)
+                shift_position!(buf, ps)
+                return RuckigProfile(buf, buf.p[8], vf, af; brake_duration, brake=brake_copy)
             end
             error("Velocity trajectory not found for zero-jerk case")
         end
@@ -453,8 +478,8 @@ function calculate_velocity_trajectory(lim::JerkLimiter{T}; vf, v0=zero(T), a0=z
                    time_acc0_velocity!(buf, v0_eff, a0_eff, vf, af, amax, amin, jmax) ||
                    time_none_velocity!(buf, v0_eff, a0_eff, vf, af, amin, amax, -jmax) ||
                    time_acc0_velocity!(buf, v0_eff, a0_eff, vf, af, amin, amax, -jmax)
-                    buf.direction = vd >= 0 ? DIR_UP : DIR_DOWN
-                    return RuckigProfile(buf, zero(T), vf, af; brake_duration, brake=brake_copy)
+                    shift_position!(buf, ps)
+                    return RuckigProfile(buf, buf.p[8], vf, af; brake_duration, brake=brake_copy)
                 end
             else
                 # Try DOWN direction first
@@ -462,19 +487,41 @@ function calculate_velocity_trajectory(lim::JerkLimiter{T}; vf, v0=zero(T), a0=z
                    time_acc0_velocity!(buf, v0_eff, a0_eff, vf, af, amin, amax, -jmax) ||
                    time_none_velocity!(buf, v0_eff, a0_eff, vf, af, amax, amin, jmax) ||
                    time_acc0_velocity!(buf, v0_eff, a0_eff, vf, af, amax, amin, jmax)
-                    buf.direction = vd >= 0 ? DIR_UP : DIR_DOWN
-                    return RuckigProfile(buf, zero(T), vf, af; brake_duration, brake=brake_copy)
+                    shift_position!(buf, ps)
+                    return RuckigProfile(buf, buf.p[8], vf, af; brake_duration, brake=brake_copy)
                 end
             end
         else
-            # af != 0: try all profiles (need to collect for potential blocked intervals)
-            # For simplicity in min-time case, just return first valid
-            if time_none_velocity!(buf, v0_eff, a0_eff, vf, af, amax, amin, jmax) ||
-               time_none_velocity!(buf, v0_eff, a0_eff, vf, af, amin, amax, -jmax) ||
-               time_acc0_velocity!(buf, v0_eff, a0_eff, vf, af, amax, amin, jmax) ||
-               time_acc0_velocity!(buf, v0_eff, a0_eff, vf, af, amin, amax, -jmax)
-                buf.direction = vd >= 0 ? DIR_UP : DIR_DOWN
-                return RuckigProfile(buf, zero(T), vf, af; brake_duration, brake=brake_copy)
+            # af != 0: several extremal profiles can be valid; C++ collects them all
+            # and Block picks the minimum duration. The full block machinery is not
+            # ported for the velocity interface, but the min-duration selection is
+            best = lim.candidate
+            best_duration = T(Inf)
+
+            if time_none_velocity!(buf, v0_eff, a0_eff, vf, af, amax, amin, jmax) && buf.t_sum[7] < best_duration
+                best_duration = buf.t_sum[7]
+                copy_buffer!(best, buf)
+            end
+            clear!(buf)
+            if time_none_velocity!(buf, v0_eff, a0_eff, vf, af, amin, amax, -jmax) && buf.t_sum[7] < best_duration
+                best_duration = buf.t_sum[7]
+                copy_buffer!(best, buf)
+            end
+            clear!(buf)
+            if time_acc0_velocity!(buf, v0_eff, a0_eff, vf, af, amax, amin, jmax) && buf.t_sum[7] < best_duration
+                best_duration = buf.t_sum[7]
+                copy_buffer!(best, buf)
+            end
+            clear!(buf)
+            if time_acc0_velocity!(buf, v0_eff, a0_eff, vf, af, amin, amax, -jmax) && buf.t_sum[7] < best_duration
+                best_duration = buf.t_sum[7]
+                copy_buffer!(best, buf)
+            end
+
+            if isfinite(best_duration)
+                copy_buffer!(buf, best)
+                shift_position!(buf, ps)
+                return RuckigProfile(buf, buf.p[8], vf, af; brake_duration, brake=brake_copy)
             end
         end
 
@@ -491,8 +538,8 @@ function calculate_velocity_trajectory(lim::JerkLimiter{T}; vf, v0=zero(T), a0=z
                time_none_velocity_step2!(buf, tf_eff, v0_eff, a0_eff, vf, af, amax, amin, jmax) ||
                time_acc0_velocity_step2!(buf, tf_eff, v0_eff, a0_eff, vf, af, amin, amax, -jmax) ||
                time_none_velocity_step2!(buf, tf_eff, v0_eff, a0_eff, vf, af, amin, amax, -jmax)
-                buf.direction = DIR_UP
-                return RuckigProfile(buf, zero(T), vf, af; brake_duration, brake=brake_copy)
+                shift_position!(buf, ps)
+                return RuckigProfile(buf, buf.p[8], vf, af; brake_duration, brake=brake_copy)
             end
         else
             # Try DOWN direction first
@@ -500,8 +547,8 @@ function calculate_velocity_trajectory(lim::JerkLimiter{T}; vf, v0=zero(T), a0=z
                time_none_velocity_step2!(buf, tf_eff, v0_eff, a0_eff, vf, af, amin, amax, -jmax) ||
                time_acc0_velocity_step2!(buf, tf_eff, v0_eff, a0_eff, vf, af, amax, amin, jmax) ||
                time_none_velocity_step2!(buf, tf_eff, v0_eff, a0_eff, vf, af, amax, amin, jmax)
-                buf.direction = DIR_DOWN
-                return RuckigProfile(buf, zero(T), vf, af; brake_duration, brake=brake_copy)
+                shift_position!(buf, ps)
+                return RuckigProfile(buf, buf.p[8], vf, af; brake_duration, brake=brake_copy)
             end
         end
 
@@ -528,13 +575,13 @@ function calculate_velocity_trajectory(lim::AccelerationLimiter{T}; vf, v0=zero(
     if isnothing(tf)
         # Time-optimal case
         if time_velocity_second_order_step1!(buf, v0, vf, amax, amin)
-            return RuckigProfile(buf, zero(T), vf, zero(T))
+            return RuckigProfile(buf, buf.p[8], vf, zero(T))
         end
         error("Second-order velocity trajectory not found (v0=$v0, vf=$vf)")
     else
         # Time-synchronized case
         if time_velocity_second_order_step2!(buf, tf, v0, vf, amax, amin)
-            return RuckigProfile(buf, zero(T), vf, zero(T))
+            return RuckigProfile(buf, buf.p[8], vf, zero(T))
         end
         error("Second-order velocity trajectory with duration $tf not found (v0=$v0, vf=$vf)")
     end
