@@ -2836,6 +2836,10 @@ struct Step2PreComputed{T}
 end
 
 function Step2PreComputed(tf, p0, v0, a0, pf, vf, af, jMax)
+    # All profile computation is Float64; coerce so that integer-typed limiter
+    # values (JerkLimiter{Int} and integer defaults derived from it) work
+    tf, p0, v0, a0, pf, vf, af, jMax =
+        Float64(tf), Float64(p0), Float64(v0), Float64(a0), Float64(pf), Float64(vf), Float64(af), Float64(jMax)
     pd = pf - p0
     tf_tf = tf * tf
     tf_p3 = tf_tf * tf
@@ -4427,6 +4431,8 @@ function solve_cubic_real(a, b, c, d)
                 push!(roots, (-c + disc_sqrt) / (2*b))
             end
         end
+        # Ascending order also on this early-return path (descending when b < 0)
+        sort!(roots)
         return roots
     end
 
@@ -4752,7 +4758,7 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
 
     # Build list of candidate synchronization times
     # Format: (time, dof_index, source) where source: 0=t_min, 1=a.right, 2=b.right
-    candidates = Tuple{T, Int, Int}[]
+    candidates = Tuple{Float64, Int, Int}[]  # block boundaries are always Float64
 
     for i in 1:ndof
         bi = blocks[i]

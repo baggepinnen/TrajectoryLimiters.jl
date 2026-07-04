@@ -167,19 +167,29 @@ end
 
     @testset "Waypoint trajectory sample integrity" begin
         # The first sample of each segment (the exact waypoint state) used to be
-        # dropped; segment durations are generally not multiples of Ts
+        # dropped. With these limits the rest-to-rest segment duration is
+        # d/vmax + vmax/amax + amax/jmax, so the fractional displacements below
+        # give durations that are NOT multiples of Ts, the case where the exact
+        # waypoint sample must be kept (round displacements degenerate to
+        # multiples of Ts here and cannot detect the regression)
         lim = JerkLimiter(; vmax=1.0, amax=5.0, jmax=50.0)
         Ts = 0.001
-        waypoints = [(p=0.0,), (p=1.0,), (p=0.5,)]
+        wp1, wp2 = 1.00035, 0.4507
+        waypoints = [(p=0.0,), (p=wp1,), (p=wp2,)]
         ts, ps, vs, as, js = calculate_waypoint_trajectory(lim, waypoints, Ts)
 
         @test all(>(0), diff(ts))
         @test maximum(diff(ts)) <= 1.5Ts
 
         @test ps[1] ≈ 0.0 atol=1e-6
-        @test any(p -> isapprox(p, 1.0, atol=1e-6), ps)
-        @test any(p -> isapprox(p, 0.5, atol=1e-6), ps)
-        @test ps[end] ≈ 0.5 atol=1e-6
+        @test any(p -> isapprox(p, wp1, atol=1e-6), ps)
+        @test any(p -> isapprox(p, wp2, atol=1e-6), ps)
+        @test ps[end] ≈ wp2 atol=1e-6
+
+        # A duration that IS a multiple of Ts must still deduplicate the shared
+        # boundary sample (strictly increasing time grid)
+        ts2, = calculate_waypoint_trajectory(lim, [(p=0.0,), (p=1.0,), (p=0.5,)], Ts)
+        @test all(>(0), diff(ts2))
     end
 
     @testset "get_first_state_at_position returns first crossing" begin
@@ -203,6 +213,21 @@ end
         i_cross = findfirst(>=(pf - 1e-9), ps)
         @test i_cross !== nothing
         @test abs(ts[i_cross] - t_first) <= 2 * step(ts)
+
+        # A query just below the overshoot peak: both crossings (up and back
+        # down) lie close together around the peak, typically inside a single
+        # phase, which is exactly where unsorted root iteration used to return
+        # the LATER crossing
+        pt = ext.max - 1e-3
+        found2, t2 = get_first_state_at_position(prof, pt)
+        @test found2
+        @test evaluate_at(prof, t2).p ≈ pt atol=1e-6
+        i2 = findfirst(>=(pt - 1e-9), ps)
+        @test i2 !== nothing
+        @test abs(ts[i2] - t2) <= 2 * step(ts)
+        # The velocity at the first crossing is positive (still on the way up);
+        # the later crossing has negative velocity
+        @test evaluate_at(prof, t2).v > 0
     end
 
     @testset "Cubic solver domain robustness and Roots iteration" begin
@@ -270,6 +295,57 @@ end
             @test all(a -> lim.amin - 1e-6 <= a <= lim.amax + 1e-6, as)
             @test all(j -> abs(j) <= lim.jmax + 1e-6, js)
         end
+    end
+
+    @testset "Step 2 accepts valid profiles at large durations" begin
+        # At large tf, floating-point accumulation makes t_sum[7] deviate from
+        # the requested duration by more than an absolute 1e-12; an absolute
+        # duration gate (removed to match C++ check_with_timing, which has it
+        # commented out) spuriously rejected this valid profile
+        lim = JerkLimiter(; vmax=10.0, amax=100.0, jmax=1000.0)
+        tf = 84457.23965447255
+        buf = lim.buffer
+        TrajectoryLimiters.clear!(buf)
+        ok = TrajectoryLimiters.calculate_profile_step2!(lim.roots, buf, tf,
+            0.0, -5.524985506971257, -60.59914483626084,
+            -8.436035184726915, -4.129219554816196, 56.94501142776885,
+            lim.jmax, lim.vmax, lim.vmin, lim.amax, lim.amin)
+        @test ok
+        # The accepted profile genuinely deviates beyond the removed gate
+        @test abs(buf.t_sum[7] - tf) > 1e-12
+        @test abs(buf.t_sum[7] - tf) < 1e-9 * tf  # but is relatively accurate
+    end
+
+    @testset "Integer-typed limiters" begin
+        # All-Int limits promote to JerkLimiter{Int64}; the work buffers and all
+        # profile data are Float64, so no internal value may be converted to T
+        lim = JerkLimiter(; vmax=10, amax=5, jmax=100)
+        prof = calculate_velocity_trajectory(lim; vf=1.0, af=0.5)
+        st = evaluate_at(prof, duration(prof))
+        @test st.v ≈ 1.0 atol=1e-6
+        @test st.a ≈ 0.5 atol=1e-6
+
+        lims = [JerkLimiter(; vmax=1, amax=2, jmax=10), JerkLimiter(; vmax=2, amax=3, jmax=20)]
+        profs = calculate_trajectory(lims; pf=[1.0, 0.3])
+        @test duration(profs[1]) ≈ duration(profs[2]) atol=1e-9
+        @test evaluate_at(profs[1], duration(profs[1])).p ≈ 1.0 atol=1e-6
+    end
+
+    @testset "Velocity interface rejects degenerate limits" begin
+        # aMax of zero produces NaN/Inf phase times; the checks must fail
+        # NaN-safely instead of returning a garbage profile as success
+        lim = JerkLimiter(; vmax=10.0, amax=0.0, jmax=1.0)
+        @test_throws Exception calculate_velocity_trajectory(lim; vf=1.0)
+        @test_throws Exception calculate_velocity_trajectory(lim; vf=1.0, a0=0.5)
+    end
+
+    @testset "Quadratic branch of solve_cubic_real is sorted" begin
+        # Near-zero leading coefficient takes the early-return quadratic branch,
+        # whose roots are pushed in descending order when b < 0
+        roots = TrajectoryLimiters.solve_cubic_real(3e-12 / 6, -1.0, 3.0, -2.0)
+        @test issorted(roots)
+        @test length(roots) == 2
+        @test roots ≈ [1.0, 2.0] atol=1e-9
     end
 
 end
