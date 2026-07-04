@@ -78,11 +78,13 @@ function check_for_velocity!(buf::ProfileBuffer{T}, v0, a0, vf, af, jf, aMax, aM
         (buf.a[i] > aUppLim || buf.a[i] < aLowLim) && return false
     end
 
-    # Check final velocity
-    abs(buf.v[8] - vf) > V_PRECISION && return false
+    # Reject numerically absurd durations (C++ profile.hpp t_max); NaN-safe form
+    buf.t_sum[7] <= T_MAX || return false
 
-    # Check final acceleration
-    abs(buf.a[8] - af) > A_PRECISION && return false
+    # Check final velocity and acceleration. Written NaN-safely: degenerate
+    # limits (e.g. aMax = 0) produce NaN times that must fail these checks
+    abs(buf.v[8] - vf) < V_PRECISION || return false
+    abs(buf.a[8] - af) < A_PRECISION || return false
 
     buf.limits = limits
     buf.control_signs = control_signs
@@ -496,7 +498,7 @@ function calculate_velocity_trajectory(lim::JerkLimiter{T}; vf, v0=zero(T), a0=z
             # and Block picks the minimum duration. The full block machinery is not
             # ported for the velocity interface, but the min-duration selection is
             best = lim.candidate
-            best_duration = T(Inf)
+            best_duration = Inf  # durations are always Float64 (work buffers are Float64)
 
             if time_none_velocity!(buf, v0_eff, a0_eff, vf, af, amax, amin, jmax) && buf.t_sum[7] < best_duration
                 best_duration = buf.t_sum[7]

@@ -1248,7 +1248,8 @@ end
         # Request a longer duration. With af != 0 a blocked interval of
         # infeasible durations can exist just above the minimum (the same
         # phenomenon as the blocked intervals of the position interface), so
-        # escalate the offset until a feasible duration is found
+        # escalate the offset until a feasible duration is found. Only the
+        # expected infeasibility error is swallowed; anything else rethrows
         profile = nothing
         tf = tf_min
         for offset in (0.05 + 0.2 * rand(), 0.5, 1.0, 2.0, 5.0)
@@ -1256,12 +1257,14 @@ end
             try
                 profile = calculate_velocity_trajectory(lim; v0, a0, vf, af, tf)
                 break
-            catch
+            catch e
+                e isa ErrorException || rethrow()
                 profile = nothing
             end
         end
         if profile === nothing
-            @test false  # no feasible synchronized duration found in the sweep
+            @error "No feasible synchronized duration found in the sweep" vmax amax jmax v0 a0 vf af tf_min
+            @test false
         else
             @test duration(profile) ≈ tf atol=1e-6
             _, vf_actual, af_actual, _ = profile(duration(profile))

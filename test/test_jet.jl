@@ -63,6 +63,8 @@ end
     ]
 
     @test_call calculate_trajectory(lims; pf=[1.0, 2.0])
+    @test_call calculate_trajectory(lims; pf=[1.0, 2.0], synchronization=:phase)
+    @test_call TrajectoryLimiters.is_phase_synchronized(calculate_trajectory(lims; pf=[1.0, 2.0]))
 end
 
 @testset "TrajectoryLimiter (filter)" begin
