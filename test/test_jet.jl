@@ -7,9 +7,9 @@ using TrajectoryLimiters
 using Test
 
 # Test the package for potential runtime errors
-# target_defined_modules=true limits analysis to code defined in this package
+# target_modules limits the analysis to code defined in this package
 @testset "Package-wide analysis" begin
-    JET.test_package(TrajectoryLimiters; target_defined_modules=true)
+    JET.test_package(TrajectoryLimiters; target_modules=(TrajectoryLimiters,))
 end
 
 # Test specific key functions for type stability and potential errors
