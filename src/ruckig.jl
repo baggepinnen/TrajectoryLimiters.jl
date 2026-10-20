@@ -530,7 +530,19 @@ end
 function Base.show(io::IO, lim::JerkLimiter)
     # Check if vmin/amin are at their default values
     (; vmin, vmax, amin, amax, jmax) = lim
-    print(io, "JerkLimiter(; vmax=$(vmax), vmin=$(vmin), amax=$(amax), amin=$(amin), jmax=$(jmax))")
+    # Printed value by value; a string interpolated from this many values is not
+    # resolved at compile time with `juliac --trim=safe`
+    print(io, "JerkLimiter(; vmax=")
+    print(io, vmax)
+    print(io, ", vmin=")
+    print(io, vmin)
+    print(io, ", amax=")
+    print(io, amax)
+    print(io, ", amin=")
+    print(io, amin)
+    print(io, ", jmax=")
+    print(io, jmax)
+    print(io, ")")
 end
 
 #=============================================================================
@@ -3880,6 +3892,10 @@ function time_vel_step2!(roots::Roots, buf::ProfileBuffer{T}, pc::Step2PreComput
         # Helper lambda to check a root candidate
         check_uddu_vel_root = let a0_a0=a0_a0, af_af=af_af, a0_p3=a0_p3, af_p3=af_p3, jMax_jMax=jMax_jMax, vd=vd, pd=pd, tf=tf, v0=v0, a0=a0, af=af, jMax=jMax
             function(t::T)
+                # Declared local so that they are not shared with the enclosing
+                # function, which assigns variables of the same names. A shared
+                # variable is stored in a Core.Box and its type is not inferred
+                local h1_sq, h1, orig, deriv_newton
                 # Newton refinement
                 h1_sq = (a0_a0 + af_af)/(2*jMax_jMax) + (2*a0*t + jMax*t*t - vd)/jMax
                 if h1_sq >= 0
@@ -4709,6 +4725,73 @@ export is_phase_synchronized
  Multi-DOF Trajectory Calculation
 =============================================================================#
 
+# Diagnostic messages for synchronization failures. The vectors are printed element
+# by element: the generic `show` of a vector of structs, and a string interpolated
+# from many values of different types, are not resolved at compile time, which
+# `juliac --trim=safe` requires also for code that runs only on failure.
+function print_vector(io::IO, name::String, x::AbstractVector)
+    print(io, name)
+    print(io, " = [")
+    for k in eachindex(x)
+        k == firstindex(x) || print(io, ", ")
+        print(io, x[k])
+    end
+    print(io, "]")
+end
+
+function print_interval(io::IO, name::String, interval::Union{Nothing, BlockInterval})
+    print(io, name)
+    if interval === nothing
+        print(io, " = nothing")
+    else
+        print(io, " = (")
+        print(io, interval.left)
+        print(io, ", ")
+        print(io, interval.right)
+        print(io, ")")
+    end
+end
+
+function print_blocks(io::IO, blocks::AbstractVector{<:Block})
+    print(io, "Blocks: [")
+    for k in eachindex(blocks)
+        k == firstindex(blocks) || print(io, ", ")
+        b = blocks[k]
+        print(io, "(t_min = ")
+        print(io, b.t_min)
+        print(io, ", ")
+        print_interval(io, "a", b.a)
+        print(io, ", ")
+        print_interval(io, "b", b.b)
+        print(io, ")")
+    end
+    print(io, "]")
+end
+
+function format_blocks(blocks::AbstractVector{<:Block})
+    io = IOBuffer()
+    print_blocks(io, blocks)
+    String(take!(io))
+end
+
+function format_synchronization_inputs(blocks, lims, p0, v0, a0, pf, vf, af)
+    io = IOBuffer()
+    print_blocks(io, blocks)
+    print(io, ", lims = [")
+    for k in eachindex(lims)
+        k == firstindex(lims) || print(io, ", ")
+        show(io, lims[k])
+    end
+    print(io, "]")
+    print_vector(io, ", p0", p0)
+    print_vector(io, ", v0", v0)
+    print_vector(io, ", a0", a0)
+    print_vector(io, ", pf", pf)
+    print_vector(io, ", vf", vf)
+    print_vector(io, ", af", af)
+    String(take!(io))
+end
+
 """
     calculate_trajectory(lims::AbstractVector{<:JerkLimiter}; pf, p0, v0, a0, vf, af, synchronization = :time)
 
@@ -4826,7 +4909,7 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
     end
 
     if isnan(t_sync)
-        error("Failed to find valid synchronization time. Blocks: ", blocks)
+        error("Failed to find valid synchronization time. " * format_blocks(blocks))
     end
 
     profiles = Vector{RuckigProfile{Float64}}(undef, ndof)
@@ -4874,7 +4957,8 @@ function calculate_trajectory(lims::AbstractVector{<:JerkLimiter{T}};
                 lims[i].amax, lims[i].amin)
 
             if !success
-                error("Failed to find synchronized profile for DOF $i at duration $t_sync. Blocks: $blocks, lims = $lims, p0 = $p0, v0 = $v0, a0 = $a0, pf = $pf, vf = $vf, af = $af")
+                error("Failed to find synchronized profile for DOF $i at duration $t_sync. " *
+                      format_synchronization_inputs(blocks, lims, p0, v0, a0, pf, vf, af))
             end
 
             profiles[i] = RuckigProfile(buf, pf[i], vf[i], af[i];
