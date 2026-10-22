@@ -2123,12 +2123,21 @@ end
  State Evaluation
 =============================================================================#
 
+# A state with its four values converted to `R`. The held states and the jerk are stored
+# values of the profile, so without the conversion the type of the result would depend
+# on the branch, for example for a ForwardDiff `Dual` time.
+function _promoted_state(::Type{R}, s) where {R}
+    return (; p = convert(R, s.p), v = convert(R, s.v), a = convert(R, s.a), j = convert(R, s.j))
+end
+
 """
     evaluate_at(profile::RuckigProfile, t) -> (p, v, a, j)
 
-Evaluate profile at time t.
+Evaluate profile at time t. The four values have the number type that `t` and the
+profile's type `T` promote to, also before the start and after the end.
 """
 function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
+    R = promote_type(T, typeof(t))
     T_total = duration(profile)
     brake_dur = profile.brake_duration
 
@@ -2136,14 +2145,14 @@ function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
         # Return initial state (before brake if any)
         if profile.brake !== nothing && brake_dur > 0
             bp = profile.brake
-            return (; p=bp.p[1], v=bp.v[1], a=bp.a[1], j=bp.j[1])
+            return _promoted_state(R, (; p=bp.p[1], v=bp.v[1], a=bp.a[1], j=bp.j[1]))
         else
-            return (; p=profile.p[1], v=profile.v[1], a=profile.a[1], j=profile.j[1])
+            return _promoted_state(R, (; p=profile.p[1], v=profile.v[1], a=profile.a[1], j=profile.j[1]))
         end
     end
 
     if t >= T_total
-        return (; p=profile.p[8], v=profile.v[8], a=profile.a[8], j=zero(T))
+        return _promoted_state(R, (; p=profile.p[8], v=profile.v[8], a=profile.a[8], j=zero(T)))
     end
 
     # Handle brake phase if present
@@ -2164,7 +2173,7 @@ function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
         v = vk + dt * (ak + dt * jk / 2)
         a = ak + dt * jk
 
-        return (; p, v, a, j=jk)
+        return _promoted_state(R, (; p, v, a, j=jk))
     end
 
     # Main profile evaluation (subtract brake duration)
@@ -2191,7 +2200,7 @@ function evaluate_at(profile::RuckigProfile{T}, t::Real) where T
     v = vk + dt * (ak + dt * jk / 2)
     a = ak + dt * jk
 
-    return (; p, v, a, j=jk)
+    return _promoted_state(R, (; p, v, a, j=jk))
 end
 
 """
@@ -2202,11 +2211,12 @@ Evaluate the trajectory at multiple time points.
 Returns a tuple of vectors `(positions, velocities, accelerations, jerks)`.
 """
 function evaluate_at(profile::RuckigProfile{T}, ts::AbstractVector) where T
+    R = promote_type(T, eltype(ts))
     n = length(ts)
-    positions = Vector{T}(undef, n)
-    velocities = Vector{T}(undef, n)
-    accelerations = Vector{T}(undef, n)
-    jerks = Vector{T}(undef, n)
+    positions = Vector{R}(undef, n)
+    velocities = Vector{R}(undef, n)
+    accelerations = Vector{R}(undef, n)
+    jerks = Vector{R}(undef, n)
 
     @inbounds for i in eachindex(ts)
         p, v, a, j = evaluate_at(profile, ts[i])
@@ -4976,11 +4986,12 @@ Evaluate all DOF profiles at time t.
 Returns (positions, velocities, accelerations, jerks) as vectors.
 """
 function evaluate_at(profiles::AbstractVector{<:RuckigProfile{T}}, t::Real) where T
+    R = promote_type(T, typeof(t))
     ndof = length(profiles)
-    ps = Vector{T}(undef, ndof)
-    vs = Vector{T}(undef, ndof)
-    as = Vector{T}(undef, ndof)
-    js = Vector{T}(undef, ndof)
+    ps = Vector{R}(undef, ndof)
+    vs = Vector{R}(undef, ndof)
+    as = Vector{R}(undef, ndof)
+    js = Vector{R}(undef, ndof)
 
     for i in 1:ndof
         ps[i], vs[i], as[i], js[i] = evaluate_at(profiles[i], t)
@@ -4990,13 +5001,14 @@ function evaluate_at(profiles::AbstractVector{<:RuckigProfile{T}}, t::Real) wher
 end
 
 function evaluate_at(profiles::AbstractVector{<:RuckigProfile{T}}, ts::AbstractVector) where T
+    R = promote_type(T, eltype(ts))
     ndof = length(profiles)
     n = length(ts)
 
-    pos = Matrix{T}(undef, n, ndof)
-    vel = Matrix{T}(undef, n, ndof)
-    acc = Matrix{T}(undef, n, ndof)
-    jerk = Matrix{T}(undef, n, ndof)
+    pos = Matrix{R}(undef, n, ndof)
+    vel = Matrix{R}(undef, n, ndof)
+    acc = Matrix{R}(undef, n, ndof)
+    jerk = Matrix{R}(undef, n, ndof)
 
     for j in 1:ndof
         for (i, t) in enumerate(ts)

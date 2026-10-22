@@ -1,5 +1,6 @@
 using TrajectoryLimiters
 using Test
+using ForwardDiff
 
 @testset "JerkLimiter constructors" begin
     # Symmetric constructor
@@ -213,6 +214,35 @@ end
     @test pos[1] ≈ 0.0
     @test pos[end] ≈ 2.0 atol=1e-6
     @test vel[end] ≈ 0.0 atol=1e-6
+end
+
+@testset "evaluate_at with a ForwardDiff Dual time" begin
+    lim = JerkLimiter(; vmax=1.0, amax=1.0, jmax=10.0)
+    profile = calculate_trajectory(lim; pf=1.0)
+    T_total = duration(profile)
+    D = typeof(ForwardDiff.Dual(0.0, 1.0))
+
+    # Before the start, inside and after the end, all four values are Duals, with the
+    # values of the Float64 evaluation
+    for t in (-0.5, 0.7, T_total + 1.0)
+        state = @inferred evaluate_at(profile, ForwardDiff.Dual(t, 1.0))
+        @test all(x -> x isa D, state)
+        @test map(ForwardDiff.value, state) == @inferred(evaluate_at(profile, t))
+    end
+
+    # Inside a phase the derivative of each value is the next one, and a held state is constant
+    t = 0.7
+    p, v, a, j = evaluate_at(profile, t)
+    @test ForwardDiff.derivative(s -> evaluate_at(profile, s).p, t) ≈ v
+    @test ForwardDiff.derivative(s -> evaluate_at(profile, s).v, t) ≈ a
+    @test ForwardDiff.derivative(s -> evaluate_at(profile, s).a, t) ≈ j
+    @test ForwardDiff.derivative(s -> evaluate_at(profile, s).p, T_total + 1.0) == 0
+
+    # The vector and multi-DOF methods return Duals too
+    @test eltype(evaluate_at(profile, ForwardDiff.Dual.([0.1, 0.7, 1.5], 1.0)).p) == D
+    profiles = calculate_trajectory([lim, lim]; pf=[1.0, 2.0])
+    ps, vs, as, js = evaluate_at(profiles, ForwardDiff.Dual(0.7, 1.0))
+    @test eltype(ps) == D
 end
 
 @testset "evaluate_dt" begin
